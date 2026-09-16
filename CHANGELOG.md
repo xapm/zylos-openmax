@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.19.0] — 2026-09-11
+
+### Added
+
+- Auto-install the `openmax-kb` companion component during openmax install and upgrade. The post-install and post-upgrade hooks now ensure `openmaxai/zylos-openmax-kb` is present so every agent with openmax has the product knowledge base by default; on upgrade this also back-fills kb onto already-deployed agents.
+
+The step is idempotent (compares the locally-recorded kb version to the pin — skips when already at or above it, upgrades when below, installs when absent), non-fatal (a kb failure never blocks the openmax install/upgrade), time-bounded (30s timeout + SIGKILL so a hung clone cannot stall the upgrade or hold the component lock), and short-circuits under `DEPLOY_REGION=cn`.
+
 ## [2.18.0] — 2026-09-07
 
 ### Added

@@ -30,6 +30,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { ensureOpenmaxKb } from './lib/ensure-openmax-kb.js';
 
 const HOME = process.env.HOME;
 const CONFIG_PATH = path.join(HOME, 'zylos/components/openmax/config.json');
@@ -318,3 +319,7 @@ if (legacyKeysSeen.length > 0) {
   hardenDir(GROUP_LOGS_DIR);
   console.log('[post-upgrade] permissions hardened: config.json (0600), runtime/tokens/ + runtime/group-logs/ (0700 dir / 0600 files).');
 }
+
+// Ensure the openmax-kb companion is present at >= pin (idempotent, non-fatal,
+// time-bounded). On upgrade this also back-fills kb onto already-deployed agents.
+ensureOpenmaxKb();

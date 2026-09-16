@@ -64,6 +64,7 @@ import path from 'path';
 import crypto from 'crypto';
 import readline from 'readline';
 import { DEFAULT_CONFIG } from '../src/lib/config.js';
+import { ensureOpenmaxKb } from './lib/ensure-openmax-kb.js';
 
 const HOME = process.env.HOME;
 const DATA_DIR    = path.join(HOME, 'zylos/components/openmax');
@@ -446,6 +447,11 @@ try { fs.chmodSync(CONFIG_PATH, 0o600); } catch {}
 console.log('[install] config.json written (0600)');
 
 console.log('[install] complete');
+
+// Auto-install the openmax-kb companion (idempotent, non-fatal, time-bounded).
+// Placed before the interactive "Next steps" so those lines don't print above kb output.
+ensureOpenmaxKb();
+
 if (isInteractive) {
   console.log('');
   console.log('Next steps:');

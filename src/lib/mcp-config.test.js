@@ -6,6 +6,8 @@ import {
   isMcpConnection,
   mcpServerName,
   transportFlag,
+  isStdioConfig,
+  parseArgs,
   buildAuthHeader,
   buildHeaderArgs,
   upsertMcpServer,
@@ -75,12 +77,13 @@ test('mcpServerName 清洗非法字符、缺 slug 回退 mcp', () => {
 
 // --- transportFlag ----------------------------------------------------------
 
-test('transportFlag: remote_http→http, sse→sse, 未知/stdio→http', () => {
+test('transportFlag: remote_http→http, sse→sse, stdio→stdio, 未知→http', () => {
   assert.equal(transportFlag('remote_http'), 'http');
   assert.equal(transportFlag('http'), 'http');
   assert.equal(transportFlag(''), 'http');
   assert.equal(transportFlag('sse'), 'sse');
-  assert.equal(transportFlag('stdio'), 'http');
+  assert.equal(transportFlag('stdio'), 'stdio');
+  assert.equal(transportFlag('weird'), 'http');
   assert.equal(transportFlag(undefined), 'http');
 });
 
@@ -283,6 +286,81 @@ test('removeMcpServer: best-effort — 抛错（如 server 不存在）不外抛
   const res = await removeMcpServer({ id: 'c1', slug: 'x' }, { execFile, cwd: '/w' });
   assert.equal(res.ok, false);
   assert.match(res.reason, /No such server/);
+});
+
+// --- stdio (P2) local subprocess transport ----------------------------------
+
+test('transportFlag: stdio→stdio（不再误映射为 http）', () => {
+  assert.equal(transportFlag('stdio'), 'stdio');
+});
+
+test('isStdioConfig: transport=stdio 或 有 command 无 server_url 判为 stdio', () => {
+  assert.equal(isStdioConfig({ transport: 'stdio' }), true);
+  assert.equal(isStdioConfig({ command: 'npx', args: ['x'] }), true); // command, no url
+  assert.equal(isStdioConfig({ transport: 'remote_http', server_url: 'https://x/mcp' }), false);
+  assert.equal(isStdioConfig({ command: 'npx', server_url: 'https://x/mcp' }), false); // url present → not stdio
+  assert.equal(isStdioConfig(null), false);
+});
+
+test('parseArgs: 接受数组、JSON 字符串，其他→[]', () => {
+  assert.deepEqual(parseArgs(['a', 'b']), ['a', 'b']);
+  assert.deepEqual(parseArgs('["a","b"]'), ['a', 'b']);
+  assert.deepEqual(parseArgs([1, 2]), ['1', '2']); // coerced to string
+  assert.deepEqual(parseArgs(undefined), []);
+  assert.deepEqual(parseArgs('not json'), []);
+  assert.deepEqual(parseArgs({ a: 1 }), []);
+});
+
+test('upsertMcpServer (stdio): 组装 mcp add -s local -t stdio <name> -- <command> <args...>，无 -H', async () => {
+  const { calls, execFile } = recordingExec();
+  const res = await upsertMcpServer(
+    { id: 'conn-s1', slug: 'filesystem' },
+    {
+      connector_kind: 'mcp',
+      mcp_server: { transport: 'stdio', command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp'] },
+    },
+    { execFile, cwd: '/home/agent/zylos' },
+  );
+  assert.deepEqual(res, { ok: true, name: 'openmax-filesystem-conn-s1' });
+  // remove precedes add
+  assert.equal(calls[0].args[1], 'remove');
+  const add = addCall(calls);
+  assert.deepEqual(add.args, [
+    'mcp', 'add', '-s', 'local', '-t', 'stdio', 'openmax-filesystem-conn-s1',
+    '--', 'npx', '-y', '@modelcontextprotocol/server-filesystem', '/tmp',
+  ]);
+  assert.ok(!add.args.includes('-H'), 'stdio must never carry an auth header');
+  assert.equal(add.opts.cwd, '/home/agent/zylos');
+});
+
+test('upsertMcpServer (stdio): args 为 JSON 字符串也能解析成数组', async () => {
+  const { calls, execFile } = recordingExec();
+  await upsertMcpServer(
+    { id: 'conn-s2', slug: 'demo' },
+    { connector_kind: 'mcp', mcp_server: { transport: 'stdio', command: 'my-server', args: '["--flag","v"]' } },
+    { execFile, cwd: '/w' },
+  );
+  const add = addCall(calls);
+  assert.deepEqual(add.args.slice(-3), ['my-server', '--flag', 'v']);
+});
+
+test('upsertMcpServer (stdio): 缺 command → 跳过并给出 reason，不调用 CLI', async () => {
+  const { calls, execFile } = recordingExec();
+  const res = await upsertMcpServer(
+    { id: 'conn-s3', slug: 'demo' },
+    { connector_kind: 'mcp', mcp_server: { transport: 'stdio', args: ['x'] } },
+    { execFile, cwd: '/w' },
+  );
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, 'no-command');
+  assert.equal(calls.length, 0, 'no CLI invocation when stdio config has no command');
+});
+
+test('removeMcpServer: 同样适用于 stdio 命名的 server（基于 name，与传输无关）', async () => {
+  const { calls, execFile } = recordingExec();
+  const res = await removeMcpServer({ id: 'conn-s1', slug: 'filesystem' }, { execFile, cwd: '/w' });
+  assert.deepEqual(res, { ok: true, name: 'openmax-filesystem-conn-s1' });
+  assert.deepEqual(calls[0].args, ['mcp', 'remove', '-s', 'local', 'openmax-filesystem-conn-s1']);
 });
 
 // --- P1-1: token must never leak via the exec FAILURE path -------------------

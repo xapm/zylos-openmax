@@ -10,6 +10,9 @@
  * `~/.claude.json` (the settled decision — see the design proposal §9.4).
  *
  *   - HTTP:  `claude mcp add -s local -t http <name> <url> -H "<Header>: <value>"`
+ *   - stdio (P2): `claude mcp add -s local -t stdio <name> -- <command> <args...>`
+ *     (a local subprocess connector — no URL, no auth header/token; `--` separates
+ *     the subprocess argv)
  *   - remove: `claude mcp remove -s local <name>`
  *
  * DESIGN NOTES (all pinned by the proposal §9.4 / §10):
@@ -87,15 +90,42 @@ export function mcpServerName(slug, connectionId) {
 
 /**
  * Map the Acquire `mcp_server.transport` to the Claude CLI `-t` transport flag.
- * P0 in scope is remote_http → "http". "sse" passes through (legacy remote), and
- * anything unknown (incl. "stdio", a P2 shape not materialized here) defaults to
- * "http" — the only remote transport we assemble a URL for.
+ * remote_http → "http", "sse" → "sse" (legacy remote), "stdio" → "stdio" (P2
+ * local subprocess). Anything unknown/empty defaults to "http" — the primary
+ * remote transport. Callers branch on stdio separately (its argv is command-based,
+ * not URL-based).
  */
 export function transportFlag(transport) {
   const t = String(transport || '').toLowerCase();
-  if (t === 'remote_http' || t === 'http' || t === '' ) return 'http';
+  if (t === 'stdio') return 'stdio';
   if (t === 'sse') return 'sse';
   return 'http';
+}
+
+/**
+ * Whether an mcp_server config describes a stdio (P2 local subprocess) connector.
+ * True when the transport says stdio, OR (defensively) when it carries a `command`
+ * and no `server_url` — a remote_http config always has server_url, a stdio one a
+ * command. This split decides which `upsertMcpServer` branch runs.
+ */
+export function isStdioConfig(mcp) {
+  if (!mcp || typeof mcp !== 'object') return false;
+  if (String(mcp.transport || '').toLowerCase() === 'stdio') return true;
+  return !!mcp.command && !mcp.server_url;
+}
+
+/**
+ * Parse mcp_server.args into a string[]. The REST DTO may deliver it as a JSON
+ * array (native fetch parses it) or as a JSON string (belt-and-suspenders, like
+ * parseHeadersTemplate). Anything else → []. Each element is coerced to a string.
+ */
+export function parseArgs(args) {
+  let arr = args;
+  if (typeof arr === 'string') {
+    try { arr = JSON.parse(arr); } catch { return []; }
+  }
+  if (!Array.isArray(arr)) return [];
+  return arr.map((a) => (a == null ? '' : String(a)));
 }
 
 /** Scrub known secret substrings from a string (best-effort, all occurrences). */
@@ -211,11 +241,39 @@ export async function upsertMcpServer(conn, acquireResponse, deps = {}) {
   const connId = conn && conn.id;
   try {
     const mcp = acquireResponse && acquireResponse.mcp_server;
-    if (!mcp || !mcp.server_url) {
-      warn(`[mcp-config] upsert skipped conn=${connId}: acquire response carries no mcp_server.server_url`);
+    if (!mcp || typeof mcp !== 'object') {
+      warn(`[mcp-config] upsert skipped conn=${connId}: acquire response carries no mcp_server`);
       return { ok: false, reason: 'no-mcp-server' };
     }
     const name = mcpServerName(conn && conn.slug, connId);
+
+    // stdio (P2): a local subprocess connector — command + args, NO server_url and
+    // NO auth token/header (the whole auth_injection / header / query-token /
+    // redaction path is N/A). Its argv is command-based, so it is assembled here
+    // separately from the remote_http path below.
+    if (isStdioConfig(mcp)) {
+      if (!mcp.command) {
+        warn(`[mcp-config] upsert skipped conn=${connId}: stdio mcp_server carries no command`);
+        return { ok: false, reason: 'no-command' };
+      }
+      const command = String(mcp.command);
+      const cmdArgs = parseArgs(mcp.args);
+      // Remove-then-add for clean idempotent refresh (same as the remote path).
+      try {
+        await execFile('claude', ['mcp', 'remove', '-s', 'local', name], { cwd, timeout: timeoutMs });
+      } catch { /* no prior server registered — fine */ }
+      // `--` separates the subprocess argv from claude's own flags.
+      const args = ['mcp', 'add', '-s', 'local', '-t', 'stdio', name, '--', command, ...cmdArgs];
+      await execFile('claude', args, { cwd, timeout: timeoutMs });
+      log(`[mcp-config] MCP server upserted (stdio) name=${name} command=${command} cwd=${cwd}`);
+      return { ok: true, name };
+    }
+
+    // remote_http (P0): requires a server_url.
+    if (!mcp.server_url) {
+      warn(`[mcp-config] upsert skipped conn=${connId}: acquire response carries no mcp_server.server_url`);
+      return { ok: false, reason: 'no-mcp-server' };
+    }
     const authHeader = buildAuthHeader({
       accessToken: acquireResponse.access_token,
       tokenType: acquireResponse.token_type,

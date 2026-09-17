@@ -347,3 +347,30 @@ test('P1-1 upsertMcpServer: query 型 auth 失败也不漏 URL 里的 token', as
   assert.equal(res.ok, false);
   assert.ok(!res.reason.includes(TOKEN), `reason leaked the query token: ${res.reason}`);
 });
+
+test('P1-R2 upsertMcpServer: query 型 auth 无 exit code 回退时，raw 与 URL 编码后的 token 都不泄露', async () => {
+  // zylos0t R2 repro: a token with URL-special chars, query-location auth, and a
+  // non-exec error (no .code) → the fallback returns the redacted e.message. The
+  // URL carries encodeURIComponent(token), so BOTH forms must be scrubbed.
+  const TOKEN = 'tok/a+b=';
+  const ENCODED = encodeURIComponent(TOKEN); // "tok%2Fa%2Bb%3D"
+  const warns = [];
+  const execFile = async (file, args) => {
+    if (args[1] === 'add') throw new Error(`failed running: claude ${args.join(' ')}`); // no .code → fallback
+    return { stdout: '' };
+  };
+  const res = await upsertMcpServer(
+    { id: 'cq', slug: 'demo' },
+    { connector_kind: 'mcp', access_token: TOKEN,
+      auth_injection: { location: 'query', name: 'access_token', value_template: '{token}' },
+      mcp_server: { transport: 'remote_http', server_url: 'https://demo/mcp' } },
+    { execFile, cwd: '/w', warn: (m) => warns.push(m) },
+  );
+  assert.equal(res.ok, false);
+  // Neither the raw token nor its URL-encoded form may appear in the reason…
+  assert.ok(!res.reason.includes(TOKEN), `reason leaked the raw token: ${res.reason}`);
+  assert.ok(!res.reason.includes(ENCODED), `reason leaked the URL-encoded token: ${res.reason}`);
+  // …nor in the warn log.
+  assert.ok(warns.length > 0, 'expected a warn log');
+  assert.ok(warns.every((l) => !l.includes(TOKEN) && !l.includes(ENCODED)), `warn log leaked the token: ${warns.join(' | ')}`);
+});

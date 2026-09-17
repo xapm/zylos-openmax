@@ -247,8 +247,17 @@ export async function upsertMcpServer(conn, acquireResponse, deps = {}) {
     return { ok: true, name };
   } catch (e) {
     // Redact the token: on a failed `claude mcp add`, e.message/.cmd carry the
-    // full argv including the `-H` auth header and any query-auth URL.
-    const reason = safeExecFailure('add', e, [acquireResponse && acquireResponse.access_token]);
+    // full argv including the `-H` auth header AND, for query-location auth, the
+    // token in the URL where it rides as encodeURIComponent(...) — so we must
+    // scrub BOTH the raw token and its URL-encoded form (exact-substring
+    // redaction won't catch the encoded value otherwise). encodeURIComponent is
+    // per-character, so encodeURIComponent(token) is always a substring of the
+    // encoded URL value regardless of any value_template prefix/suffix.
+    const tok = acquireResponse && acquireResponse.access_token;
+    const secrets = tok
+      ? [...new Set([String(tok), encodeURIComponent(String(tok))])] // dedupe (equal when no special chars)
+      : [];
+    const reason = safeExecFailure('add', e, secrets);
     warn(`[mcp-config] upsertMcpServer failed conn=${connId}: ${reason}`);
     return { ok: false, reason };
   }

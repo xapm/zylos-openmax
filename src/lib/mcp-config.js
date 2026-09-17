@@ -37,8 +37,11 @@
  *     throwing into the connection-event handler.
  *
  * SECURITY: the token rides in a `-H` argument (an argv, via execFile — no shell,
- * so no shell-injection surface). It is NEVER logged: log lines carry the server
- * name, URL and cwd only, never the assembled headers.
+ * so no shell-injection surface). It is NEVER logged: success log lines carry the
+ * server name, URL and cwd only, never the assembled headers, and the FAILURE path
+ * never surfaces the exec error's `.message` / `.cmd` / `.stdout` / `.stderr` raw
+ * (those carry the full argv incl. the `-H` auth header) — see safeExecFailure,
+ * which returns an exit-code-only reason (or a secret-redacted fallback).
  */
 
 import { execFile as execFileCb } from 'child_process';
@@ -93,6 +96,32 @@ export function transportFlag(transport) {
   if (t === 'remote_http' || t === 'http' || t === '' ) return 'http';
   if (t === 'sse') return 'sse';
   return 'http';
+}
+
+/** Scrub known secret substrings from a string (best-effort, all occurrences). */
+function redactSecrets(str, secrets = []) {
+  let out = String(str == null ? '' : str);
+  for (const s of secrets) {
+    if (s) out = out.split(String(s)).join('***');
+  }
+  return out;
+}
+
+/**
+ * Build a log/return-safe failure reason for a `claude mcp` exec.
+ *
+ * SECURITY: a promisified execFile rejection carries the FULL argv in
+ * `.message` / `.cmd` (and possibly the token in `.stdout` / `.stderr`). For an
+ * `add`, that argv includes `-H "Authorization: <token>"` (and, for query-auth,
+ * the token in the URL). Surfacing `e.message` raw — as the previous catch blocks
+ * did — leaks the token into logs and the upstream error reason. So we NEVER
+ * surface argv/message/stdout/stderr: we return the exit code alone, and only when
+ * there is no exit code (a non-exec error) fall back to a secret-redacted message.
+ */
+function safeExecFailure(op, e, secrets = []) {
+  const code = e && (e.code != null ? e.code : e.signal);
+  if (code != null && code !== '') return `claude mcp ${op} failed (exit ${code})`;
+  return `claude mcp ${op} failed: ${redactSecrets(e && e.message, secrets)}`;
 }
 
 /** Parse mcp_server.headers_template into a plain string→string object. */
@@ -217,8 +246,11 @@ export async function upsertMcpServer(conn, acquireResponse, deps = {}) {
     log(`[mcp-config] MCP server upserted name=${name} url=${mcp.server_url} cwd=${cwd}`);
     return { ok: true, name };
   } catch (e) {
-    warn(`[mcp-config] upsertMcpServer failed conn=${connId}: ${e.message}`);
-    return { ok: false, reason: e.message };
+    // Redact the token: on a failed `claude mcp add`, e.message/.cmd carry the
+    // full argv including the `-H` auth header and any query-auth URL.
+    const reason = safeExecFailure('add', e, [acquireResponse && acquireResponse.access_token]);
+    warn(`[mcp-config] upsertMcpServer failed conn=${connId}: ${reason}`);
+    return { ok: false, reason };
   }
 }
 
@@ -245,7 +277,10 @@ export async function removeMcpServer(conn, deps = {}) {
     log(`[mcp-config] MCP server removed name=${name} cwd=${cwd}`);
     return { ok: true, name };
   } catch (e) {
-    warn(`[mcp-config] removeMcpServer failed conn=${connId}: ${e.message}`);
-    return { ok: false, reason: e.message };
+    // `remove` argv holds no token, but stay consistent (exit-code-only) so no
+    // exec message/argv is ever surfaced raw from this module.
+    const reason = safeExecFailure('remove', e);
+    warn(`[mcp-config] removeMcpServer failed conn=${connId}: ${reason}`);
+    return { ok: false, reason };
   }
 }

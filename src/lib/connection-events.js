@@ -137,10 +137,14 @@ export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
       // Only a genuinely unknown/legacy non-direct, non-proxy mode is unsupported.
       // An unexpected connection from the backend must never crash the event
       // handler — just skip + log.
+      // Hoisted so the post-refresh index persistence below (which must run AFTER
+      // warmIdentityAndCatalog's wholesale replaceIndexFromList) can see the
+      // Acquire-derived MCP taxonomy.
+      let acquiredCred = null;
       if (data.credential_mode === 'direct') {
         try {
-          const cred = await acquireCredential(orgId, connectionId, { post });
-          saveCredentialCache(connectionId, cred, data.provider, credentialsDir);
+          acquiredCred = await acquireCredential(orgId, connectionId, { post });
+          saveCredentialCache(connectionId, acquiredCred, data.provider, credentialsDir);
           log(`[${slug}] direct credential acquired + cached conn=${connectionId} provider=${data.provider || '?'}`);
           // Route A sink: an MCP connector is a direct-mode connection whose Acquire
           // response carries connector_kind="mcp" + a structured mcp_server. Rather
@@ -149,8 +153,8 @@ export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
           // discovers, and calls its tools. The Acquire response is authoritative
           // (the WS event may not carry connector_kind). upsertMcpServer is
           // best-effort and never throws, so it cannot break the credential path.
-          if (isMcpConnection(cred)) {
-            const r = await upsertMcpServer({ id: connectionId, slug: data.provider }, cred, mcpDeps);
+          if (isMcpConnection(acquiredCred)) {
+            const r = await upsertMcpServer({ id: connectionId, slug: data.provider }, acquiredCred, mcpDeps);
             if (r && r.ok) log(`[${slug}] MCP server materialized conn=${connectionId} name=${r.name}`);
           }
         } catch (e) {
@@ -171,6 +175,27 @@ export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
         }
       } catch (e) {
         warn(`[${slug}] identity/catalog warm failed conn=${connectionId}: ${e.message}`);
+      }
+      // (P1-2) Persist the Acquire-derived MCP taxonomy into the index AFTER the
+      // warm refresh. warmIdentityAndCatalog rebuilds the index wholesale from the
+      // agent-connections list (replaceIndexFromList), which may NOT carry
+      // connector_kind — so an MCP server we just materialized would leave the
+      // index entry connectorKind:null, and teardown (revoke/disconnect/reauth,
+      // which read ONLY the index) would never remove it → an orphaned local MCP
+      // server holding a dead token. Writing the Acquire-authoritative
+      // connector_kind here (additively — it fills the null without nulling
+      // slug/app/mode) guarantees a later teardown recognizes it as MCP.
+      if (isMcpConnection(acquiredCred)) {
+        try {
+          upsertConnection({
+            connection_id: connectionId,
+            application_slug: data.provider,
+            connector_kind: acquiredCred.connector_kind,
+            credential_mode: acquiredCred.credential_mode,
+          }, idxPath);
+        } catch (e) {
+          warn(`[${slug}] MCP taxonomy persist failed conn=${connectionId}: ${e.message}`);
+        }
       }
       // Surface the new capability to the agent session: without this a bot only
       // learns a connection exists if it happens to run conn.list. On authorize we
@@ -225,6 +250,15 @@ export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
             if (isMcpConnection(cred)) {
               const r = await upsertMcpServer({ id: connectionId, slug: data.provider }, cred, mcpDeps);
               if (r && r.ok) log(`[${slug}] MCP server refreshed conn=${connectionId} name=${r.name}`);
+              // (P1-2) Persist the Acquire-derived MCP taxonomy so a later teardown
+              // recognizes it (the credential_updated event carries no connector_kind).
+              // Additive — fills connectorKind without nulling other index fields.
+              upsertConnection({
+                connection_id: connectionId,
+                application_slug: data.provider,
+                connector_kind: cred.connector_kind,
+                credential_mode: cred.credential_mode,
+              }, idxPath);
             }
           } else {
             deleteCredentialCache(connectionId, credentialsDir);

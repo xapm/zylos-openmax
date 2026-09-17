@@ -476,6 +476,51 @@ test('connection.reauth_needed (MCP): removes the MCP server but keeps the conne
   assert.equal(entry.connectorKind, 'mcp');
 });
 
+test('P1-2 (regression): sparse authorize + list refresh WITHOUT connector_kind — the Acquire connector_kind:mcp is persisted, so a later revoke removes the server', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  const idxPath = indexPathForOrg('org-1', connectDir);
+
+  // Acquire (post) is authoritative: connector_kind mcp + a structured mcp_server.
+  const post = async () => ({
+    credential_mode: 'direct', connector_kind: 'mcp', access_token: 'mcp-tok', token_type: 'bearer',
+    mcp_server: { transport: 'remote_http', server_url: 'https://mcp.linear.app/rpc' },
+  });
+  // The agent-connections list refresh returns the connection but WITHOUT
+  // connector_kind (the exact gap zylos0t flagged): warmIdentityAndCatalog
+  // rebuilds the index from it wholesale, leaving connectorKind null unless the
+  // Acquire value is re-persisted afterward. The actions endpoint returns [].
+  const get = async (orgId, urlPath) => {
+    if (urlPath.endsWith('/connections')) {
+      return { connections: [{ id: 'conn-mcp-6', application_id: 'app-1', application_slug: 'linear', credential_mode: 'direct', status: 'active' }] };
+    }
+    return []; // actions
+  };
+  const mcp = recordingMcpExec();
+
+  // authorize event carries NO connector_kind either.
+  const frame = { payload: { event: 'connection.authorized', data: {
+    connection_id: 'conn-mcp-6', provider: 'linear', credential_mode: 'direct',
+  } } };
+  await handleConnectionEvent(baseOrgConfig, frame, {
+    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w',
+  });
+
+  // (a) despite neither the event nor the list carrying it, the index entry ends
+  // up connectorKind:'mcp' (persisted from the authoritative Acquire response).
+  assert.equal(readIndex(idxPath).connections['conn-mcp-6'].connectorKind, 'mcp',
+    'Acquire-derived connector_kind must be persisted into the index post-refresh');
+  assert.ok(mcp.addArgs(), 'authorize must have materialized the MCP server');
+
+  // (b) a subsequent revoke reads ONLY the index, recognizes it as MCP, and
+  // removes the local server — the orphaned-server bug is gone.
+  const mcp2 = recordingMcpExec();
+  const rframe = { payload: { event: 'connection.revoked', data: { connection_id: 'conn-mcp-6', provider: 'linear' } } };
+  await handleConnectionEvent(baseOrgConfig, rframe, {
+    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp2.exec, mcpCwd: '/w',
+  });
+  assert.deepEqual(mcp2.removeArgs(), ['mcp', 'remove', '-s', 'local', 'openmax-linear-conn-mcp-6']);
+});
+
 test('MCP sink is best-effort: a throwing command runner never breaks the handler (authorize still caches the credential)', async () => {
   const { connectDir, credentialsDir, catalogDir } = tmpDirs();
   const { get, post } = mcpHttp();

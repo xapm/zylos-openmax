@@ -284,3 +284,66 @@ test('removeMcpServer: best-effort — 抛错（如 server 不存在）不外抛
   assert.equal(res.ok, false);
   assert.match(res.reason, /No such server/);
 });
+
+// --- P1-1: token must never leak via the exec FAILURE path -------------------
+
+test('P1-1 upsertMcpServer: 失败(带 exit code)绝不把 token 漏进 reason/日志（仅 exit code）', async () => {
+  const TOKEN = 'super-secret-tok-abc123';
+  const warns = [];
+  // Mirror a real promisified execFile rejection: .message/.cmd carry the FULL
+  // argv (incl. -H "Authorization: Bearer <token>"), .stderr may carry it too.
+  const execFile = async (file, args) => {
+    if (args[1] === 'add') {
+      const e = new Error(`Command failed: claude ${args.join(' ')}`);
+      e.code = 1;
+      e.cmd = `claude ${args.join(' ')}`;
+      e.stderr = `handshake failed ${TOKEN}`;
+      throw e;
+    }
+    return { stdout: '' }; // remove succeeds
+  };
+  const res = await upsertMcpServer(
+    { id: 'c1', slug: 'linear' },
+    { connector_kind: 'mcp', access_token: TOKEN, token_type: 'bearer',
+      mcp_server: { transport: 'remote_http', server_url: 'https://mcp/rpc' } },
+    { execFile, cwd: '/w', warn: (m) => warns.push(m) },
+  );
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, 'claude mcp add failed (exit 1)', 'reason must be exit-code-only');
+  assert.ok(!res.reason.includes(TOKEN), `reason leaked the token: ${res.reason}`);
+  assert.ok(warns.length > 0 && warns.every((l) => !l.includes(TOKEN)), 'warn log leaked the token');
+});
+
+test('P1-1 upsertMcpServer: 失败(无 exit code)回退到脱敏消息，token 被 *** 替换', async () => {
+  const TOKEN = 'tok-xyz-77';
+  const execFile = async (file, args) => {
+    if (args[1] === 'add') throw new Error(`spawn error: claude ${args.join(' ')}`); // no .code
+    return { stdout: '' };
+  };
+  const res = await upsertMcpServer(
+    { id: 'c1', slug: 'linear' },
+    { connector_kind: 'mcp', access_token: TOKEN,
+      mcp_server: { transport: 'remote_http', server_url: 'https://mcp/rpc' } },
+    { execFile, cwd: '/w' },
+  );
+  assert.equal(res.ok, false);
+  assert.ok(!res.reason.includes(TOKEN), `reason leaked the token: ${res.reason}`);
+  assert.ok(res.reason.includes('***'), `expected redaction marker in: ${res.reason}`);
+});
+
+test('P1-1 upsertMcpServer: query 型 auth 失败也不漏 URL 里的 token', async () => {
+  const TOKEN = 'qtok-9';
+  const execFile = async (file, args) => {
+    if (args[1] === 'add') throw new Error(`failed running: claude ${args.join(' ')}`); // no .code → fallback
+    return { stdout: '' };
+  };
+  const res = await upsertMcpServer(
+    { id: 'cq', slug: 'demo' },
+    { connector_kind: 'mcp', access_token: TOKEN,
+      auth_injection: { location: 'query', name: 'access_token', value_template: '{token}' },
+      mcp_server: { transport: 'remote_http', server_url: 'https://demo/mcp' } },
+    { execFile, cwd: '/w' },
+  );
+  assert.equal(res.ok, false);
+  assert.ok(!res.reason.includes(TOKEN), `reason leaked the query token: ${res.reason}`);
+});

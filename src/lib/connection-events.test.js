@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { handleConnectionEvent, acquireCredential, isEventForMe, sendOwnerReauthDm, buildConnectionAuthorizedNotice } from './connection-events.js';
-import { readIndex, indexPathForOrg } from './connect-store.js';
+import { readIndex, indexPathForOrg, upsertConnection } from './connect-store.js';
 
 // Regression coverage for the 2026-08-04 security fix: cws-core no longer
 // accepts a client-supplied agent_member_id, and its
@@ -321,6 +321,173 @@ test('sendOwnerReauthDm: no owner bound → no DM sent, no HTTP calls', async ()
   assert.equal(r.sent, false);
   assert.equal(r.reason, 'no-owner');
   assert.equal(calls.length, 0, 'no owner → must not touch the network');
+});
+
+// -----------------------------------------------------------------------------
+// Route A MCP sink: an MCP connection (connector_kind="mcp", direct mode) is
+// materialized into a local Claude Code MCP server via the injected command
+// runner (mcpExecFile). The Acquire response is authoritative for connector_kind
+// + mcp_server; teardown events (revoke/disconnect/reauth), which do NOT carry
+// connector_kind, recognize MCP from the additively-threaded index entry.
+// -----------------------------------------------------------------------------
+
+// A recording MCP command runner (injected as mcpExecFile). Mirrors the
+// promisified execFile shape; captures every `claude mcp ...` argv.
+function recordingMcpExec() {
+  const calls = [];
+  return {
+    calls,
+    exec: async (file, args, opts) => { calls.push({ file, args, opts }); return { stdout: '' }; },
+    addArgs: () => calls.find((c) => c.args[0] === 'mcp' && c.args[1] === 'add')?.args,
+    removeArgs: () => calls.find((c) => c.args[0] === 'mcp' && c.args[1] === 'remove')?.args,
+  };
+}
+
+// An acquire (post) double that returns an MCP direct-mode credential.
+function mcpHttp() {
+  const calls = [];
+  return {
+    calls,
+    get: async (orgId, urlPath) => { calls.push({ method: 'GET', path: urlPath }); return { connections: [] }; },
+    post: async (orgId, urlPath) => {
+      calls.push({ method: 'POST', path: urlPath });
+      return {
+        credential_mode: 'direct',
+        connector_kind: 'mcp',
+        access_token: 'mcp-tok',
+        token_type: 'bearer',
+        mcp_server: { transport: 'remote_http', server_url: 'https://mcp.linear.app/rpc' },
+      };
+    },
+  };
+}
+
+test('connection.authorized (MCP): acquires + materializes a local MCP server via the injected runner', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  const { get, post } = mcpHttp();
+  const mcp = recordingMcpExec();
+
+  const frame = { payload: { event: 'connection.authorized', data: {
+    connection_id: 'conn-mcp-1', provider: 'linear', credential_mode: 'direct', connector_kind: 'mcp',
+  } } };
+  await handleConnectionEvent(baseOrgConfig, frame, {
+    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/home/agent/zylos',
+  });
+
+  const add = mcp.addArgs();
+  assert.ok(add, `MCP sink must run 'claude mcp add': ${JSON.stringify(mcp.calls.map((c) => c.args))}`);
+  assert.deepEqual(add, [
+    'mcp', 'add', '-s', 'local', '-t', 'http',
+    'openmax-linear-conn-mcp-1', 'https://mcp.linear.app/rpc',
+    '-H', 'Authorization: Bearer mcp-tok',
+  ]);
+  // cwd forced to the agent launch dir (not the comm-bridge service cwd)
+  assert.equal(mcp.calls.find((c) => c.args[1] === 'add').opts.cwd, '/home/agent/zylos');
+});
+
+test('connection.authorized (non-MCP direct): must NOT materialize any MCP server', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  const { get, post } = recordingHttp(); // returns credential_mode:direct, no connector_kind
+  const mcp = recordingMcpExec();
+
+  const frame = { payload: { event: 'connection.authorized', data: {
+    connection_id: 'conn-http-1', provider: 'github', credential_mode: 'direct',
+  } } };
+  await handleConnectionEvent(baseOrgConfig, frame, {
+    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec,
+  });
+  assert.equal(mcp.calls.length, 0, 'a plain HTTP direct connection must never touch the MCP sink');
+});
+
+test('connection.credential_updated (MCP): re-acquires and refreshes the MCP server (new token)', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  // Pre-seed a cache file so the credential_updated direct-detector fires.
+  fs.mkdirSync(credentialsDir, { recursive: true });
+  fs.writeFileSync(path.join(credentialsDir, 'conn-mcp-2.json'), JSON.stringify({ credential_mode: 'direct', access_token: 'old' }));
+
+  const post = async () => ({
+    credential_mode: 'direct', connector_kind: 'mcp', access_token: 'mcp-tok-new', token_type: 'bearer',
+    mcp_server: { transport: 'remote_http', server_url: 'https://mcp.linear.app/rpc' },
+  });
+  const get = async () => { throw new Error('credential_updated must not call GET'); };
+  const mcp = recordingMcpExec();
+
+  const frame = { payload: { event: 'connection.credential_updated', data: { connection_id: 'conn-mcp-2', provider: 'linear' } } };
+  await handleConnectionEvent(baseOrgConfig, frame, {
+    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w',
+  });
+
+  const add = mcp.addArgs();
+  assert.ok(add, 'credential_updated on an MCP connection must re-materialize the server');
+  assert.ok(add.includes('Authorization: Bearer mcp-tok-new'), `refreshed server must carry the new token: ${JSON.stringify(add)}`);
+});
+
+for (const event of ['connection.revoked', 'connection.disconnected']) {
+  test(`${event} (MCP): tears down the local MCP server (recognized from the index)`, async () => {
+    const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+    // Pre-seed the index with an MCP connection (the teardown event does not carry
+    // connector_kind — the index entry is the only local signal).
+    const idxPath = indexPathForOrg('org-1', connectDir);
+    upsertConnection({ connection_id: 'conn-mcp-3', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' }, idxPath);
+    const { get, post } = recordingHttp();
+    const mcp = recordingMcpExec();
+
+    const frame = { payload: { event, data: { connection_id: 'conn-mcp-3', provider: 'linear' } } };
+    await handleConnectionEvent(baseOrgConfig, frame, {
+      get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w',
+    });
+
+    assert.deepEqual(mcp.removeArgs(), ['mcp', 'remove', '-s', 'local', 'openmax-linear-conn-mcp-3']);
+    // and the connection is dropped from the index as before
+    assert.equal(readIndex(idxPath).connections['conn-mcp-3'], undefined);
+  });
+}
+
+test('connection.revoked (non-MCP): must NOT call the MCP sink', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  const idxPath = indexPathForOrg('org-1', connectDir);
+  upsertConnection({ connection_id: 'conn-http-3', application_slug: 'github', connector_kind: 'http', credential_mode: 'direct', status: 'active' }, idxPath);
+  const { get, post } = recordingHttp();
+  const mcp = recordingMcpExec();
+
+  const frame = { payload: { event: 'connection.revoked', data: { connection_id: 'conn-http-3', provider: 'github' } } };
+  await handleConnectionEvent(baseOrgConfig, frame, {
+    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec,
+  });
+  assert.equal(mcp.calls.length, 0, 'a non-MCP revoke must never touch the MCP sink');
+});
+
+test('connection.reauth_needed (MCP): removes the MCP server but keeps the connection indexed (needs_reauth)', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  const idxPath = indexPathForOrg('org-1', connectDir);
+  upsertConnection({ connection_id: 'conn-mcp-4', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' }, idxPath);
+  const { get, post } = recordingHttp();
+  const mcp = recordingMcpExec();
+
+  const frame = { payload: { event: 'connection.reauth_needed', data: { connection_id: 'conn-mcp-4', provider: 'linear', trigger: 'provider_401' } } };
+  await handleConnectionEvent(baseOrgConfig, frame, {
+    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w',
+  });
+
+  assert.deepEqual(mcp.removeArgs(), ['mcp', 'remove', '-s', 'local', 'openmax-linear-conn-mcp-4']);
+  // still indexed, flagged needs_reauth (connectorKind preserved additively)
+  const entry = readIndex(idxPath).connections['conn-mcp-4'];
+  assert.equal(entry.status, 'needs_reauth');
+  assert.equal(entry.connectorKind, 'mcp');
+});
+
+test('MCP sink is best-effort: a throwing command runner never breaks the handler (authorize still caches the credential)', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  const { get, post } = mcpHttp();
+  const mcpExecFile = async () => { throw new Error('claude CLI missing'); };
+
+  const frame = { payload: { event: 'connection.authorized', data: {
+    connection_id: 'conn-mcp-5', provider: 'linear', credential_mode: 'direct', connector_kind: 'mcp',
+  } } };
+  // Must resolve, not reject, despite the runner throwing.
+  await handleConnectionEvent(baseOrgConfig, frame, { get, post, connectDir, credentialsDir, catalogDir, mcpExecFile });
+  // The credential path is unaffected — the direct credential is still cached.
+  assert.ok(fs.existsSync(path.join(credentialsDir, 'conn-mcp-5.json')), 'a sink failure must not break credential caching');
 });
 
 test('connection.authorized notify is best-effort: a throwing notify never breaks the handler', async () => {

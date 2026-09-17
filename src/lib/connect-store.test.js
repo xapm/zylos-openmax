@@ -188,6 +188,46 @@ test('replaceIndexFromList 整体重建也捕获 credentialMode（走 toEntry）
   assert.ok(!('credentialSource' in readIndex(idx).connections.c2));
 });
 
+// --- connector taxonomy: connectorKind（Route A：MCP 分流字段）----------------
+
+test('toEntry 捕获 connectorKind（mcp 与 http 都认，含 camelCase 别名），缺省为 null', () => {
+  const idx = tmpIndex();
+  upsertConnection(
+    { connection_id: 'c1', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' },
+    idx,
+  );
+  upsertConnection(
+    { connection_id: 'c2', application_slug: 'gmail', connectorKind: 'http', credential_mode: 'direct', status: 'active' },
+    idx,
+  );
+  upsertConnection({ connection_id: 'c3', application_slug: 'notion', status: 'active' }, idx);
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp');
+  assert.equal(readIndex(idx).connections.c2.connectorKind, 'http'); // camelCase 别名也认
+  assert.equal(readIndex(idx).connections.c3.connectorKind, null);   // 缺省不臆造
+});
+
+test('upsert 叠加：稀疏事件（无 connector_kind）不清空已知的 mcp（撤销/reauth 拆除路径依赖它）', () => {
+  const idx = tmpIndex();
+  upsertConnection(
+    { connection_id: 'c1', application_id: 'app-1', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' },
+    idx,
+  );
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp');
+  // 后续只带 slug 的事件（如 credential_updated / revoke，均不带 connector_kind）不得冲成 null
+  upsertConnection({ connection_id: 'c1', provider: 'linear', status: 'active' }, idx);
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp');
+});
+
+test('replaceIndexFromList 整体重建也捕获 connectorKind（走 toEntry）', () => {
+  const idx = tmpIndex();
+  replaceIndexFromList([
+    { id: 'c1', application_id: 'app-1', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' },
+    { id: 'c2', application_id: 'app-2', application_slug: 'gmail', connectorKind: 'http', credential_mode: 'direct', status: 'active' },
+  ], idx);
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp');
+  assert.equal(readIndex(idx).connections.c2.connectorKind, 'http');
+});
+
 // --- replaceIndexFromList 孤儿剪枝（全量刷新纠正本地索引）---------------------
 
 test('replaceIndexFromList 剪除孤儿条目（slug 与 credentialMode 皆 null），保留 direct/proxy', () => {

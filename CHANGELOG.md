@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.20.0] — 2026-09-17
+
+### Added
+
+- **MCP connector sink (Route A).** An MCP-kind cws-connect connection is now materialized into a live local Claude Code MCP server, so the agent's runtime connects to the remote MCP server directly and discovers/calls its tools — rather than routing per-action through `conn.invoke`. A new `src/lib/mcp-config.js` (`upsertMcpServer` / `removeMcpServer`) registers the server through the Claude Code CLI (`claude mcp add/remove -s local`), never by hand-editing `~/.claude.json`.
+
+  - The connections index now threads a `connectorKind` field (`"http"` | `"mcp"`) additively alongside `credentialMode`, so teardown events that don't carry the field can still recognize an MCP connection.
+  - The connection-event lifecycle drives the sink: `connection.authorized` acquires the credential and materializes the server; `connection.credential_updated` refreshes it with the rotated token; `connection.revoked` / `connection.disconnected` / `connection.reauth_needed` remove it. All hooks are best-effort (a CLI failure never breaks the credential/index path).
+  - The auth header is assembled from the Acquire response's `auth_injection` recipe (custom header + `{token}` template), falling back to the canonical `Authorization: <scheme> <token>` convention derived from `token_type` — never a hardcoded Bearer. Non-secret `headers_template` headers are forwarded too, with `auth_injection` winning on a same-name clash.
+  - The `-s local` config is written under the agent's own launch cwd (resolved via `ZYLOS_DIR` / `~/zylos`, not the comm-bridge service cwd) so the running agent actually sees the server.
+
+  Backend prerequisites (cws-connect `application_mcp_servers` table + `applications.connector_kind`, cws-core Acquire DTO passthrough) are tracked separately; this ships the agent-side sink. See the CWS-Connect MCP Integration proposal §9.4.
+
 ## [2.19.0] — 2026-09-11
 
 ### Added

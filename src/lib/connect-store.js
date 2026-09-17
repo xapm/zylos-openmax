@@ -105,6 +105,17 @@ function toEntry(conn) {
     // event may not, so it defaults to null and is filled additively by a later
     // refresh.
     credentialMode: conn.credential_mode || conn.credentialMode || null,
+    // Connector taxonomy (cws-connect, Route A): connector_kind is "http" | "mcp"
+    // (default "http" server-side; empty is treated as http). It is orthogonal to
+    // credentialMode — an MCP connector is still credential_mode=direct — and tells
+    // the agent whether to materialize the connection into a local Claude Code MCP
+    // server (see mcp-config.js) instead of routing per-action via conn.invoke.
+    // conn.list / conn.acquire carry connector_kind; a sparse WS event may not, so
+    // it defaults to null and is filled additively by a later refresh (exactly like
+    // credentialMode). Kept even on the removal path so a revoke/reauth event, which
+    // may not carry connector_kind, can still recognize an MCP connection and tear
+    // down its local MCP server.
+    connectorKind: conn.connector_kind || conn.connectorKind || null,
     status,
   };
 }
@@ -132,6 +143,10 @@ export function upsertConnection(conn, indexPath = INDEX_PATH) {
     // Additive like the rest: a sparse event (slug only, no credential_mode)
     // must never null a value a richer conn.list record already captured.
     credentialMode: entry.credentialMode ?? prev.credentialMode ?? null,
+    // Additive like the rest: a sparse event (e.g. credential_updated, which does
+    // not carry connector_kind) must never null a value a richer authorize event /
+    // conn.list record already captured — the MCP teardown path depends on it.
+    connectorKind: entry.connectorKind ?? prev.connectorKind ?? null,
     status: entry.status ?? prev.status ?? 'active',
   };
   writeIndex(index, indexPath);

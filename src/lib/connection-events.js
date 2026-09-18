@@ -43,9 +43,12 @@ export function isEventForMe(data, selfMemberId) {
 // is invokable immediately after authorize instead of paying a lazy fetch on
 // first use. cws-core derives the caller from the authenticated principal for
 // this endpoint too (security fix, 2026-08-04) — no id in the path.
-export async function warmIdentityAndCatalog(orgId, connectionId, idxPath, { get = getForOrg, catalogDir } = {}) {
+export async function warmIdentityAndCatalog(orgId, connectionId, idxPath, { get = getForOrg, catalogDir, credentialsDir } = {}) {
   const list = await get(orgId, apiPath('/connect/agents/me/connections'));
-  replaceIndexFromList(Array.isArray(list) ? list : (list?.connections || []), idxPath);
+  // Pass credentialsDir so the wholesale rebuild can re-derive an omitted
+  // connector_kind from the per-connection credential file (Problem ②) — the
+  // agent-connections list may not carry connector_kind.
+  replaceIndexFromList(Array.isArray(list) ? list : (list?.connections || []), idxPath, { credentialsDir });
   const entry = readIndex(idxPath)?.connections?.[connectionId];
   const applicationId = entry?.applicationId;
   if (!applicationId) return { applicationId: null, actionCount: 0 };
@@ -169,7 +172,7 @@ export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
       let applicationId = null;
       let actionCount = 0;
       try {
-        ({ applicationId, actionCount } = await warmIdentityAndCatalog(orgId, connectionId, idxPath, { get, catalogDir }));
+        ({ applicationId, actionCount } = await warmIdentityAndCatalog(orgId, connectionId, idxPath, { get, catalogDir, credentialsDir }));
         if (applicationId) {
           log(`[${slug}] identity resolved + action-catalog warmed conn=${connectionId} app=${applicationId} actions=${actionCount}`);
         }

@@ -24,6 +24,7 @@
 import fs from 'fs';
 import path from 'path';
 import { RUNTIME_DIR } from './session.js';
+import { readCredentialCache } from './credential-cache.js';
 
 export const CONNECT_DIR = path.join(RUNTIME_DIR, 'connect');
 export const INDEX_PATH = path.join(CONNECT_DIR, 'connections-index.json');
@@ -165,6 +166,28 @@ export function removeConnection(connectionId, indexPath = INDEX_PATH) {
 }
 
 /**
+ * Re-derive a connection's connectorKind when the authoritative list omits it.
+ * conn.list (/connect/agents/me/connections) may NOT carry connector_kind, so a
+ * naive wholesale rebuild would null it — but the MCP teardown path (revoke /
+ * reauth events read ONLY the index) depends on it, so nulling it orphans the
+ * local MCP server (Problem ②). Recover it, in order, from:
+ *   1. the PREVIOUS index entry (authorize/acquire already wrote connectorKind),
+ *   2. else the per-connection credential FILE, which still carries
+ *      `connector_kind` (saved verbatim from the Acquire response).
+ * Returns null only when no local source knows it (a legacy/http connection).
+ */
+function deriveConnectorKind(id, prevConnections, credentialsDir) {
+  const prev = prevConnections && prevConnections[id];
+  if (prev && prev.connectorKind != null) return prev.connectorKind;
+  try {
+    const cred = credentialsDir !== undefined ? readCredentialCache(id, credentialsDir) : readCredentialCache(id);
+    const k = cred && (cred.connector_kind ?? cred.connectorKind);
+    if (k != null) return k;
+  } catch { /* no credential file — fall through to null */ }
+  return null;
+}
+
+/**
  * Rebuild the index wholesale from a conn.list array (authoritative refresh).
  * Stale entries absent from the list are dropped by the wholesale rebuild.
  * Orphan entries are additionally SKIPPED: a connection whose app is
@@ -172,13 +195,24 @@ export function removeConnection(connectionId, indexPath = INDEX_PATH) {
  * null`) carries no useful discovery/routing information — it can neither be
  * resolved from an app nor routed by conn.invoke — so it must not pollute the
  * rebuilt index.
+ *
+ * connectorKind is NEVER nulled by a refresh (Problem ②): when the list item
+ * omits connector_kind, the value is re-derived from the previous index entry or
+ * the per-connection credential file (see deriveConnectorKind). An EXPLICIT
+ * connector_kind in the list always wins (so a genuine change still applies).
+ * `opts.credentialsDir` overrides where credential files are read (tests / dir
+ * injection); production uses the default CREDENTIALS_DIR.
  */
-export function replaceIndexFromList(list, indexPath = INDEX_PATH) {
+export function replaceIndexFromList(list, indexPath = INDEX_PATH, { credentialsDir } = {}) {
+  const prev = readIndex(indexPath).connections;
   const connections = {};
   for (const conn of Array.isArray(list) ? list : []) {
     const entry = toEntry(conn);
     if (!entry) continue;
     if (entry.slug == null && entry.credentialMode == null) continue;
+    if (entry.connectorKind == null) {
+      entry.connectorKind = deriveConnectorKind(entry.id, prev, credentialsDir);
+    }
     connections[entry.id] = entry;
   }
   writeIndex({ connections }, indexPath);

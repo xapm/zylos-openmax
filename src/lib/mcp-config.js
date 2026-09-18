@@ -4,15 +4,25 @@
  *
  * Route A means the agent connects to the remote MCP server DIRECTLY (cws-connect
  * is not on the tools/list · tools/call path); the platform only authorizes the
- * connection and hands us its non-secret server config + a token. This module is
- * the thin sink that turns that Acquire response into a registered MCP server via
- * the Claude Code CLI (`claude mcp add/remove`), rather than hand-editing
- * `~/.claude.json` (the settled decision — see the design proposal §9.4).
+ * connection and hands us its server config (a `raw_config` JSON template + the
+ * discrete fields) plus the connection credential. This module is the thin sink
+ * that turns that Acquire response into a registered MCP server via the Claude
+ * Code CLI, rather than hand-editing `~/.claude.json` (settled — proposal §9.4).
  *
- *   - HTTP:  `claude mcp add -s local -t http <name> <url> -H "<Header>: <value>"`
- *   - stdio (P2): `claude mcp add -s local -t stdio <name> -- <command> <args...>`
- *     (a local subprocess connector — no URL, no auth header/token; `--` separates
- *     the subprocess argv)
+ * UNIFIED INSTALL (design §4.2 / §7): every transport goes through ONE path,
+ * `claude mcp add-json <name> '<json>'`, which the CLI supports for
+ * stdio/SSE/HTTP/WebSocket alike. We build a single MCP-server JSON object —
+ * preferring the Acquire-delivered `raw_config` as the template, else assembling
+ * it from the discrete fields — and INJECT the live credential into it at install
+ * time (design Problem ①):
+ *
+ *   - HTTP/SSE/WS: the credential merges into the JSON's `headers`
+ *     (Authorization etc.), per the `auth_injection` recipe; a query-placed token
+ *     rides in the `url` instead.
+ *   - stdio:       the credential merges into the JSON's `env` (the piece that
+ *     was missing — a stdio server like github used to launch with an EMPTY env),
+ *     per the `env:<KEY>` auth-injection binding cws-connect now delivers (!176).
+ *
  *   - remove: `claude mcp remove -s local <name>`
  *
  * DESIGN NOTES (all pinned by the proposal §9.4 / §10):
@@ -26,12 +36,13 @@
  *     agent-readiness.js does (ZYLOS_DIR or ~/zylos).
  *   - The server name embeds the connection_id so two connections of the SAME app
  *     never collide (owner-confirmed default).
- *   - The auth header is assembled from the Acquire response's `auth_injection`
- *     recipe ({location, name, value_template} with a literal "{token}"), NEVER a
- *     hardcoded "Authorization: Bearer". Absent auth_injection falls back to the
- *     canonical "Authorization: <scheme> <token>" convention (scheme derived from
- *     token_type, mirroring direct-exec.js), and a `none` auth_type / no token
- *     yields no auth header at all.
+ *   - The auth header/env is assembled from the Acquire response's `auth_injection`
+ *     recipe ({location, name, value_template} with a literal "{token}", or the
+ *     string binding forms "env:KEY" / "header:Authorization(Bearer)"), NEVER a
+ *     hardcoded "Authorization: Bearer". Absent auth_injection, a token defaults to
+ *     the canonical "Authorization: <scheme> <token>" header (scheme derived from
+ *     token_type, mirroring direct-exec.js); a `none` auth_type / no token yields
+ *     no injection at all.
  *   - `protocol_version` is deliberately NOT surfaced (the REST Acquire DTO omits
  *     it; §9.4 settled to leave it out) — do not add it.
  *   - Best-effort + injectable: the command runner (`execFile`) and `cwd` are
@@ -39,12 +50,14 @@
  *     and every exec is wrapped so a CLI failure returns { ok:false } instead of
  *     throwing into the connection-event handler.
  *
- * SECURITY: the token rides in a `-H` argument (an argv, via execFile — no shell,
- * so no shell-injection surface). It is NEVER logged: success log lines carry the
- * server name, URL and cwd only, never the assembled headers, and the FAILURE path
- * never surfaces the exec error's `.message` / `.cmd` / `.stdout` / `.stderr` raw
- * (those carry the full argv incl. the `-H` auth header) — see safeExecFailure,
- * which returns an exit-code-only reason (or a secret-redacted fallback).
+ * SECURITY: the token rides inside the JSON string argument (an env value or a
+ * header value), passed via execFile (argv, no shell — no shell-injection
+ * surface). It is NEVER logged: success log lines carry the server name, type,
+ * command-or-host and cwd only, never the assembled env/headers, and the FAILURE
+ * path never surfaces the exec error's `.message` / `.cmd` / `.stdout` / `.stderr`
+ * raw (those carry the full JSON incl. the injected credential) — see
+ * safeExecFailure, which returns an exit-code-only reason (or a secret-redacted
+ * fallback that scrubs both the raw and URL-encoded token).
  */
 
 import { execFile as execFileCb } from 'child_process';
@@ -89,11 +102,10 @@ export function mcpServerName(slug, connectionId) {
 }
 
 /**
- * Map the Acquire `mcp_server.transport` to the Claude CLI `-t` transport flag.
- * remote_http → "http", "sse" → "sse" (legacy remote), "stdio" → "stdio" (P2
- * local subprocess). Anything unknown/empty defaults to "http" — the primary
- * remote transport. Callers branch on stdio separately (its argv is command-based,
- * not URL-based).
+ * Map the Acquire `mcp_server.transport` to the Claude Code MCP JSON `type`.
+ * remote_http → "http", "sse" → "sse", "stdio" → "stdio". Anything unknown/empty
+ * defaults to "http" — the primary remote transport. (A raw_config that already
+ * carries its own `type` — e.g. "ws" — is honored verbatim and never remapped.)
  */
 export function transportFlag(transport) {
   const t = String(transport || '').toLowerCase();
@@ -103,10 +115,10 @@ export function transportFlag(transport) {
 }
 
 /**
- * Whether an mcp_server config describes a stdio (P2 local subprocess) connector.
+ * Whether an mcp_server config describes a stdio (local subprocess) connector.
  * True when the transport says stdio, OR (defensively) when it carries a `command`
- * and no `server_url` — a remote_http config always has server_url, a stdio one a
- * command. This split decides which `upsertMcpServer` branch runs.
+ * and no `server_url` — a remote config always has server_url, a stdio one a
+ * command. Decides which branch of the JSON builder runs.
  */
 export function isStdioConfig(mcp) {
   if (!mcp || typeof mcp !== 'object') return false;
@@ -142,11 +154,12 @@ function redactSecrets(str, secrets = []) {
  *
  * SECURITY: a promisified execFile rejection carries the FULL argv in
  * `.message` / `.cmd` (and possibly the token in `.stdout` / `.stderr`). For an
- * `add`, that argv includes `-H "Authorization: <token>"` (and, for query-auth,
- * the token in the URL). Surfacing `e.message` raw — as the previous catch blocks
- * did — leaks the token into logs and the upstream error reason. So we NEVER
- * surface argv/message/stdout/stderr: we return the exit code alone, and only when
- * there is no exit code (a non-exec error) fall back to a secret-redacted message.
+ * `add-json`, that argv includes the JSON with the injected credential (an env
+ * value or a header value), and for query-auth the token in the URL. Surfacing
+ * `e.message` raw would leak the token into logs and the upstream error reason.
+ * So we NEVER surface argv/message/stdout/stderr: we return the exit code alone,
+ * and only when there is no exit code (a non-exec error) fall back to a
+ * secret-redacted message.
  */
 function safeExecFailure(op, e, secrets = []) {
   const code = e && (e.code != null ? e.code : e.signal);
@@ -154,10 +167,10 @@ function safeExecFailure(op, e, secrets = []) {
   return `claude mcp ${op} failed: ${redactSecrets(e && e.message, secrets)}`;
 }
 
-/** Parse mcp_server.headers_template into a plain string→string object. */
-function parseHeadersTemplate(headersTemplate) {
-  if (!headersTemplate) return {};
-  let obj = headersTemplate;
+/** Parse a headers/env template into a plain string→string object. */
+function parseStringMap(tmpl) {
+  if (!tmpl) return {};
+  let obj = tmpl;
   // The REST DTO carries it as raw JSON; native fetch parses it to an object, but
   // tolerate a JSON string too (belt-and-suspenders for other transports).
   if (typeof obj === 'string') {
@@ -172,62 +185,168 @@ function parseHeadersTemplate(headersTemplate) {
 }
 
 /**
- * Resolve the single auth header from the Acquire response's `auth_injection`
+ * Normalize an auth_injection descriptor into { location, name, valueTemplate }.
+ * Accepts the structured object {location, name, value_template} AND the string
+ * binding forms the design records (§5.1): "env:GITHUB_TOKEN",
+ * "header:Authorization", "header:Authorization(Bearer)", "query:access_token".
+ * A "(Scheme)" suffix on a string binding means the value is "<Scheme> {token}".
+ * Returns null when there is no usable descriptor.
+ */
+export function normalizeAuthInjection(ai) {
+  if (!ai) return null;
+  if (typeof ai === 'string') {
+    const m = ai.match(/^\s*(env|header|query)\s*:\s*([^()]+?)\s*(?:\(([^)]*)\))?\s*$/i);
+    if (!m) return null;
+    const name = m[2].trim();
+    if (!name) return null;
+    const scheme = m[3] && m[3].trim();
+    return { location: m[1].toLowerCase(), name, valueTemplate: scheme ? `${scheme} {token}` : '{token}' };
+  }
+  if (typeof ai === 'object' && ai.name) {
+    const location = String(ai.location || 'header').toLowerCase();
+    const valueTemplate = typeof ai.value_template === 'string' && ai.value_template ? ai.value_template : '{token}';
+    return { location, name: ai.name, valueTemplate };
+  }
+  return null;
+}
+
+/**
+ * Resolve where + how the live credential is injected. Returns
+ * { location:'header'|'env'|'query', name, value } (the {token} expanded), or
+ * null when there is nothing to inject (auth_type "none" / no token and no
+ * descriptor). With a descriptor we follow it verbatim (never a hardcoded
+ * Bearer); with no descriptor but a token present we default to the canonical
+ * Authorization header (scheme from token_type, mirroring direct-exec.js).
+ */
+export function resolveInjection({ accessToken, tokenType, authInjection } = {}) {
+  const token = accessToken == null ? '' : String(accessToken);
+  const norm = normalizeAuthInjection(authInjection);
+  if (norm) {
+    return { location: norm.location, name: norm.name, value: norm.valueTemplate.replace(/\{token\}/g, token) };
+  }
+  if (!token) return null;
+  return { location: 'header', name: 'Authorization', value: `${canonicalAuthScheme(tokenType)} ${token}` };
+}
+
+/**
+ * Resolve the single auth HEADER from the Acquire response's `auth_injection`
  * recipe (never a hardcoded Bearer). Returns { name, value } for a header-placed
- * token, or null when the token belongs in the query string (caller appends it to
- * the URL) or when there is no auth to inject (auth_type "none" / no token).
+ * token, or null when the token belongs in env or the query string, or when
+ * there is no auth to inject. Kept as a focused helper for callers/tests that
+ * only care about the header case; the JSON builder uses resolveInjection.
  *
  * @param {object} [opts]
  *   - accessToken   the acquired token (the {token} substitution value)
  *   - tokenType     credential token_type → default Authorization scheme
- *   - authInjection { location:'header'|'query', name, value_template }
+ *   - authInjection { location, name, value_template } | "header:...:" string
  */
 export function buildAuthHeader({ accessToken, tokenType, authInjection } = {}) {
-  const token = accessToken == null ? '' : String(accessToken);
-  if (authInjection && typeof authInjection === 'object' && authInjection.name) {
-    // A query-placed token cannot be a header — caller rides it in the URL.
-    if (authInjection.location === 'query') return null;
-    const vt = typeof authInjection.value_template === 'string' && authInjection.value_template
-      ? authInjection.value_template
-      : '{token}';
-    return { name: authInjection.name, value: vt.replace(/\{token\}/g, token) };
+  const inj = resolveInjection({ accessToken, tokenType, authInjection });
+  if (!inj || inj.location !== 'header') return null;
+  return { name: inj.name, value: inj.value };
+}
+
+/** Merge one header into a headers object, auth WINNING on a case-insensitive
+ * name clash (§5.4: "同名头以 auth_injection 为准"). Mutates + returns `headers`. */
+function mergeHeader(headers, name, value) {
+  const lower = name.toLowerCase();
+  for (const k of Object.keys(headers)) {
+    if (k.toLowerCase() === lower) delete headers[k];
   }
-  // No auth_injection descriptor. With no token (auth_type "none") there is no
-  // header. Otherwise fall back to the canonical convention — scheme derived from
-  // token_type (mirrors direct-exec.js canonicalAuthScheme), NOT a hardcoded Bearer.
-  if (!token) return null;
-  return { name: 'Authorization', value: `${canonicalAuthScheme(tokenType)} ${token}` };
+  headers[name] = value;
+  return headers;
+}
+
+/** Parse a raw_config JSON template into a deep-cloned plain object, or null. */
+function parseRawConfig(raw) {
+  if (!raw) return null;
+  let obj = raw;
+  if (typeof obj === 'string') {
+    try { obj = JSON.parse(obj); } catch { return null; }
+  }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+  try { return JSON.parse(JSON.stringify(obj)); } catch { return null; }
+}
+
+/** Derive the JSON `type` for a raw_config that omits it. */
+function typeOfRaw(base, mcp) {
+  if (base.type) return String(base.type);
+  if (base.command && !base.url) return 'stdio';
+  return transportFlag(base.transport || (mcp && mcp.transport));
+}
+
+/** Append a query param to a URL string (token rides here for query-auth). */
+function appendQuery(url, name, value) {
+  const u = String(url || '');
+  return `${u}${u.includes('?') ? '&' : '?'}${name}=${encodeURIComponent(value)}`;
 }
 
 /**
- * Assemble the ordered `-H` args: the connector's non-secret headers_template
- * first, then the auth header last so it WINS on a case-insensitive name clash
- * (the §5.4 merge rule: "同名头以 auth_injection 为准"). Returns a flat argv slice
- * like ["-H", "X-Tenant: acme", "-H", "Authorization: Bearer …"].
+ * Build the single MCP-server JSON object for `claude mcp add-json`, injecting
+ * the live credential at install time. Prefers `rawConfig` as the template
+ * (design §4.2: the stored JSON = a template with the secret left as a
+ * placeholder); otherwise assembles from the discrete mcp_server fields.
+ *
+ * @param {object} mcpServer   the Acquire mcp_server ({ transport, server_url,
+ *                             headers_template, command, args, env, raw_config })
+ * @param {object} [opts]      { accessToken, tokenType, authInjection, rawConfig }
+ * @returns {object} the JSON object to stringify (never mutates the inputs)
  */
-export function buildHeaderArgs(mcpServer, authHeader) {
-  const headers = parseHeadersTemplate(mcpServer && mcpServer.headers_template);
-  if (authHeader && authHeader.name) {
-    const lower = authHeader.name.toLowerCase();
-    for (const k of Object.keys(headers)) {
-      if (k.toLowerCase() === lower) delete headers[k];
-    }
-    headers[authHeader.name] = authHeader.value;
+export function buildMcpServerJson(mcpServer, { accessToken, tokenType, authInjection, rawConfig } = {}) {
+  const mcp = mcpServer && typeof mcpServer === 'object' ? mcpServer : {};
+  const raw = parseRawConfig(rawConfig);
+  const injection = resolveInjection({ accessToken, tokenType, authInjection });
+
+  let base;
+  let type;
+  if (raw) {
+    base = raw;
+    type = typeOfRaw(base, mcp);
+    base.type = type;
+  } else if (isStdioConfig(mcp)) {
+    type = 'stdio';
+    base = { type, command: mcp.command == null ? '' : String(mcp.command), args: parseArgs(mcp.args), env: parseStringMap(mcp.env) };
+  } else {
+    type = transportFlag(mcp.transport);
+    base = { type, url: mcp.server_url == null ? '' : String(mcp.server_url), headers: parseStringMap(mcp.headers_template) };
   }
-  const args = [];
-  for (const [k, v] of Object.entries(headers)) args.push('-H', `${k}: ${v}`);
-  return args;
+  const isStdio = String(type).toLowerCase() === 'stdio';
+
+  // Inject the live credential (design Problem ①). stdio → env; remote → headers
+  // (or the URL query for a query-placed token). An injection whose location does
+  // not fit the transport (e.g. a header default for a stdio server, which has no
+  // headers) is simply not applied.
+  if (injection) {
+    if (isStdio) {
+      if (injection.location === 'env') {
+        base.env = { ...(base.env && typeof base.env === 'object' ? base.env : {}), [injection.name]: injection.value };
+      }
+    } else if (injection.location === 'header') {
+      base.headers = mergeHeader(base.headers && typeof base.headers === 'object' ? base.headers : {}, injection.name, injection.value);
+    } else if (injection.location === 'query') {
+      base.url = appendQuery(base.url, injection.name, injection.value);
+    }
+  }
+
+  // Drop empty container fields so the JSON stays minimal (and add-json doesn't
+  // record a bare `"env":{}` / `"headers":{}` / `"args":[]`).
+  if (Array.isArray(base.args) && base.args.length === 0) delete base.args;
+  if (base.env && typeof base.env === 'object' && Object.keys(base.env).length === 0) delete base.env;
+  if (base.headers && typeof base.headers === 'object' && Object.keys(base.headers).length === 0) delete base.headers;
+
+  return base;
 }
 
 /**
  * Register/refresh a connection's MCP server in the agent's local Claude Code
- * config. Idempotent: removes any same-named server first (so a token refresh
- * cleanly replaces the old one), then adds. Best-effort — returns
- * { ok:false, reason } instead of throwing.
+ * config via the UNIFIED `claude mcp add-json` path. Idempotent: removes any
+ * same-named server first (so a token refresh cleanly replaces the old one),
+ * then adds. Best-effort — returns { ok:false, reason } instead of throwing.
  *
  * @param {object} conn              { id, slug } — connection identity for the name
- * @param {object} acquireResponse   the Acquire response ({ mcp_server, access_token,
- *                                    token_type, auth_injection, connector_kind })
+ * @param {object} acquireResponse   the Acquire response ({ mcp_server, raw_config,
+ *                                    access_token, token_type, auth_injection,
+ *                                    connector_kind })
  * @param {object} [deps]            { execFile, cwd, log, warn, timeoutMs }
  */
 export async function upsertMcpServer(conn, acquireResponse, deps = {}) {
@@ -241,81 +360,60 @@ export async function upsertMcpServer(conn, acquireResponse, deps = {}) {
   const connId = conn && conn.id;
   try {
     const mcp = acquireResponse && acquireResponse.mcp_server;
-    if (!mcp || typeof mcp !== 'object') {
-      warn(`[mcp-config] upsert skipped conn=${connId}: acquire response carries no mcp_server`);
+    // raw_config may ride on mcp_server (preferred) or at the response root.
+    const rawConfig = (mcp && mcp.raw_config) != null ? mcp.raw_config
+      : (acquireResponse && acquireResponse.raw_config);
+    if ((!mcp || typeof mcp !== 'object') && !rawConfig) {
+      warn(`[mcp-config] upsert skipped conn=${connId}: acquire response carries no mcp_server / raw_config`);
       return { ok: false, reason: 'no-mcp-server' };
     }
     const name = mcpServerName(conn && conn.slug, connId);
 
-    // stdio (P2): a local subprocess connector — command + args, NO server_url and
-    // NO auth token/header (the whole auth_injection / header / query-token /
-    // redaction path is N/A). Its argv is command-based, so it is assembled here
-    // separately from the remote_http path below.
-    if (isStdioConfig(mcp)) {
-      if (!mcp.command) {
-        warn(`[mcp-config] upsert skipped conn=${connId}: stdio mcp_server carries no command`);
-        return { ok: false, reason: 'no-command' };
-      }
-      const command = String(mcp.command);
-      const cmdArgs = parseArgs(mcp.args);
-      // Remove-then-add for clean idempotent refresh (same as the remote path).
-      try {
-        await execFile('claude', ['mcp', 'remove', '-s', 'local', name], { cwd, timeout: timeoutMs });
-      } catch { /* no prior server registered — fine */ }
-      // `--` separates the subprocess argv from claude's own flags.
-      const args = ['mcp', 'add', '-s', 'local', '-t', 'stdio', name, '--', command, ...cmdArgs];
-      await execFile('claude', args, { cwd, timeout: timeoutMs });
-      log(`[mcp-config] MCP server upserted (stdio) name=${name} command=${command} cwd=${cwd}`);
-      return { ok: true, name };
-    }
-
-    // remote_http (P0): requires a server_url.
-    if (!mcp.server_url) {
-      warn(`[mcp-config] upsert skipped conn=${connId}: acquire response carries no mcp_server.server_url`);
-      return { ok: false, reason: 'no-mcp-server' };
-    }
-    const authHeader = buildAuthHeader({
+    const json = buildMcpServerJson(mcp, {
       accessToken: acquireResponse.access_token,
       tokenType: acquireResponse.token_type,
       authInjection: acquireResponse.auth_injection,
+      rawConfig,
     });
+    const isStdio = String(json.type || '').toLowerCase() === 'stdio';
 
-    // A query-placed token rides in the URL (a header can't express it).
-    let url = String(mcp.server_url);
-    const ai = acquireResponse.auth_injection;
-    if (ai && typeof ai === 'object' && ai.location === 'query' && ai.name) {
-      const vt = typeof ai.value_template === 'string' && ai.value_template ? ai.value_template : '{token}';
-      const val = vt.replace(/\{token\}/g, acquireResponse.access_token == null ? '' : String(acquireResponse.access_token));
-      url += `${url.includes('?') ? '&' : '?'}${ai.name}=${encodeURIComponent(val)}`;
+    // Validate BEFORE touching the CLI so a malformed config makes zero calls.
+    if (isStdio) {
+      if (!json.command) {
+        warn(`[mcp-config] upsert skipped conn=${connId}: stdio config carries no command`);
+        return { ok: false, reason: 'no-command' };
+      }
+    } else if (!json.url) {
+      warn(`[mcp-config] upsert skipped conn=${connId}: remote config carries no server_url`);
+      return { ok: false, reason: 'no-mcp-server' };
     }
 
-    const headerArgs = buildHeaderArgs(mcp, authHeader);
-
-    // Remove-then-add so a refresh replaces the prior token cleanly (a bare `add`
-    // of an existing name can be rejected). The remove is best-effort — a
+    // Remove-then-add so a refresh replaces the prior credential cleanly (a bare
+    // add of an existing name can be rejected). The remove is best-effort — a
     // first-time add has nothing to remove.
     try {
       await execFile('claude', ['mcp', 'remove', '-s', 'local', name], { cwd, timeout: timeoutMs });
     } catch { /* no prior server registered — fine */ }
 
-    const args = ['mcp', 'add', '-s', 'local', '-t', transportFlag(mcp.transport), name, url, ...headerArgs];
+    const args = ['mcp', 'add-json', '-s', 'local', name, JSON.stringify(json)];
     await execFile('claude', args, { cwd, timeout: timeoutMs });
-    // NEVER log headerArgs — they carry the token. Name + URL + cwd only.
-    log(`[mcp-config] MCP server upserted name=${name} url=${mcp.server_url} cwd=${cwd}`);
+    // NEVER log the JSON — it carries the injected credential (env value / header).
+    // Name + type + command-or-host + cwd only (host = url with any query stripped).
+    const where = isStdio ? `command=${json.command}` : `url=${String(json.url).split('?')[0]}`;
+    log(`[mcp-config] MCP server upserted (add-json) name=${name} type=${json.type} ${where} cwd=${cwd}`);
     return { ok: true, name };
   } catch (e) {
-    // Redact the token: on a failed `claude mcp add`, e.message/.cmd carry the
-    // full argv including the `-H` auth header AND, for query-location auth, the
-    // token in the URL where it rides as encodeURIComponent(...) — so we must
-    // scrub BOTH the raw token and its URL-encoded form (exact-substring
-    // redaction won't catch the encoded value otherwise). encodeURIComponent is
-    // per-character, so encodeURIComponent(token) is always a substring of the
-    // encoded URL value regardless of any value_template prefix/suffix.
+    // Redact the token: on a failed add-json, e.message/.cmd carry the full argv
+    // including the JSON with the injected credential AND, for query-location
+    // auth, the token in the URL where it rides as encodeURIComponent(...) — so we
+    // scrub BOTH the raw token and its URL-encoded form (exact-substring redaction
+    // won't catch the encoded value otherwise). encodeURIComponent is per-char, so
+    // encodeURIComponent(token) is always a substring of the encoded URL value.
     const tok = acquireResponse && acquireResponse.access_token;
     const secrets = tok
       ? [...new Set([String(tok), encodeURIComponent(String(tok))])] // dedupe (equal when no special chars)
       : [];
-    const reason = safeExecFailure('add', e, secrets);
+    const reason = safeExecFailure('add-json', e, secrets);
     warn(`[mcp-config] upsertMcpServer failed conn=${connId}: ${reason}`);
     return { ok: false, reason };
   }

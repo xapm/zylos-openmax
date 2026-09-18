@@ -338,8 +338,14 @@ function recordingMcpExec() {
   return {
     calls,
     exec: async (file, args, opts) => { calls.push({ file, args, opts }); return { stdout: '' }; },
-    addArgs: () => calls.find((c) => c.args[0] === 'mcp' && c.args[1] === 'add')?.args,
+    // The unified install path is `claude mcp add-json <name> <json>`.
+    addArgs: () => calls.find((c) => c.args[0] === 'mcp' && c.args[1] === 'add-json')?.args,
     removeArgs: () => calls.find((c) => c.args[0] === 'mcp' && c.args[1] === 'remove')?.args,
+    // Parse the JSON payload of the add-json call (last argv element).
+    addJson: () => {
+      const a = calls.find((c) => c.args[0] === 'mcp' && c.args[1] === 'add-json')?.args;
+      return a ? JSON.parse(a[a.length - 1]) : null;
+    },
   };
 }
 
@@ -375,14 +381,13 @@ test('connection.authorized (MCP): acquires + materializes a local MCP server vi
   });
 
   const add = mcp.addArgs();
-  assert.ok(add, `MCP sink must run 'claude mcp add': ${JSON.stringify(mcp.calls.map((c) => c.args))}`);
-  assert.deepEqual(add, [
-    'mcp', 'add', '-s', 'local', '-t', 'http',
-    'openmax-linear-conn-mcp-1', 'https://mcp.linear.app/rpc',
-    '-H', 'Authorization: Bearer mcp-tok',
-  ]);
+  assert.ok(add, `MCP sink must run 'claude mcp add-json': ${JSON.stringify(mcp.calls.map((c) => c.args))}`);
+  assert.deepEqual(add.slice(0, 5), ['mcp', 'add-json', '-s', 'local', 'openmax-linear-conn-mcp-1']);
+  assert.deepEqual(mcp.addJson(), {
+    type: 'http', url: 'https://mcp.linear.app/rpc', headers: { Authorization: 'Bearer mcp-tok' },
+  });
   // cwd forced to the agent launch dir (not the comm-bridge service cwd)
-  assert.equal(mcp.calls.find((c) => c.args[1] === 'add').opts.cwd, '/home/agent/zylos');
+  assert.equal(mcp.calls.find((c) => c.args[1] === 'add-json').opts.cwd, '/home/agent/zylos');
 });
 
 test('connection.authorized (non-MCP direct): must NOT materialize any MCP server', async () => {
@@ -419,7 +424,33 @@ test('connection.credential_updated (MCP): re-acquires and refreshes the MCP ser
 
   const add = mcp.addArgs();
   assert.ok(add, 'credential_updated on an MCP connection must re-materialize the server');
-  assert.ok(add.includes('Authorization: Bearer mcp-tok-new'), `refreshed server must carry the new token: ${JSON.stringify(add)}`);
+  assert.equal(mcp.addJson().headers.Authorization, 'Bearer mcp-tok-new', `refreshed server must carry the new token: ${JSON.stringify(add)}`);
+});
+
+test('[Problem ①] connection.authorized (MCP stdio): injects the token into the add-json env (not an empty env)', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  // Acquire returns a stdio MCP connector with an env:<KEY> auth-injection binding.
+  const post = async () => ({
+    credential_mode: 'direct', connector_kind: 'mcp', access_token: 'ghp_live_token',
+    auth_injection: 'env:GITHUB_PERSONAL_ACCESS_TOKEN',
+    mcp_server: { transport: 'stdio', command: 'docker', args: ['run', '-i', '--rm', 'ghcr.io/github/github-mcp-server'], env: {} },
+  });
+  const get = async () => ({ connections: [] });
+  const mcp = recordingMcpExec();
+
+  const frame = { payload: { event: 'connection.authorized', data: {
+    connection_id: 'conn-gh-1', provider: 'github', credential_mode: 'direct', connector_kind: 'mcp',
+  } } };
+  await handleConnectionEvent(baseOrgConfig, frame, {
+    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w',
+  });
+
+  const json = mcp.addJson();
+  assert.ok(json, 'stdio MCP connection must run add-json');
+  assert.equal(json.type, 'stdio');
+  assert.equal(json.command, 'docker');
+  assert.equal(json.env.GITHUB_PERSONAL_ACCESS_TOKEN, 'ghp_live_token',
+    'the stdio server must launch WITH its token in env (Problem ①)');
 });
 
 for (const event of ['connection.revoked', 'connection.disconnected']) {

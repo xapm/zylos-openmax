@@ -109,12 +109,146 @@ function compareSemver(a, b) {
   return 0;
 }
 
-async function fetchLatestRelease() {
-  const url = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
+// Default GitHub REST base. Kept as a constant so the default resolution below
+// produces the exact same URL the hardcoded path used before issue #146.
+const DEFAULT_API_BASE = 'https://api.github.com';
+
+// Build `<base>/repos/<repo>/releases/latest`, tolerating a trailing slash (or
+// several) on the base so both `https://host` and `https://host/gh-api/` join
+// cleanly.
+function releasesLatestUrl(base) {
+  return `${base.replace(/\/+$/, '')}/repos/${GITHUB_REPO}/releases/latest`;
+}
+
+// Parse ZYLOS_UPSTREAM_TRUST_HOSTS (comma/whitespace separated hostnames) into
+// a lowercase set. This is the same trust convention catalog/runtime uses when
+// injecting the mirror config for zylos-core self-upgrade.
+function parseTrustHosts() {
+  return new Set(
+    (process.env.ZYLOS_UPSTREAM_TRUST_HOSTS || '')
+      .split(/[,\s]+/)
+      .map((h) => h.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
+// True only when urlStr parses and its hostname is present in `trusted`.
+function isTrustedHost(urlStr, trusted) {
+  try {
+    return trusted.has(new URL(urlStr).hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Issue #146 — derive the REST base from the catalog-injected upstreams.json.
+ *
+ * upstreams.json shape: { schemaVersion, revision, providers: { github: {
+ * apiBase, rawBase, downloadBase } } }, where apiBase is a GENERIC
+ * api.github.com mirror (e.g. "https://ghmirror.icoco.site/gh-api/"). NOTE:
+ * upstreams.json carries NO per-component version/tag, so we only read
+ * providers.github.apiBase and still call `/repos/.../releases/latest` against
+ * it. Fails soft (returns null) on any error, missing apiBase, or an untrusted
+ * host so discovery is never made more fragile than the hardcoded path was.
+ */
+async function deriveBaseFromUpstreams(configUrl, fetchFn) {
+  const trusted = parseTrustHosts();
+  // Env-poisoning guard: never even fetch the config from a host that is not in
+  // the trust list. With no trust list we cannot vouch for any host, so we skip
+  // the derive path entirely and fall back to the default.
+  if (!isTrustedHost(configUrl, trusted)) {
+    warn(`ZYLOS_UPSTREAM_CONFIG host not in ZYLOS_UPSTREAM_TRUST_HOSTS — ignoring, using default base`);
+    return null;
+  }
+  try {
+    const res = await fetchFn(configUrl, { signal: AbortSignal.timeout(15000) });
+    if (!res.ok) throw new Error(`upstreams.json HTTP ${res.status}`);
+    const data = await res.json();
+    const apiBase = data?.providers?.github?.apiBase;
+    if (!apiBase || typeof apiBase !== 'string') {
+      warn('upstreams.json has no providers.github.apiBase — using default base');
+      return null;
+    }
+    // The derived host must also be trusted — the config could be legitimate
+    // but point apiBase at an arbitrary (malicious) host.
+    if (!isTrustedHost(apiBase, trusted)) {
+      warn(`derived providers.github.apiBase host not in ZYLOS_UPSTREAM_TRUST_HOSTS — using default base`);
+      return null;
+    }
+    return apiBase;
+  } catch (e) {
+    warn(`could not derive base from ZYLOS_UPSTREAM_CONFIG: ${e.message} — using default base`);
+    return null;
+  }
+}
+
+/**
+ * Issue #146 — resolve the releases-latest URL for self-upgrade discovery.
+ *
+ * CN / behind-the-GFW agents cannot reach api.github.com, so the previously
+ * hardcoded GET timed out (15s) and self-upgrade never advanced to the install
+ * step (`zylos upgrade openmax`, which already goes through the ghmirror and
+ * works). This makes the REST base configurable while keeping the default
+ * (non-CN) behavior byte-for-byte identical.
+ *
+ * Precedence (highest → lowest):
+ *   1. OPENMAX_RELEASES_URL  — a full releases-latest URL, used verbatim
+ *                              (zero-dependency escape hatch; no extra fetch).
+ *   2. GITHUB_API_BASE       — a base URL; append repos/<repo>/releases/latest.
+ *   3. ZYLOS_UPSTREAM_CONFIG — points at an upstreams.json (injected & trusted
+ *                              by catalog, same channel zylos-core uses); read
+ *                              providers.github.apiBase as the base. Gated by
+ *                              ZYLOS_UPSTREAM_TRUST_HOSTS.
+ *   4. Default               — https://api.github.com (unchanged).
+ *
+ * Every layer fails soft: a missing/untrusted/malformed value falls through to
+ * the next, so discovery failure can never crash the upgrade timer.
+ */
+export async function resolveReleasesUrl(deps = {}) {
+  const fetchFn = deps.fetchFn || fetch;
+
+  // 1. Full-URL escape hatch (highest priority).
+  const explicitUrl = process.env.OPENMAX_RELEASES_URL;
+  if (explicitUrl) {
+    log(`discovery base: OPENMAX_RELEASES_URL override → ${explicitUrl}`);
+    return explicitUrl;
+  }
+
+  // 2. Base-URL escape hatch.
+  const explicitBase = process.env.GITHUB_API_BASE;
+  if (explicitBase) {
+    const url = releasesLatestUrl(explicitBase);
+    log(`discovery base: GITHUB_API_BASE override → ${url}`);
+    return url;
+  }
+
+  // 3. Derive from the catalog-injected upstreams.json (CN main path).
+  const upstreamConfig = process.env.ZYLOS_UPSTREAM_CONFIG;
+  if (upstreamConfig) {
+    const derivedBase = await deriveBaseFromUpstreams(upstreamConfig, fetchFn);
+    if (derivedBase) {
+      const url = releasesLatestUrl(derivedBase);
+      log(`discovery base: derived from ZYLOS_UPSTREAM_CONFIG → ${url}`);
+      return url;
+    }
+    // else fall through to the default below.
+  }
+
+  // 4. Default — unchanged for GKE / non-CN deployments.
+  const url = releasesLatestUrl(DEFAULT_API_BASE);
+  log(`discovery base: default api.github.com → ${url}`);
+  return url;
+}
+
+export async function fetchLatestRelease(deps = {}) {
+  const fetchFn = deps.fetchFn || fetch;
+  // Issue #146: base is resolved (env / mirror / default) instead of hardcoded.
+  const url = await resolveReleasesUrl(deps);
   const headers = { Accept: 'application/vnd.github.v3+json' };
   const ghToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
   if (ghToken) headers.Authorization = `Bearer ${ghToken}`;
-  const res = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
+  const res = await fetchFn(url, { headers, signal: AbortSignal.timeout(15000) });
   if (!res.ok) throw new Error(`GitHub API ${res.status}: ${res.statusText}`);
   const data = await res.json();
   return {

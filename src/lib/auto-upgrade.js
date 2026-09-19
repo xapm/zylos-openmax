@@ -332,7 +332,7 @@ export async function resolveReleasesUrl(deps = {}) {
 
   // 4. Default — unchanged for GKE / non-CN deployments.
   const url = releasesLatestUrl(DEFAULT_API_BASE);
-  log(`discovery base: default api.github.com → ${url}`);
+  log(`discovery base: default api.github.com → ${redactUrl(url)}`);
   return url;
 }
 
@@ -834,6 +834,12 @@ export async function checkForUpdates(enabledOrgConfigs, postForOrgFn, apiPathFn
       await notifyUpgradeComplete(enabledOrgConfigs, postForOrgFn, apiPathFn);
     }
   } catch (e) {
-    warn(`check failed: ${e.message}`);
+    // Outer catch for the whole release-discovery chain (resolveReleasesUrl →
+    // fetchLatestRelease → release fetch + res.json()). NEVER interpolate raw
+    // exception content: a JSON parse error embeds a snippet of the
+    // (attacker-influenced) mirror response body, and a fetch rejection can
+    // embed the signed release URL — query token and all. Log a fixed string
+    // plus only the coarse error class name, which can never carry a secret.
+    warn(`check failed (${e?.constructor?.name || 'error'}; detail redacted)`);
   }
 }

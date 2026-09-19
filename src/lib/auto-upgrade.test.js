@@ -26,6 +26,7 @@ const {
   startUpgraderApp,
   resolveReleasesUrl,
   fetchLatestRelease,
+  checkForUpdates,
   shouldAttachToken,
   parseTrustHosts,
   GRACE_START_MS,
@@ -825,6 +826,45 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
       const out = await captureConsole(async () => { url = await resolveReleasesUrl({ fetchFn }); });
       assert.ok(!out.includes(shortSecret), 'a JSON parse-error body snippet must never reach the log');
       assert.equal(url, DEFAULT_URL, 'still falls through to the default');
+    });
+
+    // R4: the FINAL release request path (checkForUpdates → fetchLatestRelease →
+    // release fetch + res.json()) must not leak either. These drive the real
+    // checkForUpdates() chain with a stubbed global fetch (it calls
+    // fetchLatestRelease() with no injected deps, so it uses globalThis.fetch).
+    it('release-discovery fetch REJECTION does not leak a signed URL (checkForUpdates catch)', async () => {
+      const origFetch = globalThis.fetch;
+      const signedUrl = `https://mirror.example/gh-api/repos/zylos-ai/zylos-openmax/releases/latest?token=${SENTINEL}`;
+      // Model a native fetch rejection, whose message embeds the requested URL.
+      const err = new Error(`request to ${signedUrl} failed, reason: ECONNRESET`);
+      assert.ok(err.message.includes(SENTINEL), 'sanity: the thrown error embeds the signed URL');
+      globalThis.fetch = async () => { throw err; };
+      try {
+        const out = await captureConsole(() => checkForUpdates([], async () => ({}), (p) => p));
+        assert.ok(!out.includes(SENTINEL), 'the release-fetch rejection must never reach the log');
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it('release-discovery non-JSON body does not leak the body snippet (checkForUpdates catch)', async () => {
+      const origFetch = globalThis.fetch;
+      const shortSecret = 's3cr3t7';
+      let parseMsg = '';
+      try { JSON.parse(shortSecret); } catch (e) { parseMsg = e.message; }
+      assert.ok(parseMsg.includes(shortSecret), 'sanity: the parse error embeds the body snippet');
+      globalThis.fetch = async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => JSON.parse(shortSecret), // real SyntaxError quoting the body
+      });
+      try {
+        const out = await captureConsole(() => checkForUpdates([], async () => ({}), (p) => p));
+        assert.ok(!out.includes(shortSecret), 'a JSON parse-error body snippet must never reach the log');
+      } finally {
+        globalThis.fetch = origFetch;
+      }
     });
   });
 });

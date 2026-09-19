@@ -130,24 +130,26 @@ function isValidHostToken(tok) {
 }
 
 // Parse ZYLOS_UPSTREAM_TRUST_HOSTS into a lowercase Set of exact `host[:port]`
-// tokens. STRICTLY comma-separated: whitespace is NOT a separator, so a token
-// that contains whitespace is malformed and rejected (a fat-fingered
-// space-separated list can never silently authorize a host). Empty items (a
-// stray/trailing comma) are skipped; malformed items are rejected with a
-// warning rather than treated as valid. This is the same trust convention
-// catalog/runtime uses when injecting the mirror config for self-upgrade.
+// tokens. STRICTLY comma-separated (whitespace is never a separator) and ATOMIC
+// fail-closed: if the declaration is present but ANY item is empty (a stray,
+// double, or trailing comma) or malformed, the ENTIRE list is rejected and NO
+// host is authorized — a single typo can never leave a partial allowlist in
+// force. An unset or blank env is the normal "no trust" case (empty set, no
+// warning). Warnings never echo the raw value. This mirrors the trust
+// convention catalog/runtime uses when injecting the mirror config.
 export function parseTrustHosts() {
-  const set = new Set();
-  for (const raw of (process.env.ZYLOS_UPSTREAM_TRUST_HOSTS || '').split(',')) {
-    const tok = raw.trim().toLowerCase();
-    if (!tok) continue; // skip empty items (e.g. a stray or trailing comma)
-    if (!isValidHostToken(tok)) {
-      warn(`ignoring malformed ZYLOS_UPSTREAM_TRUST_HOSTS entry: ${JSON.stringify(raw)}`);
-      continue;
+  const raw = process.env.ZYLOS_UPSTREAM_TRUST_HOSTS;
+  if (!raw || !raw.trim()) return new Set(); // unset / blank → no trust (normal)
+  const hosts = [];
+  for (const part of raw.split(',')) {
+    const tok = part.trim().toLowerCase();
+    if (!tok || !isValidHostToken(tok)) {
+      warn('ZYLOS_UPSTREAM_TRUST_HOSTS has an empty or malformed entry — rejecting the entire trust list (no host authorized)');
+      return new Set();
     }
-    set.add(tok);
+    hosts.push(tok);
   }
-  return set;
+  return new Set(hosts);
 }
 
 // Shared URL-safety gate applied to any resolved URL before it is used or given
@@ -162,6 +164,19 @@ function safeHttpsUrl(urlStr) {
   return u;
 }
 
+// Redact a URL/base for logging: scheme + host + path ONLY, with any userinfo
+// and the entire query/fragment removed (either can carry a secret or a signed
+// token, and PM2 captures our operational logs to disk). A value that does not
+// parse becomes a fixed placeholder — a raw env value is NEVER echoed verbatim.
+function redactUrl(str) {
+  try {
+    const u = new URL(str);
+    return `${u.protocol}//${u.host}${u.pathname}`;
+  } catch {
+    return '<unparseable>';
+  }
+}
+
 // True only when urlStr parses, is https, and its FULL host (including port) is
 // present in `trusted`. Requiring https and matching URL.host (not hostname)
 // means an entry `mirror.example` does NOT authorize `mirror.example:4444` and
@@ -172,14 +187,22 @@ function isTrustedHost(urlStr, trusted) {
 }
 
 // Validate a *base* URL (GITHUB_API_BASE / providers.github.apiBase) and build
-// the releases-latest URL from it. A base must be a clean https origin+path
-// prefix: no credentials, no fragment, and no query (we append a path, so a
-// base query would yield a malformed target). Returns the built URL string, or
-// null when the base is malformed/unsafe (the caller then falls through).
+// the releases-latest URL from the NORMALIZED URL object, never the raw string.
+// A base must be a clean https origin+path prefix. Rejected (→ caller falls
+// through) when the raw value has leading/trailing or embedded whitespace, any
+// control char, or a query/fragment marker (`?`/`#`) — even an EMPTY one, which
+// `new URL()` reports as an empty search/hash yet still swallows the appended
+// path into the query/fragment — or when it embeds credentials / is non-https.
+// Building from `origin + pathname` guarantees no un-normalized raw artifact
+// (stray whitespace, `?`, `#`) can ever reach the final target URL.
 function buildValidatedReleasesUrl(base) {
+  if (typeof base !== 'string') return null;
+  if (base !== base.trim()) return null;                     // surrounding whitespace
+  if (/[\s\x00-\x1f\x7f]/.test(base)) return null;           // any whitespace / control char
+  if (base.includes('?') || base.includes('#')) return null; // query/fragment marker (even empty)
   const u = safeHttpsUrl(base);
-  if (!u || u.search) return null;
-  return releasesLatestUrl(base);
+  if (!u || u.search || u.hash) return null;
+  return releasesLatestUrl(`${u.origin}${u.pathname}`);
 }
 
 // Token-attachment boundary. Attach GITHUB_TOKEN/GH_TOKEN ONLY when the resolved
@@ -268,10 +291,12 @@ export async function resolveReleasesUrl(deps = {}) {
   const explicitUrl = process.env.OPENMAX_RELEASES_URL;
   if (explicitUrl) {
     if (safeHttpsUrl(explicitUrl)) {
-      log(`discovery base: OPENMAX_RELEASES_URL override → ${explicitUrl}`);
+      // Log a REDACTED form: the verbatim value may legitimately carry a signed
+      // query token, and PM2 persists these logs — never echo it.
+      log(`discovery base: OPENMAX_RELEASES_URL override → ${redactUrl(explicitUrl)}`);
       return explicitUrl;
     }
-    warn(`OPENMAX_RELEASES_URL is not a safe https URL (${explicitUrl}) — ignoring, trying next source`);
+    warn(`OPENMAX_RELEASES_URL is not a safe https URL (${redactUrl(explicitUrl)}) — ignoring, trying next source`);
   }
 
   // 2. Base-URL escape hatch (also strictly validated; fails soft).
@@ -279,10 +304,10 @@ export async function resolveReleasesUrl(deps = {}) {
   if (explicitBase) {
     const url = buildValidatedReleasesUrl(explicitBase);
     if (url) {
-      log(`discovery base: GITHUB_API_BASE override → ${url}`);
+      log(`discovery base: GITHUB_API_BASE override → ${redactUrl(url)}`);
       return url;
     }
-    warn(`GITHUB_API_BASE is not a safe https base (${explicitBase}) — ignoring, trying next source`);
+    warn(`GITHUB_API_BASE is not a safe https base (${redactUrl(explicitBase)}) — ignoring, trying next source`);
   }
 
   // 3. Derive from the catalog-injected upstreams.json (CN main path).
@@ -292,10 +317,10 @@ export async function resolveReleasesUrl(deps = {}) {
     if (derivedBase) {
       const url = buildValidatedReleasesUrl(derivedBase);
       if (url) {
-        log(`discovery base: derived from ZYLOS_UPSTREAM_CONFIG → ${url}`);
+        log(`discovery base: derived from ZYLOS_UPSTREAM_CONFIG → ${redactUrl(url)}`);
         return url;
       }
-      warn(`derived providers.github.apiBase is not a safe https base (${derivedBase}) — using default base`);
+      warn(`derived providers.github.apiBase is not a safe https base (${redactUrl(derivedBase)}) — using default base`);
     }
     // else fall through to the default below.
   }

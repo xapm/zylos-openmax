@@ -548,20 +548,62 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
     return fetchFn;
   }
 
-  describe('P1 — parseTrustHosts is strict comma-separated', () => {
+  // Capture everything the module writes to console during fn() so a test can
+  // assert a sentinel secret NEVER appears in the (PM2-persisted) logs.
+  async function captureConsole(fn) {
+    const orig = { log: console.log, warn: console.warn, error: console.error };
+    const lines = [];
+    console.log = (...a) => lines.push(a.join(' '));
+    console.warn = (...a) => lines.push(a.join(' '));
+    console.error = (...a) => lines.push(a.join(' '));
+    try { await fn(); } finally {
+      console.log = orig.log; console.warn = orig.warn; console.error = orig.error;
+    }
+    return lines.join('\n');
+  }
+
+  describe('P1/P2 — parseTrustHosts strict + atomic fail-closed', () => {
     it('(c) does NOT accept whitespace-separated items (no silent authorization)', () => {
       process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example other.example';
       const set = parseTrustHosts();
-      assert.ok(!set.has('mirror.example'), 'a whitespace-separated token must not be trusted');
-      assert.ok(!set.has('other.example'));
-      assert.equal(set.size, 0, 'a single space-containing token is malformed → nothing trusted');
+      assert.equal(set.size, 0, 'a space-containing token is malformed → whole list rejected');
     });
 
-    it('(c) skips empty items and keeps only valid comma-separated host[:port] tokens', () => {
-      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example,, ,other.example:8443,';
+    it('keeps all hosts when every comma-separated item is a valid host[:port]', () => {
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example,other.example:8443';
       const set = parseTrustHosts();
       assert.deepEqual([...set].sort(), ['mirror.example', 'other.example:8443']);
-      assert.ok(!set.has(''), 'empty items must never enter the set');
+    });
+
+    it('atomic fail-closed: one EMPTY item (a,,b) rejects the ENTIRE list', () => {
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example,,other.example';
+      const set = parseTrustHosts();
+      assert.equal(set.size, 0, 'neither host is trusted when any item is empty');
+      assert.ok(!set.has('mirror.example') && !set.has('other.example'));
+    });
+
+    it('atomic fail-closed: one MALFORMED item rejects the ENTIRE list', () => {
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example,not a host,other.example';
+      assert.equal(parseTrustHosts().size, 0, 'a malformed declaration authorizes nothing');
+    });
+
+    it('a trailing comma (empty trailing item) rejects the whole list', () => {
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example,';
+      assert.equal(parseTrustHosts().size, 0);
+    });
+
+    it('unset / blank env is the normal no-trust case (empty set, no throw)', () => {
+      assert.equal(parseTrustHosts().size, 0);
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = '   ';
+      assert.equal(parseTrustHosts().size, 0);
+    });
+
+    it('atomic fail-closed strips token authority from ALL hosts under a malformed list', () => {
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example,,other.example'; // empty middle item
+      assert.equal(shouldAttachToken('https://mirror.example/x'), false, 'no host authorized under a malformed declaration');
+      assert.equal(shouldAttachToken('https://other.example/x'), false);
+      // Official GitHub is always authorized, independent of the trust list.
+      assert.equal(shouldAttachToken('https://api.github.com/x'), true);
     });
   });
 
@@ -582,7 +624,7 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
     });
 
     it('(d) never attaches to a URL carrying embedded credentials', () => {
-      assert.equal(shouldAttachToken('https://user:pass@api.github.com/x'), false);
+      assert.equal(shouldAttachToken('https://u:p@api.github.com/x'), false);
     });
 
     it('does not attach to an untrusted https host', () => {
@@ -659,7 +701,7 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
     });
 
     it('OPENMAX_RELEASES_URL with embedded credentials falls through, not used verbatim', async () => {
-      process.env.OPENMAX_RELEASES_URL = 'https://user:pass@mirror.example/releases/latest';
+      process.env.OPENMAX_RELEASES_URL = 'https://u:p@mirror.example/releases/latest';
       process.env.GITHUB_API_BASE = 'https://base.example';
       const fetchFn = makeFetch({});
       const url = await resolveReleasesUrl({ fetchFn });
@@ -677,6 +719,73 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
     it('keeps the default-URL byte-identity when no env is set', async () => {
       const url = await resolveReleasesUrl({ fetchFn: makeFetch({}) });
       assert.equal(url, DEFAULT_URL);
+    });
+  });
+
+  describe('P2 — base raw-string anomalies fall through (built from normalized URL)', () => {
+    it('GITHUB_API_BASE with surrounding whitespace falls through to a trusted upstream', async () => {
+      const configUrl = 'https://ghmirror.icoco.site/upstreams.json';
+      process.env.GITHUB_API_BASE = ' https://api.github.com ';
+      process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      const fetchFn = makeFetch({
+        [configUrl]: { body: { providers: { github: { apiBase: 'https://ghmirror.icoco.site/gh-api/' } } } },
+      });
+      const url = await resolveReleasesUrl({ fetchFn });
+      // Reaching the distinct upstream mirror proves the whitespace base was
+      // rejected (not silently normalized to api.github.com).
+      assert.equal(url, 'https://ghmirror.icoco.site/gh-api/repos/zylos-ai/zylos-openmax/releases/latest');
+    });
+
+    it('GITHUB_API_BASE with an empty query (?) falls through to the default', async () => {
+      process.env.GITHUB_API_BASE = 'https://base.example?';
+      const url = await resolveReleasesUrl({ fetchFn: makeFetch({}) });
+      assert.equal(url, DEFAULT_URL);
+    });
+
+    it('GITHUB_API_BASE with a trailing fragment (#) falls through to the default', async () => {
+      process.env.GITHUB_API_BASE = 'https://base.example#';
+      const url = await resolveReleasesUrl({ fetchFn: makeFetch({}) });
+      assert.equal(url, DEFAULT_URL);
+    });
+
+    it('a clean GITHUB_API_BASE still builds from the normalized origin+path', async () => {
+      process.env.GITHUB_API_BASE = 'https://ghproxy.example/gh-api/';
+      const url = await resolveReleasesUrl({ fetchFn: makeFetch({}) });
+      assert.equal(url, 'https://ghproxy.example/gh-api/repos/zylos-ai/zylos-openmax/releases/latest');
+    });
+  });
+
+  describe('P1 — secrets never reach the logs (redaction)', () => {
+    const SENTINEL = 'do-NOT-log-THIS-secret-9f3a';
+
+    it('rejected OPENMAX_RELEASES_URL with userinfo does not leak the secret', async () => {
+      process.env.OPENMAX_RELEASES_URL = `https://alice:${SENTINEL}@mirror.example/releases/latest`;
+      const out = await captureConsole(() => resolveReleasesUrl({ fetchFn: makeFetch({}) }));
+      assert.ok(!out.includes(SENTINEL), 'userinfo secret must be redacted from logs');
+      assert.ok(out.includes('OPENMAX_RELEASES_URL'), 'the variable name is still logged for diagnostics');
+    });
+
+    it('accepted full-URL override with a signed query is used verbatim but logged redacted', async () => {
+      process.env.OPENMAX_RELEASES_URL = `https://mirror.example/x/releases/latest?token=${SENTINEL}`;
+      let returned;
+      const out = await captureConsole(async () => {
+        returned = await resolveReleasesUrl({ fetchFn: makeFetch({}) });
+      });
+      assert.ok(!out.includes(SENTINEL), 'signed-query token must be redacted from the success log');
+      assert.ok(returned.includes(SENTINEL), 'the override is still used verbatim (query preserved) for the fetch');
+    });
+
+    it('rejected GITHUB_API_BASE with userinfo does not leak the secret', async () => {
+      process.env.GITHUB_API_BASE = `https://alice:${SENTINEL}@base.example`;
+      const out = await captureConsole(() => resolveReleasesUrl({ fetchFn: makeFetch({}) }));
+      assert.ok(!out.includes(SENTINEL), 'GITHUB_API_BASE userinfo secret must be redacted');
+    });
+
+    it('malformed trust-list warning does not echo the raw value', async () => {
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = `evil ${SENTINEL} host`;
+      const out = await captureConsole(() => { parseTrustHosts(); });
+      assert.ok(!out.includes(SENTINEL), 'trust-list warning must not echo raw items');
     });
   });
 });

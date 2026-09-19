@@ -1,4 +1,4 @@
-import { describe, it, afterEach } from 'node:test';
+import { describe, it, afterEach, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'fs';
 import path from 'path';
@@ -24,6 +24,11 @@ const {
   recordFailedVersion,
   classifyUpgraderState,
   startUpgraderApp,
+  resolveReleasesUrl,
+  fetchLatestRelease,
+  checkForUpdates,
+  shouldAttachToken,
+  parseTrustHosts,
   GRACE_START_MS,
   STALE_RUNNING_THRESHOLD_MS,
 } = mod;
@@ -276,5 +281,590 @@ describe('startUpgraderApp', () => {
     assert.ok(!calls.includes('delete'), 'must not delete an online upgrader');
     assert.ok(!calls.includes('start'), 'must not start a second upgrader');
     assert.ok(!fs.existsSync(MARKER_PATH), 'must not overwrite the marker');
+  });
+});
+
+// Issue #146: self-upgrade discovery base must be configurable (CN / behind-GFW
+// agents cannot reach api.github.com) while the default stays unchanged.
+describe('release discovery base resolution (issue #146)', () => {
+  const DISCOVERY_ENVS = [
+    'OPENMAX_RELEASES_URL',
+    'GITHUB_API_BASE',
+    'ZYLOS_UPSTREAM_CONFIG',
+    'ZYLOS_UPSTREAM_TRUST_HOSTS',
+    'GITHUB_TOKEN',
+    'GH_TOKEN',
+  ];
+  const DEFAULT_URL = 'https://api.github.com/repos/zylos-ai/zylos-openmax/releases/latest';
+  let savedEnv;
+
+  beforeEach(() => {
+    savedEnv = {};
+    for (const k of DISCOVERY_ENVS) {
+      savedEnv[k] = process.env[k];
+      delete process.env[k];
+    }
+  });
+
+  afterEach(() => {
+    for (const k of DISCOVERY_ENVS) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+  });
+
+  // Build a mock fetch that answers per-URL and records every call.
+  function makeFetch(routes) {
+    const calls = [];
+    const fetchFn = async (url, options) => {
+      calls.push({ url, options });
+      const route = routes[url];
+      if (!route) throw new Error(`unexpected fetch: ${url}`);
+      return {
+        ok: route.ok !== false,
+        status: route.status || 200,
+        statusText: route.statusText || 'OK',
+        json: async () => {
+          if (route.throwOnJson) throw new SyntaxError('Unexpected token in JSON');
+          return route.body;
+        },
+      };
+    };
+    fetchFn.calls = calls;
+    return fetchFn;
+  }
+
+  describe('resolveReleasesUrl precedence', () => {
+    it('defaults to api.github.com when no env is set', async () => {
+      const url = await resolveReleasesUrl({ fetchFn: makeFetch({}) });
+      assert.equal(url, DEFAULT_URL);
+    });
+
+    it('uses OPENMAX_RELEASES_URL verbatim (full-URL escape hatch)', async () => {
+      process.env.OPENMAX_RELEASES_URL = 'https://mirror.example/custom/releases/latest';
+      const url = await resolveReleasesUrl({ fetchFn: makeFetch({}) });
+      assert.equal(url, 'https://mirror.example/custom/releases/latest');
+    });
+
+    it('builds from GITHUB_API_BASE and normalizes a trailing slash', async () => {
+      process.env.GITHUB_API_BASE = 'https://ghproxy.example/gh-api/';
+      const url = await resolveReleasesUrl({ fetchFn: makeFetch({}) });
+      assert.equal(url, 'https://ghproxy.example/gh-api/repos/zylos-ai/zylos-openmax/releases/latest');
+    });
+
+    it('builds from GITHUB_API_BASE with no trailing slash', async () => {
+      process.env.GITHUB_API_BASE = 'https://ghproxy.example';
+      const url = await resolveReleasesUrl({ fetchFn: makeFetch({}) });
+      assert.equal(url, 'https://ghproxy.example/repos/zylos-ai/zylos-openmax/releases/latest');
+    });
+
+    it('derives providers.github.apiBase from a trusted ZYLOS_UPSTREAM_CONFIG', async () => {
+      const configUrl = 'https://ghmirror.icoco.site/upstreams.json';
+      process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      const fetchFn = makeFetch({
+        [configUrl]: { body: { providers: { github: { apiBase: 'https://ghmirror.icoco.site/gh-api/' } } } },
+      });
+      const url = await resolveReleasesUrl({ fetchFn });
+      assert.equal(url, 'https://ghmirror.icoco.site/gh-api/repos/zylos-ai/zylos-openmax/releases/latest');
+      assert.equal(fetchFn.calls.length, 1, 'derive path fetches upstreams.json once');
+      assert.equal(fetchFn.calls[0].url, configUrl);
+    });
+
+    it('OPENMAX_RELEASES_URL wins over GITHUB_API_BASE and ZYLOS_UPSTREAM_CONFIG', async () => {
+      process.env.OPENMAX_RELEASES_URL = 'https://verbatim.example/releases/latest';
+      process.env.GITHUB_API_BASE = 'https://base.example';
+      process.env.ZYLOS_UPSTREAM_CONFIG = 'https://ghmirror.icoco.site/upstreams.json';
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      const fetchFn = makeFetch({});
+      const url = await resolveReleasesUrl({ fetchFn });
+      assert.equal(url, 'https://verbatim.example/releases/latest');
+      assert.equal(fetchFn.calls.length, 0, 'escape hatch must not fetch upstreams.json');
+    });
+
+    it('GITHUB_API_BASE wins over ZYLOS_UPSTREAM_CONFIG', async () => {
+      process.env.GITHUB_API_BASE = 'https://base.example';
+      process.env.ZYLOS_UPSTREAM_CONFIG = 'https://ghmirror.icoco.site/upstreams.json';
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      const fetchFn = makeFetch({});
+      const url = await resolveReleasesUrl({ fetchFn });
+      assert.equal(url, 'https://base.example/repos/zylos-ai/zylos-openmax/releases/latest');
+      assert.equal(fetchFn.calls.length, 0);
+    });
+  });
+
+  describe('resolveReleasesUrl graceful fallback (never throws)', () => {
+    const configUrl = 'https://ghmirror.icoco.site/upstreams.json';
+
+    it('falls back to default when upstreams.json fetch is not ok', async () => {
+      process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      const fetchFn = makeFetch({ [configUrl]: { ok: false, status: 503, statusText: 'Service Unavailable' } });
+      const url = await resolveReleasesUrl({ fetchFn });
+      assert.equal(url, DEFAULT_URL);
+    });
+
+    it('falls back to default when upstreams.json is malformed (json throws)', async () => {
+      process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      const fetchFn = makeFetch({ [configUrl]: { throwOnJson: true } });
+      const url = await resolveReleasesUrl({ fetchFn });
+      assert.equal(url, DEFAULT_URL);
+    });
+
+    it('falls back to default when providers.github.apiBase is missing', async () => {
+      process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      const fetchFn = makeFetch({ [configUrl]: { body: { providers: { github: {} } } } });
+      const url = await resolveReleasesUrl({ fetchFn });
+      assert.equal(url, DEFAULT_URL);
+    });
+
+    it('falls back to default when the upstream fetch rejects (unreachable)', async () => {
+      process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      const fetchFn = async () => { throw new Error('ECONNREFUSED'); };
+      const url = await resolveReleasesUrl({ fetchFn });
+      assert.equal(url, DEFAULT_URL);
+    });
+
+    it('does not fetch and falls back when the config host is not trusted', async () => {
+      process.env.ZYLOS_UPSTREAM_CONFIG = 'https://evil.example/upstreams.json';
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      const fetchFn = makeFetch({});
+      const url = await resolveReleasesUrl({ fetchFn });
+      assert.equal(url, DEFAULT_URL);
+      assert.equal(fetchFn.calls.length, 0, 'must not fetch upstreams.json from an untrusted host');
+    });
+
+    it('falls back when the derived apiBase host is not trusted (env poisoning guard)', async () => {
+      process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      const fetchFn = makeFetch({
+        [configUrl]: { body: { providers: { github: { apiBase: 'https://evil.example/gh-api/' } } } },
+      });
+      const url = await resolveReleasesUrl({ fetchFn });
+      assert.equal(url, DEFAULT_URL);
+    });
+
+    it('falls back when ZYLOS_UPSTREAM_CONFIG is set but no trust list exists', async () => {
+      process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
+      // No ZYLOS_UPSTREAM_TRUST_HOSTS: nothing can be vouched for → default.
+      const fetchFn = makeFetch({});
+      const url = await resolveReleasesUrl({ fetchFn });
+      assert.equal(url, DEFAULT_URL);
+      assert.equal(fetchFn.calls.length, 0);
+    });
+  });
+
+  describe('fetchLatestRelease', () => {
+    it('GETs the default URL and parses the release (no env set)', async () => {
+      const fetchFn = makeFetch({
+        [DEFAULT_URL]: { body: { tag_name: 'v2.20.0', name: 'v2.20.0', body: 'notes', html_url: 'https://gh/rel' } },
+      });
+      const rel = await fetchLatestRelease({ fetchFn });
+      assert.equal(fetchFn.calls.length, 1);
+      assert.equal(fetchFn.calls[0].url, DEFAULT_URL);
+      assert.equal(rel.tag, '2.20.0');
+      assert.equal(rel.name, 'v2.20.0');
+      assert.equal(rel.url, 'https://gh/rel');
+    });
+
+    it('attaches the GITHUB_TOKEN bearer header to the release GET', async () => {
+      process.env.GITHUB_TOKEN = 'secret-token';
+      const fetchFn = makeFetch({ [DEFAULT_URL]: { body: { tag_name: 'v2.20.0' } } });
+      await fetchLatestRelease({ fetchFn });
+      assert.equal(fetchFn.calls[0].options.headers.Authorization, 'Bearer secret-token');
+    });
+
+    it('honors GH_TOKEN when GITHUB_TOKEN is absent', async () => {
+      process.env.GH_TOKEN = 'gh-token';
+      const fetchFn = makeFetch({ [DEFAULT_URL]: { body: { tag_name: 'v2.20.0' } } });
+      await fetchLatestRelease({ fetchFn });
+      assert.equal(fetchFn.calls[0].options.headers.Authorization, 'Bearer gh-token');
+    });
+
+    it('GETs the mirror URL derived from a trusted ZYLOS_UPSTREAM_CONFIG', async () => {
+      const configUrl = 'https://ghmirror.icoco.site/upstreams.json';
+      const mirrorRelease = 'https://ghmirror.icoco.site/gh-api/repos/zylos-ai/zylos-openmax/releases/latest';
+      process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      const fetchFn = makeFetch({
+        [configUrl]: { body: { providers: { github: { apiBase: 'https://ghmirror.icoco.site/gh-api/' } } } },
+        [mirrorRelease]: { body: { tag_name: 'v2.20.0' } },
+      });
+      const rel = await fetchLatestRelease({ fetchFn });
+      assert.equal(rel.tag, '2.20.0');
+      const urls = fetchFn.calls.map((c) => c.url);
+      assert.deepEqual(urls, [configUrl, mirrorRelease]);
+    });
+
+    it('throws on a non-ok release response (kept non-fatal by the caller)', async () => {
+      const fetchFn = makeFetch({ [DEFAULT_URL]: { ok: false, status: 404, statusText: 'Not Found' } });
+      await assert.rejects(() => fetchLatestRelease({ fetchFn }), /GitHub API 404/);
+    });
+  });
+});
+
+// Issue #146 review hardening — P1 (token authorization boundary) and P2
+// (a malformed high-priority override must fail SOFT, falling through to the
+// next source, never hard-failing discovery or returning an unvalidated URL).
+describe('discovery trust/URL hardening (review P1/P2)', () => {
+  const ENVS = [
+    'OPENMAX_RELEASES_URL',
+    'GITHUB_API_BASE',
+    'ZYLOS_UPSTREAM_CONFIG',
+    'ZYLOS_UPSTREAM_TRUST_HOSTS',
+    'GITHUB_TOKEN',
+    'GH_TOKEN',
+  ];
+  const DEFAULT_URL = 'https://api.github.com/repos/zylos-ai/zylos-openmax/releases/latest';
+  let savedEnv;
+
+  beforeEach(() => {
+    savedEnv = {};
+    for (const k of ENVS) { savedEnv[k] = process.env[k]; delete process.env[k]; }
+  });
+  afterEach(() => {
+    for (const k of ENVS) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+  });
+
+  function makeFetch(routes) {
+    const calls = [];
+    const fetchFn = async (url, options) => {
+      calls.push({ url, options });
+      const route = routes[url];
+      if (!route) throw new Error(`unexpected fetch: ${url}`);
+      return {
+        ok: route.ok !== false,
+        status: route.status || 200,
+        statusText: route.statusText || 'OK',
+        json: async () => route.body,
+      };
+    };
+    fetchFn.calls = calls;
+    return fetchFn;
+  }
+
+  // Capture everything the module writes to console during fn() so a test can
+  // assert a sentinel secret NEVER appears in the (PM2-persisted) logs.
+  async function captureConsole(fn) {
+    const orig = { log: console.log, warn: console.warn, error: console.error };
+    const lines = [];
+    console.log = (...a) => lines.push(a.join(' '));
+    console.warn = (...a) => lines.push(a.join(' '));
+    console.error = (...a) => lines.push(a.join(' '));
+    try { await fn(); } finally {
+      console.log = orig.log; console.warn = orig.warn; console.error = orig.error;
+    }
+    return lines.join('\n');
+  }
+
+  describe('P1/P2 — parseTrustHosts strict + atomic fail-closed', () => {
+    it('(c) does NOT accept whitespace-separated items (no silent authorization)', () => {
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example other.example';
+      const set = parseTrustHosts();
+      assert.equal(set.size, 0, 'a space-containing token is malformed → whole list rejected');
+    });
+
+    it('keeps all hosts when every comma-separated item is a valid host[:port]', () => {
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example,other.example:8443';
+      const set = parseTrustHosts();
+      assert.deepEqual([...set].sort(), ['mirror.example', 'other.example:8443']);
+    });
+
+    it('atomic fail-closed: one EMPTY item (a,,b) rejects the ENTIRE list', () => {
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example,,other.example';
+      const set = parseTrustHosts();
+      assert.equal(set.size, 0, 'neither host is trusted when any item is empty');
+      assert.ok(!set.has('mirror.example') && !set.has('other.example'));
+    });
+
+    it('atomic fail-closed: one MALFORMED item rejects the ENTIRE list', () => {
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example,not a host,other.example';
+      assert.equal(parseTrustHosts().size, 0, 'a malformed declaration authorizes nothing');
+    });
+
+    it('a trailing comma (empty trailing item) rejects the whole list', () => {
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example,';
+      assert.equal(parseTrustHosts().size, 0);
+    });
+
+    it('unset / blank env is the normal no-trust case (empty set, no throw)', () => {
+      assert.equal(parseTrustHosts().size, 0);
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = '   ';
+      assert.equal(parseTrustHosts().size, 0);
+    });
+
+    it('atomic fail-closed strips token authority from ALL hosts under a malformed list', () => {
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example,,other.example'; // empty middle item
+      assert.equal(shouldAttachToken('https://mirror.example/x'), false, 'no host authorized under a malformed declaration');
+      assert.equal(shouldAttachToken('https://other.example/x'), false);
+      // Official GitHub is always authorized, independent of the trust list.
+      assert.equal(shouldAttachToken('https://api.github.com/x'), true);
+    });
+  });
+
+  describe('P1 — shouldAttachToken authorization boundary', () => {
+    it('attaches to official api.github.com', () => {
+      assert.equal(shouldAttachToken(DEFAULT_URL), true);
+    });
+
+    it('(a) never attaches to an http:// mirror, even a trusted host', () => {
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example';
+      assert.equal(shouldAttachToken('http://mirror.example/gh-api/x'), false);
+    });
+
+    it('(b) attaches to a trusted https host but NOT to a port-mismatched one', () => {
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example';
+      assert.equal(shouldAttachToken('https://mirror.example/gh-api/x'), true, 'exact host is trusted');
+      assert.equal(shouldAttachToken('https://mirror.example:4444/gh-api/x'), false, 'a port must not match a bare-host entry');
+    });
+
+    it('(d) never attaches to a URL carrying embedded credentials', () => {
+      assert.equal(shouldAttachToken('https://u:p@api.github.com/x'), false);
+    });
+
+    it('does not attach to an untrusted https host', () => {
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example';
+      assert.equal(shouldAttachToken('https://evil.example/x'), false);
+    });
+  });
+
+  describe('P1 — fetchLatestRelease end-to-end token boundary', () => {
+    it('(e) an http OPENMAX_RELEASES_URL is never fetched (falls through) and gets no token', async () => {
+      const httpMirror = 'http://mirror.example/gh-api/repos/zylos-ai/zylos-openmax/releases/latest';
+      process.env.OPENMAX_RELEASES_URL = httpMirror;
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example';
+      process.env.GITHUB_TOKEN = 'secret-token';
+      const fetchFn = makeFetch({ [DEFAULT_URL]: { body: { tag_name: 'v2.20.0' } } });
+      const rel = await fetchLatestRelease({ fetchFn });
+      assert.equal(rel.tag, '2.20.0');
+      const urls = fetchFn.calls.map((c) => c.url);
+      assert.ok(!urls.includes(httpMirror), 'the http mirror must never be contacted');
+      assert.deepEqual(urls, [DEFAULT_URL], 'discovery fell through to the default');
+      assert.equal(fetchFn.calls[0].options.headers.Authorization, 'Bearer secret-token',
+        'the default (official) target still carries the token — invariant preserved');
+    });
+
+    it('attaches the token to a trusted https mirror derived from upstreams (positive control)', async () => {
+      const configUrl = 'https://ghmirror.icoco.site/upstreams.json';
+      const mirrorRelease = 'https://ghmirror.icoco.site/gh-api/repos/zylos-ai/zylos-openmax/releases/latest';
+      process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      process.env.GITHUB_TOKEN = 'secret-token';
+      const fetchFn = makeFetch({
+        [configUrl]: { body: { providers: { github: { apiBase: 'https://ghmirror.icoco.site/gh-api/' } } } },
+        [mirrorRelease]: { body: { tag_name: 'v2.20.0' } },
+      });
+      await fetchLatestRelease({ fetchFn });
+      const mirrorCall = fetchFn.calls.find((c) => c.url === mirrorRelease);
+      assert.ok(mirrorCall, 'the trusted mirror was contacted');
+      assert.equal(mirrorCall.options.headers.Authorization, 'Bearer secret-token');
+    });
+
+    it('does NOT attach the token to an untrusted GITHUB_API_BASE mirror', async () => {
+      const mirror = 'https://ghproxy.example/repos/zylos-ai/zylos-openmax/releases/latest';
+      process.env.GITHUB_API_BASE = 'https://ghproxy.example';
+      process.env.GITHUB_TOKEN = 'secret-token';
+      const fetchFn = makeFetch({ [mirror]: { body: { tag_name: 'v2.20.0' } } });
+      await fetchLatestRelease({ fetchFn });
+      assert.equal(fetchFn.calls[0].url, mirror);
+      assert.equal(fetchFn.calls[0].options.headers.Authorization, undefined,
+        'a mirror not in the trust list must not receive the token');
+    });
+  });
+
+  describe('P2 — malformed high-priority override fails soft (falls through)', () => {
+    it('(f) malformed OPENMAX_RELEASES_URL falls through to GITHUB_API_BASE', async () => {
+      process.env.OPENMAX_RELEASES_URL = 'not a url';
+      process.env.GITHUB_API_BASE = 'https://base.example';
+      const fetchFn = makeFetch({});
+      const url = await resolveReleasesUrl({ fetchFn });
+      assert.equal(url, 'https://base.example/repos/zylos-ai/zylos-openmax/releases/latest');
+    });
+
+    it('(g) malformed GITHUB_API_BASE falls through to a trusted upstream', async () => {
+      const configUrl = 'https://ghmirror.icoco.site/upstreams.json';
+      process.env.GITHUB_API_BASE = '://bad';
+      process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      const fetchFn = makeFetch({
+        [configUrl]: { body: { providers: { github: { apiBase: 'https://ghmirror.icoco.site/gh-api/' } } } },
+      });
+      const url = await resolveReleasesUrl({ fetchFn });
+      assert.equal(url, 'https://ghmirror.icoco.site/gh-api/repos/zylos-ai/zylos-openmax/releases/latest');
+      assert.equal(fetchFn.calls.length, 1);
+      assert.equal(fetchFn.calls[0].url, configUrl);
+    });
+
+    it('OPENMAX_RELEASES_URL with embedded credentials falls through, not used verbatim', async () => {
+      process.env.OPENMAX_RELEASES_URL = 'https://u:p@mirror.example/releases/latest';
+      process.env.GITHUB_API_BASE = 'https://base.example';
+      const fetchFn = makeFetch({});
+      const url = await resolveReleasesUrl({ fetchFn });
+      assert.equal(url, 'https://base.example/repos/zylos-ai/zylos-openmax/releases/latest');
+    });
+
+    it('all overrides malformed → falls through to the default (discovery never hard-fails)', async () => {
+      process.env.OPENMAX_RELEASES_URL = 'http://insecure.example/releases/latest';
+      process.env.GITHUB_API_BASE = '://bad';
+      const fetchFn = makeFetch({});
+      const url = await resolveReleasesUrl({ fetchFn });
+      assert.equal(url, DEFAULT_URL);
+    });
+
+    it('keeps the default-URL byte-identity when no env is set', async () => {
+      const url = await resolveReleasesUrl({ fetchFn: makeFetch({}) });
+      assert.equal(url, DEFAULT_URL);
+    });
+  });
+
+  describe('P2 — base raw-string anomalies fall through (built from normalized URL)', () => {
+    it('GITHUB_API_BASE with surrounding whitespace falls through to a trusted upstream', async () => {
+      const configUrl = 'https://ghmirror.icoco.site/upstreams.json';
+      process.env.GITHUB_API_BASE = ' https://api.github.com ';
+      process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      const fetchFn = makeFetch({
+        [configUrl]: { body: { providers: { github: { apiBase: 'https://ghmirror.icoco.site/gh-api/' } } } },
+      });
+      const url = await resolveReleasesUrl({ fetchFn });
+      // Reaching the distinct upstream mirror proves the whitespace base was
+      // rejected (not silently normalized to api.github.com).
+      assert.equal(url, 'https://ghmirror.icoco.site/gh-api/repos/zylos-ai/zylos-openmax/releases/latest');
+    });
+
+    it('GITHUB_API_BASE with an empty query (?) falls through to the default', async () => {
+      process.env.GITHUB_API_BASE = 'https://base.example?';
+      const url = await resolveReleasesUrl({ fetchFn: makeFetch({}) });
+      assert.equal(url, DEFAULT_URL);
+    });
+
+    it('GITHUB_API_BASE with a trailing fragment (#) falls through to the default', async () => {
+      process.env.GITHUB_API_BASE = 'https://base.example#';
+      const url = await resolveReleasesUrl({ fetchFn: makeFetch({}) });
+      assert.equal(url, DEFAULT_URL);
+    });
+
+    it('a clean GITHUB_API_BASE still builds from the normalized origin+path', async () => {
+      process.env.GITHUB_API_BASE = 'https://ghproxy.example/gh-api/';
+      const url = await resolveReleasesUrl({ fetchFn: makeFetch({}) });
+      assert.equal(url, 'https://ghproxy.example/gh-api/repos/zylos-ai/zylos-openmax/releases/latest');
+    });
+  });
+
+  describe('P1 — secrets never reach the logs (redaction)', () => {
+    const SENTINEL = 'do-NOT-log-THIS-secret-9f3a';
+
+    it('rejected OPENMAX_RELEASES_URL with userinfo does not leak the secret', async () => {
+      process.env.OPENMAX_RELEASES_URL = `https://alice:${SENTINEL}@mirror.example/releases/latest`;
+      const out = await captureConsole(() => resolveReleasesUrl({ fetchFn: makeFetch({}) }));
+      assert.ok(!out.includes(SENTINEL), 'userinfo secret must be redacted from logs');
+      assert.ok(out.includes('OPENMAX_RELEASES_URL'), 'the variable name is still logged for diagnostics');
+    });
+
+    it('accepted full-URL override with a signed query is used verbatim but logged redacted', async () => {
+      process.env.OPENMAX_RELEASES_URL = `https://mirror.example/x/releases/latest?token=${SENTINEL}`;
+      let returned;
+      const out = await captureConsole(async () => {
+        returned = await resolveReleasesUrl({ fetchFn: makeFetch({}) });
+      });
+      assert.ok(!out.includes(SENTINEL), 'signed-query token must be redacted from the success log');
+      assert.ok(returned.includes(SENTINEL), 'the override is still used verbatim (query preserved) for the fetch');
+    });
+
+    it('rejected GITHUB_API_BASE with userinfo does not leak the secret', async () => {
+      process.env.GITHUB_API_BASE = `https://alice:${SENTINEL}@base.example`;
+      const out = await captureConsole(() => resolveReleasesUrl({ fetchFn: makeFetch({}) }));
+      assert.ok(!out.includes(SENTINEL), 'GITHUB_API_BASE userinfo secret must be redacted');
+    });
+
+    it('malformed trust-list warning does not echo the raw value', async () => {
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = `evil ${SENTINEL} host`;
+      const out = await captureConsole(() => { parseTrustHosts(); });
+      assert.ok(!out.includes(SENTINEL), 'trust-list warning must not echo raw items');
+    });
+
+    it('upstream-config fetch REJECTION does not leak a signed URL from e.message', async () => {
+      const configUrl = 'https://ghmirror.icoco.site/upstreams.json';
+      process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      // The rejection message embeds the signed config URL (query token and all),
+      // exactly as a native fetch error can.
+      const fetchFn = async () => {
+        throw new Error(`request to https://ghmirror.icoco.site/upstreams.json?token=${SENTINEL} failed`);
+      };
+      let url;
+      const out = await captureConsole(async () => { url = await resolveReleasesUrl({ fetchFn }); });
+      assert.ok(!out.includes(SENTINEL), 'a fetch-rejection message must never reach the log');
+      assert.equal(url, DEFAULT_URL, 'still falls through to the default');
+    });
+
+    it('upstream-config non-JSON body does not leak the body snippet from a parse error', async () => {
+      const configUrl = 'https://ghmirror.icoco.site/upstreams.json';
+      process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      // A SHORT sentinel so the real JSON.parse error message quotes it in full
+      // (Node truncates long snippets): `SyntaxError: Unexpected token 's',
+      // "s3cr3t7" is not valid JSON`. Confirm the repro actually embeds it, then
+      // assert the module never lets that message reach the log.
+      const shortSecret = 's3cr3t7';
+      let parseMsg = '';
+      try { JSON.parse(shortSecret); } catch (e) { parseMsg = e.message; }
+      assert.ok(parseMsg.includes(shortSecret), 'sanity: the parse error embeds the body snippet');
+      const fetchFn = async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => JSON.parse(shortSecret), // real SyntaxError quoting the body
+      });
+      let url;
+      const out = await captureConsole(async () => { url = await resolveReleasesUrl({ fetchFn }); });
+      assert.ok(!out.includes(shortSecret), 'a JSON parse-error body snippet must never reach the log');
+      assert.equal(url, DEFAULT_URL, 'still falls through to the default');
+    });
+
+    // R4: the FINAL release request path (checkForUpdates → fetchLatestRelease →
+    // release fetch + res.json()) must not leak either. These drive the real
+    // checkForUpdates() chain with a stubbed global fetch (it calls
+    // fetchLatestRelease() with no injected deps, so it uses globalThis.fetch).
+    it('release-discovery fetch REJECTION does not leak a signed URL (checkForUpdates catch)', async () => {
+      const origFetch = globalThis.fetch;
+      const signedUrl = `https://mirror.example/gh-api/repos/zylos-ai/zylos-openmax/releases/latest?token=${SENTINEL}`;
+      // Model a native fetch rejection, whose message embeds the requested URL.
+      const err = new Error(`request to ${signedUrl} failed, reason: ECONNRESET`);
+      assert.ok(err.message.includes(SENTINEL), 'sanity: the thrown error embeds the signed URL');
+      globalThis.fetch = async () => { throw err; };
+      try {
+        const out = await captureConsole(() => checkForUpdates([], async () => ({}), (p) => p));
+        assert.ok(!out.includes(SENTINEL), 'the release-fetch rejection must never reach the log');
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it('release-discovery non-JSON body does not leak the body snippet (checkForUpdates catch)', async () => {
+      const origFetch = globalThis.fetch;
+      const shortSecret = 's3cr3t7';
+      let parseMsg = '';
+      try { JSON.parse(shortSecret); } catch (e) { parseMsg = e.message; }
+      assert.ok(parseMsg.includes(shortSecret), 'sanity: the parse error embeds the body snippet');
+      globalThis.fetch = async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => JSON.parse(shortSecret), // real SyntaxError quoting the body
+      });
+      try {
+        const out = await captureConsole(() => checkForUpdates([], async () => ({}), (p) => p));
+        assert.ok(!out.includes(shortSecret), 'a JSON parse-error body snippet must never reach the log');
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
   });
 });

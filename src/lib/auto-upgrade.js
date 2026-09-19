@@ -109,12 +109,244 @@ function compareSemver(a, b) {
   return 0;
 }
 
-async function fetchLatestRelease() {
-  const url = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
+// Default GitHub REST base. Kept as a constant so the default resolution below
+// produces the exact same URL the hardcoded path used before issue #146.
+const DEFAULT_API_BASE = 'https://api.github.com';
+
+// Build `<base>/repos/<repo>/releases/latest`, tolerating a trailing slash (or
+// several) on the base so both `https://host` and `https://host/gh-api/` join
+// cleanly.
+function releasesLatestUrl(base) {
+  return `${base.replace(/\/+$/, '')}/repos/${GITHUB_REPO}/releases/latest`;
+}
+
+// A single ZYLOS_UPSTREAM_TRUST_HOSTS entry is an exact `host[:port]` token:
+// DNS labels (alnum + internal hyphens) joined by dots, with an optional
+// numeric port. No scheme, path, userinfo, or whitespace — anything else is
+// malformed and must not be treated as a valid authorization.
+function isValidHostToken(tok) {
+  if (!tok || tok.length > 263) return false; // 253 host + ':' + up to 5 port
+  return /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::\d{1,5})?$/.test(tok);
+}
+
+// Parse ZYLOS_UPSTREAM_TRUST_HOSTS into a lowercase Set of exact `host[:port]`
+// tokens. STRICTLY comma-separated (whitespace is never a separator) and ATOMIC
+// fail-closed: if the declaration is present but ANY item is empty (a stray,
+// double, or trailing comma) or malformed, the ENTIRE list is rejected and NO
+// host is authorized — a single typo can never leave a partial allowlist in
+// force. An unset or blank env is the normal "no trust" case (empty set, no
+// warning). Warnings never echo the raw value. This mirrors the trust
+// convention catalog/runtime uses when injecting the mirror config.
+export function parseTrustHosts() {
+  const raw = process.env.ZYLOS_UPSTREAM_TRUST_HOSTS;
+  if (!raw || !raw.trim()) return new Set(); // unset / blank → no trust (normal)
+  const hosts = [];
+  for (const part of raw.split(',')) {
+    const tok = part.trim().toLowerCase();
+    if (!tok || !isValidHostToken(tok)) {
+      warn('ZYLOS_UPSTREAM_TRUST_HOSTS has an empty or malformed entry — rejecting the entire trust list (no host authorized)');
+      return new Set();
+    }
+    hosts.push(tok);
+  }
+  return new Set(hosts);
+}
+
+// Shared URL-safety gate applied to any resolved URL before it is used or given
+// a token: must be https, must not embed credentials (user:pass@), must not
+// carry a fragment. Returns the parsed URL, or null when unsafe/malformed.
+function safeHttpsUrl(urlStr) {
+  let u;
+  try { u = new URL(urlStr); } catch { return null; }
+  if (u.protocol !== 'https:') return null;
+  if (u.username || u.password) return null;
+  if (u.hash) return null;
+  return u;
+}
+
+// Redact a URL/base for logging: scheme + host + path ONLY, with any userinfo
+// and the entire query/fragment removed (either can carry a secret or a signed
+// token, and PM2 captures our operational logs to disk). A value that does not
+// parse becomes a fixed placeholder — a raw env value is NEVER echoed verbatim.
+function redactUrl(str) {
+  try {
+    const u = new URL(str);
+    return `${u.protocol}//${u.host}${u.pathname}`;
+  } catch {
+    return '<unparseable>';
+  }
+}
+
+// True only when urlStr parses, is https, and its FULL host (including port) is
+// present in `trusted`. Requiring https and matching URL.host (not hostname)
+// means an entry `mirror.example` does NOT authorize `mirror.example:4444` and
+// never authorizes an http:// origin.
+function isTrustedHost(urlStr, trusted) {
+  const u = safeHttpsUrl(urlStr);
+  return u ? trusted.has(u.host.toLowerCase()) : false;
+}
+
+// Validate a *base* URL (GITHUB_API_BASE / providers.github.apiBase) and build
+// the releases-latest URL from the NORMALIZED URL object, never the raw string.
+// A base must be a clean https origin+path prefix. Rejected (→ caller falls
+// through) when the raw value has leading/trailing or embedded whitespace, any
+// control char, or a query/fragment marker (`?`/`#`) — even an EMPTY one, which
+// `new URL()` reports as an empty search/hash yet still swallows the appended
+// path into the query/fragment — or when it embeds credentials / is non-https.
+// Building from `origin + pathname` guarantees no un-normalized raw artifact
+// (stray whitespace, `?`, `#`) can ever reach the final target URL.
+function buildValidatedReleasesUrl(base) {
+  if (typeof base !== 'string') return null;
+  if (base !== base.trim()) return null;                     // surrounding whitespace
+  if (/[\s\x00-\x1f\x7f]/.test(base)) return null;           // any whitespace / control char
+  if (base.includes('?') || base.includes('#')) return null; // query/fragment marker (even empty)
+  const u = safeHttpsUrl(base);
+  if (!u || u.search || u.hash) return null;
+  return releasesLatestUrl(`${u.origin}${u.pathname}`);
+}
+
+// Token-attachment boundary. Attach GITHUB_TOKEN/GH_TOKEN ONLY when the resolved
+// target is (a) official GitHub (api.github.com) or (b) an explicitly
+// authorized https exact host[:port] in ZYLOS_UPSTREAM_TRUST_HOSTS. Never for
+// an http:// URL, a URL with embedded credentials, or an unauthorized host/port.
+export function shouldAttachToken(urlStr) {
+  const u = safeHttpsUrl(urlStr);
+  if (!u) return false;
+  const host = u.host.toLowerCase();
+  if (host === 'api.github.com') return true;
+  return parseTrustHosts().has(host);
+}
+
+/**
+ * Issue #146 — derive the REST base from the catalog-injected upstreams.json.
+ *
+ * upstreams.json shape: { schemaVersion, revision, providers: { github: {
+ * apiBase, rawBase, downloadBase } } }, where apiBase is a GENERIC
+ * api.github.com mirror (e.g. "https://ghmirror.icoco.site/gh-api/"). NOTE:
+ * upstreams.json carries NO per-component version/tag, so we only read
+ * providers.github.apiBase and still call `/repos/.../releases/latest` against
+ * it. Fails soft (returns null) on any error, missing apiBase, or an untrusted
+ * host so discovery is never made more fragile than the hardcoded path was.
+ */
+async function deriveBaseFromUpstreams(configUrl, fetchFn) {
+  const trusted = parseTrustHosts();
+  // Env-poisoning guard: never even fetch the config from a host that is not in
+  // the trust list. With no trust list we cannot vouch for any host, so we skip
+  // the derive path entirely and fall back to the default.
+  if (!isTrustedHost(configUrl, trusted)) {
+    warn(`ZYLOS_UPSTREAM_CONFIG host not in ZYLOS_UPSTREAM_TRUST_HOSTS — ignoring, using default base`);
+    return null;
+  }
+  try {
+    const res = await fetchFn(configUrl, { signal: AbortSignal.timeout(15000) });
+    if (!res.ok) throw new Error(`upstreams.json HTTP ${res.status}`);
+    const data = await res.json();
+    const apiBase = data?.providers?.github?.apiBase;
+    if (!apiBase || typeof apiBase !== 'string') {
+      warn('upstreams.json has no providers.github.apiBase — using default base');
+      return null;
+    }
+    // The derived host must also be trusted — the config could be legitimate
+    // but point apiBase at an arbitrary (malicious) host.
+    if (!isTrustedHost(apiBase, trusted)) {
+      warn(`derived providers.github.apiBase host not in ZYLOS_UPSTREAM_TRUST_HOSTS — using default base`);
+      return null;
+    }
+    return apiBase;
+  } catch (e) {
+    // NEVER interpolate raw exception content on this path: a JSON parse error
+    // embeds a snippet of the (attacker-influenced) response body, and a fetch
+    // rejection can embed the signed ZYLOS_UPSTREAM_CONFIG URL — query token and
+    // all. Log a fixed string plus only the coarse error class name (e.g.
+    // SyntaxError / TypeError / AbortError), which can never carry a secret.
+    warn(`could not derive base from ZYLOS_UPSTREAM_CONFIG (${e?.constructor?.name || 'error'}; detail redacted) — using default base`);
+    return null;
+  }
+}
+
+/**
+ * Issue #146 — resolve the releases-latest URL for self-upgrade discovery.
+ *
+ * CN / behind-the-GFW agents cannot reach api.github.com, so the previously
+ * hardcoded GET timed out (15s) and self-upgrade never advanced to the install
+ * step (`zylos upgrade openmax`, which already goes through the ghmirror and
+ * works). This makes the REST base configurable while keeping the default
+ * (non-CN) behavior byte-for-byte identical.
+ *
+ * Precedence (highest → lowest):
+ *   1. OPENMAX_RELEASES_URL  — a full releases-latest URL, used verbatim
+ *                              (zero-dependency escape hatch; no extra fetch).
+ *   2. GITHUB_API_BASE       — a base URL; append repos/<repo>/releases/latest.
+ *   3. ZYLOS_UPSTREAM_CONFIG — points at an upstreams.json (injected & trusted
+ *                              by catalog, same channel zylos-core uses); read
+ *                              providers.github.apiBase as the base. Gated by
+ *                              ZYLOS_UPSTREAM_TRUST_HOSTS.
+ *   4. Default               — https://api.github.com (unchanged).
+ *
+ * Every layer fails soft: a missing/untrusted/malformed value falls through to
+ * the next, so discovery failure can never crash the upgrade timer.
+ */
+export async function resolveReleasesUrl(deps = {}) {
+  const fetchFn = deps.fetchFn || fetch;
+
+  // 1. Full-URL escape hatch (highest priority). Strictly validated: a
+  //    malformed / non-https / credential-bearing value FAILS SOFT and falls
+  //    through to the next source. A single typo here must never permanently
+  //    cut off the valid lower-priority sources or return an unvalidated URL.
+  const explicitUrl = process.env.OPENMAX_RELEASES_URL;
+  if (explicitUrl) {
+    if (safeHttpsUrl(explicitUrl)) {
+      // Log a REDACTED form: the verbatim value may legitimately carry a signed
+      // query token, and PM2 persists these logs — never echo it.
+      log(`discovery base: OPENMAX_RELEASES_URL override → ${redactUrl(explicitUrl)}`);
+      return explicitUrl;
+    }
+    warn(`OPENMAX_RELEASES_URL is not a safe https URL (${redactUrl(explicitUrl)}) — ignoring, trying next source`);
+  }
+
+  // 2. Base-URL escape hatch (also strictly validated; fails soft).
+  const explicitBase = process.env.GITHUB_API_BASE;
+  if (explicitBase) {
+    const url = buildValidatedReleasesUrl(explicitBase);
+    if (url) {
+      log(`discovery base: GITHUB_API_BASE override → ${redactUrl(url)}`);
+      return url;
+    }
+    warn(`GITHUB_API_BASE is not a safe https base (${redactUrl(explicitBase)}) — ignoring, trying next source`);
+  }
+
+  // 3. Derive from the catalog-injected upstreams.json (CN main path).
+  const upstreamConfig = process.env.ZYLOS_UPSTREAM_CONFIG;
+  if (upstreamConfig) {
+    const derivedBase = await deriveBaseFromUpstreams(upstreamConfig, fetchFn);
+    if (derivedBase) {
+      const url = buildValidatedReleasesUrl(derivedBase);
+      if (url) {
+        log(`discovery base: derived from ZYLOS_UPSTREAM_CONFIG → ${redactUrl(url)}`);
+        return url;
+      }
+      warn(`derived providers.github.apiBase is not a safe https base (${redactUrl(derivedBase)}) — using default base`);
+    }
+    // else fall through to the default below.
+  }
+
+  // 4. Default — unchanged for GKE / non-CN deployments.
+  const url = releasesLatestUrl(DEFAULT_API_BASE);
+  log(`discovery base: default api.github.com → ${redactUrl(url)}`);
+  return url;
+}
+
+export async function fetchLatestRelease(deps = {}) {
+  const fetchFn = deps.fetchFn || fetch;
+  // Issue #146: base is resolved (env / mirror / default) instead of hardcoded.
+  const url = await resolveReleasesUrl(deps);
   const headers = { Accept: 'application/vnd.github.v3+json' };
+  // Token authorization boundary: attach the GitHub token ONLY to official
+  // GitHub or an explicitly-authorized https host in the trust list — never to
+  // an http URL, a URL with embedded credentials, or an unauthorized host/port.
   const ghToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
-  if (ghToken) headers.Authorization = `Bearer ${ghToken}`;
-  const res = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
+  if (ghToken && shouldAttachToken(url)) headers.Authorization = `Bearer ${ghToken}`;
+  const res = await fetchFn(url, { headers, signal: AbortSignal.timeout(15000) });
   if (!res.ok) throw new Error(`GitHub API ${res.status}: ${res.statusText}`);
   const data = await res.json();
   return {
@@ -602,6 +834,12 @@ export async function checkForUpdates(enabledOrgConfigs, postForOrgFn, apiPathFn
       await notifyUpgradeComplete(enabledOrgConfigs, postForOrgFn, apiPathFn);
     }
   } catch (e) {
-    warn(`check failed: ${e.message}`);
+    // Outer catch for the whole release-discovery chain (resolveReleasesUrl →
+    // fetchLatestRelease → release fetch + res.json()). NEVER interpolate raw
+    // exception content: a JSON parse error embeds a snippet of the
+    // (attacker-influenced) mirror response body, and a fetch rejection can
+    // embed the signed release URL — query token and all. Log a fixed string
+    // plus only the coarse error class name, which can never carry a secret.
+    warn(`check failed (${e?.constructor?.name || 'error'}; detail redacted)`);
   }
 }

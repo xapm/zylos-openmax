@@ -787,5 +787,44 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
       const out = await captureConsole(() => { parseTrustHosts(); });
       assert.ok(!out.includes(SENTINEL), 'trust-list warning must not echo raw items');
     });
+
+    it('upstream-config fetch REJECTION does not leak a signed URL from e.message', async () => {
+      const configUrl = 'https://ghmirror.icoco.site/upstreams.json';
+      process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      // The rejection message embeds the signed config URL (query token and all),
+      // exactly as a native fetch error can.
+      const fetchFn = async () => {
+        throw new Error(`request to https://ghmirror.icoco.site/upstreams.json?token=${SENTINEL} failed`);
+      };
+      let url;
+      const out = await captureConsole(async () => { url = await resolveReleasesUrl({ fetchFn }); });
+      assert.ok(!out.includes(SENTINEL), 'a fetch-rejection message must never reach the log');
+      assert.equal(url, DEFAULT_URL, 'still falls through to the default');
+    });
+
+    it('upstream-config non-JSON body does not leak the body snippet from a parse error', async () => {
+      const configUrl = 'https://ghmirror.icoco.site/upstreams.json';
+      process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
+      process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
+      // A SHORT sentinel so the real JSON.parse error message quotes it in full
+      // (Node truncates long snippets): `SyntaxError: Unexpected token 's',
+      // "s3cr3t7" is not valid JSON`. Confirm the repro actually embeds it, then
+      // assert the module never lets that message reach the log.
+      const shortSecret = 's3cr3t7';
+      let parseMsg = '';
+      try { JSON.parse(shortSecret); } catch (e) { parseMsg = e.message; }
+      assert.ok(parseMsg.includes(shortSecret), 'sanity: the parse error embeds the body snippet');
+      const fetchFn = async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => JSON.parse(shortSecret), // real SyntaxError quoting the body
+      });
+      let url;
+      const out = await captureConsole(async () => { url = await resolveReleasesUrl({ fetchFn }); });
+      assert.ok(!out.includes(shortSecret), 'a JSON parse-error body snippet must never reach the log');
+      assert.equal(url, DEFAULT_URL, 'still falls through to the default');
+    });
   });
 });

@@ -254,7 +254,12 @@ async function deriveBaseFromUpstreams(configUrl, fetchFn) {
     }
     return apiBase;
   } catch (e) {
-    warn(`could not derive base from ZYLOS_UPSTREAM_CONFIG: ${e.message} — using default base`);
+    // NEVER interpolate raw exception content on this path: a JSON parse error
+    // embeds a snippet of the (attacker-influenced) response body, and a fetch
+    // rejection can embed the signed ZYLOS_UPSTREAM_CONFIG URL — query token and
+    // all. Log a fixed string plus only the coarse error class name (e.g.
+    // SyntaxError / TypeError / AbortError), which can never carry a secret.
+    warn(`could not derive base from ZYLOS_UPSTREAM_CONFIG (${e?.constructor?.name || 'error'}; detail redacted) — using default base`);
     return null;
   }
 }

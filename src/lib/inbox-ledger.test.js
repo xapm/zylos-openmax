@@ -189,3 +189,154 @@ test('reload drops failure counters for seqs already at/behind the watermark', (
   assert.equal(ledger.getContentFetchFailureCount(3), 0, 'stale (<=acked) counter dropped on load');
   assert.equal(ledger.getContentFetchFailureCount(7), 1, 'live (>acked) counter kept on load');
 });
+
+// ---------------------------------------------------------------------------
+// Identity binding + watermark-inversion alarm (#148)
+// ---------------------------------------------------------------------------
+
+test('identity change is DETECTED on load but the ledger is NOT reset until rebind (#148)', () => {
+  // A migrated agent: the persisted ledger belongs to member "old" with a high
+  // watermark, but self.member_id is now "new" (whose server inbox restarted at
+  // 1). Owner decision: do NOT reset on load — keep the stale watermark in force
+  // (so the inversion alarm fires) until /sync/status can reseed deterministically.
+  seedLedgerFile('id-change', { member_id: 'old', acked_seq: 2313, received: [2313], fetch_failures: { '2400': 3 } });
+  const warnings = [];
+  const ledger = createInboxLedger('id-change', { log: noop, warn: (m) => warnings.push(m), memberId: 'new' });
+
+  assert.deepEqual(ledger.getIdentityChange(), { previousMemberId: 'old', currentMemberId: 'new' });
+  assert.equal(ledger.getAckedSeq(), 2313, 'watermark unchanged on load — no blind reset');
+  assert.equal(ledger.getContentFetchFailureCount(2400), 3, 'failure counters unchanged on load');
+  assert.equal(ledger.record(2), false, 'new low seqs still shadowed by the stale watermark pre-rebind');
+  assert.ok(
+    warnings.some((m) => /identity change detected old→new/.test(m)),
+    'a detection WARN was emitted',
+  );
+});
+
+test('rebindIdentity resets, reseeds to the server anchor, and adopts the new member_id (#148)', () => {
+  seedLedgerFile('id-rebind', { member_id: 'old', acked_seq: 2313, received: [2313], fetch_failures: { '2400': 3 } });
+  const ledger = createInboxLedger('id-rebind', { log: noop, memberId: 'new' });
+  assert.ok(ledger.getIdentityChange(), 'change detected');
+
+  // Server reports the new identity's last_delivered_seq=5 — reseed to it.
+  ledger.rebindIdentity('new', 5);
+  assert.equal(ledger.getIdentityChange(), null, 'flag cleared after a successful rebind');
+  assert.equal(ledger.getAckedSeq(), 5, 'watermark reseeded to the server anchor');
+  assert.equal(ledger.getContentFetchFailureCount(2400), 0, 'stale failure counters dropped by the rebind');
+  assert.equal(ledger.record(6), true, 'a pending seq above the anchor is accepted');   // advances 5→6
+  assert.equal(ledger.record(5), false, 'the seq at the anchor is deduped');
+
+  // The new member_id is persisted, so a reload sees no further change; the
+  // watermark carried is 6 (record(6) advanced it past the reseed anchor).
+  ledger.stop();
+  const reloaded = createInboxLedger('id-rebind', { log: noop, memberId: 'new' });
+  assert.equal(reloaded.getIdentityChange(), null, 'new member_id persisted → no re-detection');
+  assert.equal(reloaded.getAckedSeq(), 6, 'reseed + subsequent delivery persisted across reload');
+});
+
+test('rebindIdentity accepts a legitimate anchor of 0 (#148)', () => {
+  seedLedgerFile('id-rebind-0', { member_id: 'old', acked_seq: 2313 });
+  const ledger = createInboxLedger('id-rebind-0', { log: noop, memberId: 'new' });
+  ledger.rebindIdentity('new', 0);
+  assert.equal(ledger.getAckedSeq(), 0, 'anchor 0 fully resets the watermark');
+  assert.equal(ledger.record(1), true, 'the new inbox replays from seq 1');
+});
+
+test('deferred reseed: without a rebind the old member_id + watermark persist so the change re-detects (#148)', () => {
+  // Models the /sync/status-unavailable path: comm-bridge does NOT call
+  // rebindIdentity, so the ledger must keep the OLD identity on disk and the old
+  // watermark, so the pending change survives a restart and is retried.
+  const slug = 'id-defer';
+  seedLedgerFile(slug, { member_id: 'old', acked_seq: 2313, received: [2313] });
+  const a = createInboxLedger(slug, { log: noop, memberId: 'new' });
+  assert.ok(a.getIdentityChange(), 'change detected');
+  a.stop();   // persists — must NOT adopt "new"
+
+  const b = createInboxLedger(slug, { log: noop, memberId: 'new' });
+  assert.deepEqual(b.getIdentityChange(), { previousMemberId: 'old', currentMemberId: 'new' },
+    're-detected after restart because the new member_id was NOT adopted');
+  assert.equal(b.getAckedSeq(), 2313, 'watermark still the old one — never blindly reset');
+
+  // Now /sync/status is reachable → rebind succeeds and adopts the new identity.
+  b.rebindIdentity('new', 4);
+  b.stop();
+  const c = createInboxLedger(slug, { log: noop, memberId: 'new' });
+  assert.equal(c.getIdentityChange(), null, 'after a successful rebind the change is resolved');
+  assert.equal(c.getAckedSeq(), 4, 'the reseeded watermark is what persists');
+});
+
+test('same identity preserves the watermark; no change (#148)', () => {
+  seedLedgerFile('id-same', { member_id: 'm1', acked_seq: 42, received: [45] });
+  const ledger = createInboxLedger('id-same', { log: noop, memberId: 'm1' });
+  assert.equal(ledger.getIdentityChange(), null, 'no identity change reported');
+  assert.equal(ledger.getAckedSeq(), 42, 'watermark preserved for the same identity');
+  assert.equal(ledger.record(10), false, 'seq below the preserved watermark still deduped');
+});
+
+test('member_id is persisted and detected (not reset) across a reload (#148)', () => {
+  const slug = 'id-persist';
+  const a = createInboxLedger(slug, { log: noop, memberId: 'first' });
+  a.record(1);
+  a.stop();
+  // Same identity next boot: no change.
+  const b = createInboxLedger(slug, { log: noop, memberId: 'first' });
+  assert.equal(b.getIdentityChange(), null, 'persisted member_id matches → no change');
+  assert.equal(b.getAckedSeq(), 1, 'watermark carried across reload');
+  // A different identity next boot: change DETECTED, but watermark not reset yet.
+  const c = createInboxLedger(slug, { log: noop, memberId: 'second' });
+  assert.deepEqual(c.getIdentityChange(), { previousMemberId: 'first', currentMemberId: 'second' });
+  assert.equal(c.getAckedSeq(), 1, 'detection only — watermark not reset until rebind');
+});
+
+test('a missing current member_id neither triggers a change nor clobbers the stored id (#148)', () => {
+  const slug = 'id-missing';
+  seedLedgerFile(slug, { member_id: 'keep', acked_seq: 7 });
+  // Run with no memberId (e.g. identity not hydrated yet): must not false-trigger.
+  const a = createInboxLedger(slug, { log: noop });
+  assert.equal(a.getIdentityChange(), null, 'no change when current identity is unknown');
+  assert.equal(a.getAckedSeq(), 7, 'watermark preserved');
+  a.stop();
+  // The stored member_id survives, so a later identity-aware run still detects a change.
+  const b = createInboxLedger(slug, { log: noop, memberId: 'other' });
+  assert.deepEqual(b.getIdentityChange(), { previousMemberId: 'keep', currentMemberId: 'other' });
+});
+
+test('inverted watermark escalates to an ALARM after sustained below-watermark seqs (#148)', () => {
+  // Stale high watermark with no member_id recorded (pre-#148 ledger): the
+  // migration signature is a run of far-below-watermark seqs. This is the alert
+  // that was completely missing — inbound died with zero signal.
+  seedLedgerFile('inversion', { acked_seq: 2313 });
+  const warnings = [];
+  const ledger = createInboxLedger('inversion', { log: noop, warn: (m) => warnings.push(m) });
+
+  // 19 inversions: below the count threshold, still silent.
+  for (let i = 1; i <= 19; i++) assert.equal(ledger.record(i), false);
+  assert.equal(warnings.length, 0, 'no alarm below the consecutive-count threshold');
+
+  // The 20th consecutive far-below-watermark seq escalates.
+  assert.equal(ledger.record(20), false);
+  assert.equal(warnings.length, 1, 'alarm fires at the threshold');
+  assert.match(warnings[0], /ALARM/);
+  assert.match(warnings[0], /silently deduped/);
+  assert.match(warnings[0], /sync\/status/, 'the alarm carries the manual-fix hint');
+});
+
+test('inversion alarm does not fire when the gap is small (genuine recent duplicates) (#148)', () => {
+  // acked_seq=50 and a burst of true duplicates just below it (gap <= 100) is
+  // normal reconnect churn, not a migration — must stay silent.
+  seedLedgerFile('inversion-smallgap', { acked_seq: 50 });
+  const warnings = [];
+  const ledger = createInboxLedger('inversion-smallgap', { log: noop, warn: (m) => warnings.push(m) });
+  for (let i = 0; i < 40; i++) assert.equal(ledger.record(40 + (i % 10)), false); // seqs 40..49, gap <= 10
+  assert.equal(warnings.length, 0, 'no alarm for small-gap duplicates');
+});
+
+test('a genuine new delivery resets the inversion run (#148)', () => {
+  seedLedgerFile('inversion-reset', { acked_seq: 1000 });
+  const warnings = [];
+  const ledger = createInboxLedger('inversion-reset', { log: noop, warn: (m) => warnings.push(m) });
+  for (let i = 1; i <= 19; i++) assert.equal(ledger.record(i), false); // 19 inversions
+  assert.equal(ledger.record(1001), true, 'a real new seq is accepted and resets the run');
+  for (let i = 20; i <= 38; i++) assert.equal(ledger.record(i), false); // 19 more, counter restarted
+  assert.equal(warnings.length, 0, 'the intervening delivery reset the consecutive counter');
+});

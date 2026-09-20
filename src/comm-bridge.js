@@ -95,6 +95,12 @@ const SYNC_HEAD_MAX_INSWEEP_ATTEMPTS = 10;
 // catch-up sweep out indefinitely while holding the _syncInFlight guard.
 const SYNC_SWEEP_MAX_RETRY_BUDGET = 20;
 
+// #148 identity-rebind: bounded deadline for the GET /api/v1/sync/status probe
+// used to re-seed the watermark after a member_id change. On timeout/error the
+// rebind is NOT performed (logged, retried next reconnect — owner decision: no
+// blind degrade), so this must never hang the onOpen recovery path.
+const DEFAULT_SYNC_STATUS_TIMEOUT_MS = 5_000;
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Hardcoded WS operational defaults. `config.server.{reconnect_max_delay,
@@ -1759,7 +1765,11 @@ async function syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart = 
   }
   _syncInFlight.add(orgConfig.slug);
   try {
-    const startSeq = fromStart ? 0 : sessionRef.sync_seq;
+    // A `fromStart` replay normally begins at 0 (genuine first boot, where
+    // sync_seq is 0 anyway). The #148 identity rebind reuses this taint-clearing
+    // replay but pre-seeds sessionRef.sync_seq to the new identity's server
+    // anchor, so honor that anchor as the start position when present.
+    const startSeq = fromStart ? (sessionRef.sync_seq || 0) : sessionRef.sync_seq;
     let sinceSeq = startSeq;
     let totalSynced = 0;
     let hasMore = true;
@@ -1887,6 +1897,47 @@ async function syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart = 
 // =============================================================================
 // AckSync — tell cws-comm how far we've consumed (best-effort)
 // =============================================================================
+
+// =============================================================================
+// Server inbox watermark — GET /api/v1/sync/status (cws-core BFF passthrough of
+// cws-comm GetInboxStatus; principal-scoped — Legs A+B of #148)
+// =============================================================================
+//
+// Used ONLY on an identity rebind (#148): after self.member_id changes the local
+// watermark refers to the OLD identity's inbox, so we re-seed it from the NEW
+// identity's real server position. We seed to `last_delivered_seq` (NOT
+// `max_seq`): everything above it that is still pending is then delivered by the
+// replay; seeding to max_seq would silently drop that pending window — the very
+// inbound loss #148 is about.
+//
+// Returns { anchor, maxSeq } on SUCCESS (anchor = last_delivered_seq, which may
+// be a legitimate 0), or null on FAILURE — endpoint not yet deployed (Leg A+B
+// int cutover is held), network error, timeout, or an unusable payload. The
+// caller MUST distinguish the two: on null it does NOT reset, reseed, or replay
+// (per owner decision — no blind degrade); it logs and retries on a later
+// reconnect. Bounded timeout so it never hangs the onOpen recovery path.
+async function resolveInboxStatus(orgConfig) {
+  try {
+    const status = await getForOrg(
+      orgConfig.org_id,
+      apiPath('/sync/status'),
+      undefined,
+      { timeoutMs: config.server?.sync_status_timeout_ms ?? DEFAULT_SYNC_STATUS_TIMEOUT_MS },
+    );
+    const lastDelivered = Number(status?.last_delivered_seq);
+    const maxSeq = Number(status?.max_seq);
+    if (!Number.isFinite(lastDelivered)) {
+      warn(`[${orgConfig.slug}] sync/status returned no usable last_delivered_seq — treating as unavailable`);
+      return null;
+    }
+    log(`[${orgConfig.slug}] sync/status: max_seq=${Number.isFinite(maxSeq) ? maxSeq : '?'} ` +
+        `last_delivered_seq=${lastDelivered}`);
+    return { anchor: Math.max(0, lastDelivered), maxSeq: Number.isFinite(maxSeq) ? maxSeq : null };
+  } catch (err) {
+    warn(`[${orgConfig.slug}] sync/status request failed (${err.status || ''} ${err.message})`);
+    return null;
+  }
+}
 
 async function ackSync(orgConfig, seq) {
   try {
@@ -2179,9 +2230,12 @@ function startOrgWs(orgConfig, wsBaseUrl) {
 
   // Inbox-seq ledger: continuous-ack watermark + gap detection.
   // The ledger's acked_seq is seeded from session.sync_seq so it starts at
-  // the same position as the existing sync cursor.
+  // the same position as the existing sync cursor. It is bound to self.member_id
+  // so a migration/re-onboarding that changes the identity self-heals (#148).
   const inboxLedger = createInboxLedger(orgConfig.slug, {
     log: (...a) => log(`[${orgConfig.slug}]`, ...a),
+    warn: (...a) => warn(`[${orgConfig.slug}]`, ...a),
+    memberId: orgConfig.self?.member_id,
     onAck: (ackedSeq) => {
       // Sync the session cursor so reconnect /sync starts from the ledger's
       // watermark rather than the old sync_seq.
@@ -2194,6 +2248,18 @@ function startOrgWs(orgConfig, wsBaseUrl) {
       syncMissedEvents(orgConfig, sessionRef, onMessage);
     },
   });
+
+  // #148 identity rebind — DETECTION only here. The ledger detected that its
+  // persisted member_id no longer matches self.member_id, but it deliberately did
+  // NOT reset: the stale watermark stays in force so the connection keeps
+  // operating and the inversion alarm keeps firing. The actual reseed is done in
+  // onOpen, and ONLY if GET /sync/status succeeds (owner decision: no blind
+  // degrade). If status can't be reached we don't reset/replay — we log a loud
+  // ERROR and retry on a later reconnect. So we do NOT touch the session cursor
+  // here; the normal seeding below runs on the (still-old) watermark.
+  const identityChange = inboxLedger.getIdentityChange();
+  let identityRebindPending = !!identityChange;
+
   if (syncSeq > 0) inboxLedger.setAckedSeq(syncSeq);
   // If the durable ledger is ahead of the session cursor — the session file was
   // lost or reset but the inbox ledger (persisted separately) survived — adopt
@@ -2249,6 +2315,39 @@ function startOrgWs(orgConfig, wsBaseUrl) {
       // delivers the onboarding messages once they exist.
       reportAgentOnlineWhenReady(orgConfig).catch(e =>
         warn(`[${orgConfig.slug}] online-report failed: ${e.message} — will retry on next reconnect`));
+      if (identityRebindPending) {
+        // #148 identity rebind. STRICT (owner decision): this depends ONLY on
+        // /sync/status. On SUCCESS we reset+reseed the ledger to the new
+        // identity's server watermark, adopt the new member_id, and replay the
+        // pending window with dedupe-taint clearing (the #79 recovery machinery).
+        // On FAILURE we do NOT reset, do NOT persist the new member_id, and do
+        // NOT replay — we log a loud ERROR and keep the pending flag so a later
+        // reconnect (or restart) retries once status is reachable. The stale
+        // watermark stays in force (inbound stays shadowed, alarm keeps firing):
+        // an explicit, logged "not yet self-healed" state, never a blind reset.
+        const change = inboxLedger.getIdentityChange();
+        const status = await resolveInboxStatus(orgConfig);
+        if (status) {
+          const anchor = status.anchor;   // last_delivered_seq (may legitimately be 0)
+          inboxLedger.rebindIdentity(orgConfig.self?.member_id, anchor);
+          sessionRef.sync_seq = anchor;
+          saveOrgSession(orgConfig.slug, { sync_seq: anchor });
+          warn(`[${orgConfig.slug}] identity changed ${change?.previousMemberId}→${change?.currentMemberId}, ledger reset; ` +
+               `reseeded from server last_delivered_seq=${anchor}, replaying pending inbox`);
+          await syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart: true });
+          if (sessionRef.sync_seq) inboxLedger.setAckedSeq(sessionRef.sync_seq);
+          identityRebindPending = false;
+          return;
+        }
+        console.error(LOG_PREFIX,
+          `[${orgConfig.slug}] identity changed ${change?.previousMemberId}→${change?.currentMemberId}, ` +
+          `/sync/status unavailable — cannot reseed; NOT degrading / NOT replaying; ` +
+          `will self-heal on a later reconnect when status is reachable`);
+        // Do NOT fall through to the normal catch-up: the old cursor/inbox is
+        // frozen and the new inbox is shadowed. Live frames + the tick gap-
+        // detector keep running; the pending flag survives for the next leg.
+        return;
+      }
       if (!sessionRef.sync_seq) {
         // First-ever connect: REPLAY the inbox from the start and dispatch each
         // message, rather than seeking to the end and discarding the backlog.

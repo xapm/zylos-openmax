@@ -268,6 +268,29 @@ function parseRawConfig(raw) {
   try { return JSON.parse(JSON.stringify(obj)); } catch { return null; }
 }
 
+/**
+ * Unwrap a Claude-Desktop-style `{ "mcpServers": { "<name>": {…} } }` wrapper to
+ * its single inner server object. Custom-connector JSON is stored FE-side as the
+ * verbatim wrapper (the FE enforces exactly one entry), but `claude mcp add-json`
+ * wants a bare single-server object — so we take the sole inner server here.
+ * Backward/forward compatible: a raw_config that is ALREADY a bare server object
+ * (no `mcpServers` key) is returned unchanged. Defensive: an empty or malformed
+ * `mcpServers` (no object entry) falls back to the original object. If more than
+ * one entry somehow slips past the FE guard, the first (name-sorted, for
+ * determinism) is taken rather than failing.
+ */
+export function unwrapMcpServersWrapper(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return obj;
+  const servers = obj.mcpServers;
+  if (!servers || typeof servers !== 'object' || Array.isArray(servers)) return obj;
+  const names = Object.keys(servers);
+  if (names.length === 0) return obj;
+  const name = names.length === 1 ? names[0] : [...names].sort()[0];
+  const inner = servers[name];
+  if (!inner || typeof inner !== 'object' || Array.isArray(inner)) return obj;
+  return inner;
+}
+
 /** Derive the JSON `type` for a raw_config that omits it. */
 function typeOfRaw(base, mcp) {
   if (base.type) return String(base.type);
@@ -294,7 +317,7 @@ function appendQuery(url, name, value) {
  */
 export function buildMcpServerJson(mcpServer, { accessToken, tokenType, authInjection, rawConfig } = {}) {
   const mcp = mcpServer && typeof mcpServer === 'object' ? mcpServer : {};
-  const raw = parseRawConfig(rawConfig);
+  const raw = unwrapMcpServersWrapper(parseRawConfig(rawConfig));
   const injection = resolveInjection({ accessToken, tokenType, authInjection });
 
   let base;

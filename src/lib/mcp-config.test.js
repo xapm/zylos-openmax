@@ -12,6 +12,7 @@ import {
   resolveInjection,
   buildAuthHeader,
   buildMcpServerJson,
+  unwrapMcpServersWrapper,
   upsertMcpServer,
   removeMcpServer,
 } from './mcp-config.js';
@@ -270,6 +271,51 @@ test('buildMcpServerJson: raw_config(http) 占位 Authorization 头被真实 tok
 
 test('buildMcpServerJson: raw_config 为 JSON 字符串也能解析', () => {
   const json = buildMcpServerJson(null, { rawConfig: '{"type":"stdio","command":"my-server","args":["--flag"]}' });
+  assert.deepEqual(json, { type: 'stdio', command: 'my-server', args: ['--flag'] });
+});
+
+// --- unwrapMcpServersWrapper + wrapper-form raw_config ----------------------
+
+test('unwrapMcpServersWrapper: 取 {mcpServers:{单个}} 外层内部的那个 server', () => {
+  const inner = { type: 'http', url: 'https://x/mcp', headers: { Authorization: 'Bearer sk-INLINE' } };
+  assert.deepEqual(unwrapMcpServersWrapper({ mcpServers: { github: inner } }), inner);
+});
+
+test('unwrapMcpServersWrapper: 已是 bare server 对象（无 mcpServers）原样返回', () => {
+  const bare = { type: 'http', url: 'https://x/mcp', headers: {} };
+  assert.equal(unwrapMcpServersWrapper(bare), bare);
+});
+
+test('unwrapMcpServersWrapper: 多个条目（越过前端守卫）取名字排序第一个，行为确定', () => {
+  const a = { type: 'http', url: 'https://a' };
+  const b = { type: 'http', url: 'https://b' };
+  assert.deepEqual(unwrapMcpServersWrapper({ mcpServers: { zeta: b, alpha: a } }), a);
+});
+
+test('unwrapMcpServersWrapper: 空/畸形 mcpServers 或 null 原样回退，不抛', () => {
+  assert.equal(unwrapMcpServersWrapper(null), null);
+  const empty = { mcpServers: {} };
+  assert.equal(unwrapMcpServersWrapper(empty), empty);
+  const badInner = { mcpServers: { x: 'not-an-object' } };
+  assert.equal(unwrapMcpServersWrapper(badInner), badInner);
+});
+
+test('buildMcpServerJson: raw_config 为 {mcpServers:{单个}} wrapper 时解包内部 server；inline 密钥无 auth_injection 时原样保留', () => {
+  const json = buildMcpServerJson(
+    null,
+    {
+      // 新模型：无 access_token / 无 auth_injection，密钥 inline 留在 headers
+      rawConfig: { mcpServers: { linear: { type: 'http', url: 'https://mcp.linear.app/sse', headers: { Authorization: 'Bearer sk-INLINE-KEEP' } } } },
+    },
+  );
+  assert.equal(json.type, 'http');
+  assert.equal(json.url, 'https://mcp.linear.app/sse');
+  assert.equal(json.headers.Authorization, 'Bearer sk-INLINE-KEEP', 'inline 密钥应原样保留（不抽取、不遮蔽）');
+  assert.equal(json.mcpServers, undefined, '外层 mcpServers 应被解包掉，不进 add-json 载荷');
+});
+
+test('buildMcpServerJson: wrapper 为 JSON 字符串形态也能解包', () => {
+  const json = buildMcpServerJson(null, { rawConfig: '{"mcpServers":{"srv":{"type":"stdio","command":"my-server","args":["--flag"]}}}' });
   assert.deepEqual(json, { type: 'stdio', command: 'my-server', args: ['--flag'] });
 });
 

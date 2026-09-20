@@ -45,6 +45,7 @@ import fs from 'fs';
 import { loadOrgSession, saveOrgSession, RUNTIME_DIR } from './lib/session.js';
 import { handleConnectionEvent, sendOwnerReauthDm, buildConnectionAuthorizedNotice } from './lib/connection-events.js';
 import { createInboxLedger } from './lib/inbox-ledger.js';
+import { seedSessionFromLedger, commitIdentityRebind } from './lib/inbox-rebind.js';
 import { deliverWithInSweepRetry } from './lib/sync-head-retry.js';
 import { logAndRecord, getHistory, ensureReplay, setLimits } from './lib/group-history.js';
 import { checkForUpdates, notifyUpgradeComplete, resolveAutoUpgradeSchedule } from './lib/auto-upgrade.js';
@@ -2263,18 +2264,19 @@ function startOrgWs(orgConfig, wsBaseUrl) {
   if (syncSeq > 0) inboxLedger.setAckedSeq(syncSeq);
   // If the durable ledger is ahead of the session cursor — the session file was
   // lost or reset but the inbox ledger (persisted separately) survived — adopt
-  // the ledger's watermark as the sync cursor. This keeps onOpen on the normal
-  // catch-up path instead of mistaking a warm agent for a first boot and
-  // replaying its whole inbox from zero.
-  // Skip this when an identity rebind is pending: the ledger still holds the OLD
-  // identity's (high) watermark, so adopting it here would seed the session
-  // cursor to the stale value — onOpen re-seeds from /sync/status instead.
-  const ledgerAcked = inboxLedger.getAckedSeq();
-  if (!sessionRef.sync_seq && ledgerAcked > 0 && !identityRebindPending) {
-    sessionRef.sync_seq = ledgerAcked;
-    saveOrgSession(orgConfig.slug, { sync_seq: ledgerAcked });
-    log(`[${orgConfig.slug}] seeded sync_seq from ledger acked_seq=${ledgerAcked} (session cursor was empty)`);
-  }
+  // the ledger's watermark as the sync cursor (keeps onOpen on the normal
+  // catch-up path instead of replaying the whole inbox from zero). The
+  // `!identityRebindPending` guard lives inside seedSessionFromLedger (#151 P1):
+  // while a rebind is pending the ledger still holds the OLD high watermark, so
+  // adopting it would seed the session cursor to the stale value.
+  seedSessionFromLedger({
+    orgSlug: orgConfig.slug,
+    sessionRef,
+    ledgerAcked: inboxLedger.getAckedSeq(),
+    identityRebindPending,
+    saveOrgSession,
+    log,
+  });
   inboxLedger.start();
 
   // Mutable holder so the message handler (created before the WsClient exists)
@@ -2332,19 +2334,18 @@ function startOrgWs(orgConfig, wsBaseUrl) {
         const status = await resolveInboxStatus(orgConfig);
         if (status) {
           const anchor = status.anchor;   // last_delivered_seq (may legitimately be 0)
-          // Crash-safe write order (#151 P1): persist the session cursor to the
-          // anchor FIRST, and commit the ledger rebind — which adopts the new
-          // member_id and thereby CLEARS the mismatch — LAST. The mismatch-
-          // clearing write must be the final durable step: if we die between the
-          // two, the ledger still carries the OLD member_id, so the mismatch is
-          // re-detected on restart and the rebind retries, while the session
-          // cursor already holds the LOW anchor (not the old high one) so the
-          // startOrgWs setAckedSeq reseed can't push the watermark back up. The
-          // reverse order would leave a new-identity ledger reseeded to the stale
-          // high cursor with no rebind path — the silent re-shadow the review flags.
-          sessionRef.sync_seq = anchor;
-          saveOrgSession(orgConfig.slug, { sync_seq: anchor });
-          inboxLedger.rebindIdentity(orgConfig.self?.member_id, anchor);
+          // Crash-safe write order (#151 P1) lives in commitIdentityRebind:
+          // session cursor persisted FIRST, the mismatch-clearing member_id
+          // commit LAST — so a crash between the two leaves a retriable mismatch
+          // and cannot re-shadow the new inbox with the stale high watermark.
+          commitIdentityRebind({
+            orgSlug: orgConfig.slug,
+            sessionRef,
+            inboxLedger,
+            memberId: orgConfig.self?.member_id,
+            anchor,
+            saveOrgSession,
+          });
           warn(`[${orgConfig.slug}] identity changed ${change?.previousMemberId}→${change?.currentMemberId}, ledger reset; ` +
                `reseeded from server last_delivered_seq=${anchor}, replaying pending inbox`);
           await syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart: true });

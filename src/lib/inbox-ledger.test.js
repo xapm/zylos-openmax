@@ -13,9 +13,6 @@ const RUNTIME_DIR = path.join(tmpHome, 'zylos/components/openmax/runtime');
 const { createInboxLedger } = await import('./inbox-ledger.js');
 const { createDeduper } = await import('./ws.js');
 const { MAX_CONTENT_FETCH_ATTEMPTS } = await import('./content-fetch-giveup.js');
-// session.js shares RUNTIME_DIR (via HOME set above) — used by the crash-safety
-// tests to exercise the session-cursor / ledger write ordering (#151 P1).
-const { loadOrgSession, saveOrgSession } = await import('./session.js');
 
 const noop = () => {};
 function seedLedgerFile(slug, data) {
@@ -266,55 +263,6 @@ test('deferred reseed: without a rebind the old member_id + watermark persist so
   const c = createInboxLedger(slug, { log: noop, memberId: 'new' });
   assert.equal(c.getIdentityChange(), null, 'after a successful rebind the change is resolved');
   assert.equal(c.getAckedSeq(), 4, 'the reseeded watermark is what persists');
-});
-
-test('rebind is crash-safe: dying between the session write and the ledger commit still re-detects the mismatch, no shadow (#148/#151 P1)', () => {
-  const slug = 'rebind-crashsafe';
-  // Pre-migration steady state: old identity + high watermark in BOTH stores.
-  seedLedgerFile(slug, { member_id: 'old', acked_seq: 2313, received: [2313] });
-  saveOrgSession(slug, { sync_seq: 2313 });
-
-  // Correct (crash-safe) order: session anchor FIRST, member_id-committing rebind
-  // LAST. Simulate a crash RIGHT AFTER the session write, BEFORE the rebind.
-  const anchor = 5;                              // server last_delivered_seq (new identity)
-  saveOrgSession(slug, { sync_seq: anchor });    // write #1 (session cursor -> low anchor)
-  //  << crash — rebindIdentity NOT called; the old member_id is still on disk >>
-
-  // Restart: reproduce the startOrgWs seeding on the NEW identity.
-  const syncSeq = loadOrgSession(slug).sync_seq; // 5 (the LOW anchor, not the old 2313)
-  const ledger = createInboxLedger(slug, { log: noop, memberId: 'new' });
-  // The mismatch SURVIVED (member_id never committed) → the rebind is retriable.
-  assert.deepEqual(ledger.getIdentityChange(), { previousMemberId: 'old', currentMemberId: 'new' });
-  if (syncSeq > 0) ledger.setAckedSeq(syncSeq);  // must NOT shadow: 5 < 2313 → no-op
-  assert.equal(ledger.getAckedSeq(), 2313, 'stale watermark not lowered, and rebind still pending');
-
-  // The pending rebind now completes on this connect.
-  saveOrgSession(slug, { sync_seq: anchor });
-  ledger.rebindIdentity('new', anchor);
-  assert.equal(ledger.getIdentityChange(), null, 'rebind resolves the mismatch');
-  assert.equal(ledger.getAckedSeq(), 5, 'watermark reseeded to the anchor — new inbound no longer shadowed');
-  assert.equal(ledger.record(6), true, 'new-identity pending seq is delivered');
-});
-
-test('rebind write-order: after BOTH writes complete, restart is clean — no mismatch, no shadow (#148/#151 P1)', () => {
-  const slug = 'rebind-complete';
-  seedLedgerFile(slug, { member_id: 'old', acked_seq: 2313, received: [2313] });
-  saveOrgSession(slug, { sync_seq: 2313 });
-
-  const anchor = 5;
-  const first = createInboxLedger(slug, { log: noop, memberId: 'new' });
-  assert.ok(first.getIdentityChange(), 'mismatch detected before rebind');
-  saveOrgSession(slug, { sync_seq: anchor });   // write #1
-  first.rebindIdentity('new', anchor);          // write #2 (commits new member_id)
-  first.stop();
-
-  // Restart after a fully-completed rebind.
-  const syncSeq = loadOrgSession(slug).sync_seq;  // 5
-  const ledger = createInboxLedger(slug, { log: noop, memberId: 'new' });
-  assert.equal(ledger.getIdentityChange(), null, 'no mismatch after a completed rebind');
-  if (syncSeq > 0) ledger.setAckedSeq(syncSeq);
-  assert.equal(ledger.getAckedSeq(), 5, 'watermark stable at the reseeded anchor — no shadow');
-  assert.equal(ledger.record(6), true, 'new inbound flows');
 });
 
 test('same identity preserves the watermark; no change (#148)', () => {

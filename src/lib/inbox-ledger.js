@@ -181,8 +181,9 @@ export function createInboxLedger(orgSlug, { onAck, onGapSync, log, warn, member
           `watermark (latest seq=${inboxSeq} <= acked_seq=${ackedSeq}, gap=${gap}) — inbound is being ` +
           `silently deduped, likely a member_id change whose new server inbox restarted its seq. ` +
           `Fix: stop the service, back up runtime/, then set inbox-${orgSlug}.json acked_seq AND ` +
-          `session.json ${orgSlug}.sync_seq to the server's current last inbox_seq ` +
-          `(GET /api/v1/sync/status max_seq — do NOT set 0) and restart.`,
+          `session.json ${orgSlug}.sync_seq to the server's last_delivered_seq from ` +
+          `GET /api/v1/sync/status (do NOT seed above it — that silently drops the pending window; ` +
+          `the pending messages then replay from last_delivered_seq), and restart.`,
         );
       }
       return false;

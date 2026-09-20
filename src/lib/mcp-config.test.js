@@ -13,6 +13,7 @@ import {
   buildAuthHeader,
   buildMcpServerJson,
   unwrapMcpServersWrapper,
+  WRAPPER_REJECTED,
   upsertMcpServer,
   removeMcpServer,
 } from './mcp-config.js';
@@ -286,18 +287,32 @@ test('unwrapMcpServersWrapper: 已是 bare server 对象（无 mcpServers）原�
   assert.equal(unwrapMcpServersWrapper(bare), bare);
 });
 
-test('unwrapMcpServersWrapper: 多个条目（越过前端守卫）取名字排序第一个，行为确定', () => {
-  const a = { type: 'http', url: 'https://a' };
-  const b = { type: 'http', url: 'https://b' };
-  assert.deepEqual(unwrapMcpServersWrapper({ mcpServers: { zeta: b, alpha: a } }), a);
+test('unwrapMcpServersWrapper: 多个条目（sink 探针）拒绝解包，绝不取"第一个"（fail-closed）', () => {
+  const expected = { type: 'http', url: 'https://a' };
+  const attacker = { type: 'http', url: 'https://attacker' };
+  // A real sink probe: name-sorting the "first" would pick `alpha` (the attacker)
+  // and inject the live credential into it. Refuse instead of guessing.
+  assert.equal(unwrapMcpServersWrapper({ mcpServers: { zeta: expected, alpha: attacker } }), WRAPPER_REJECTED);
 });
 
-test('unwrapMcpServersWrapper: 空/畸形 mcpServers 或 null 原样回退，不抛', () => {
+test('unwrapMcpServersWrapper: 空/非对象条目/嵌套/混合外层 → fail-closed（WRAPPER_REJECTED）', () => {
+  // null / non-object input is "no wrapper", returned unchanged (means: no raw_config)
   assert.equal(unwrapMcpServersWrapper(null), null);
-  const empty = { mcpServers: {} };
-  assert.equal(unwrapMcpServersWrapper(empty), empty);
-  const badInner = { mcpServers: { x: 'not-an-object' } };
-  assert.equal(unwrapMcpServersWrapper(badInner), badInner);
+  // empty mcpServers → reject (was: fall back to the original object)
+  assert.equal(unwrapMcpServersWrapper({ mcpServers: {} }), WRAPPER_REJECTED);
+  // non-object entry → reject
+  assert.equal(unwrapMcpServersWrapper({ mcpServers: { x: 'not-an-object' } }), WRAPPER_REJECTED);
+  // nested wrapper (inner entry itself carries mcpServers) → reject
+  assert.equal(
+    unwrapMcpServersWrapper({ mcpServers: { x: { mcpServers: { y: { type: 'http', url: 'https://x' } } } } }),
+    WRAPPER_REJECTED,
+  );
+  // mixed bare+wrapper (extra top-level fields alongside mcpServers) → reject,
+  // rather than silently dropping the outer fields
+  assert.equal(
+    unwrapMcpServersWrapper({ mcpServers: { x: { type: 'http', url: 'https://x' } }, type: 'http', url: 'https://outer' }),
+    WRAPPER_REJECTED,
+  );
 });
 
 test('buildMcpServerJson: raw_config 为 {mcpServers:{单个}} wrapper 时解包内部 server；inline 密钥无 auth_injection 时原样保留', () => {
@@ -317,6 +332,18 @@ test('buildMcpServerJson: raw_config 为 {mcpServers:{单个}} wrapper 时解包
 test('buildMcpServerJson: wrapper 为 JSON 字符串形态也能解包', () => {
   const json = buildMcpServerJson(null, { rawConfig: '{"mcpServers":{"srv":{"type":"stdio","command":"my-server","args":["--flag"]}}}' });
   assert.deepEqual(json, { type: 'stdio', command: 'my-server', args: ['--flag'] });
+});
+
+test('buildMcpServerJson: 多条目/畸形 wrapper → 返回 null（fail-closed，不落到离散字段）', () => {
+  const attacker = { type: 'http', url: 'https://attacker' };
+  const expected = { type: 'http', url: 'https://a' };
+  // Even with usable discrete mcp_server fields present, an ambiguous wrapper must
+  // NOT be silently ignored in favor of them — it fails closed.
+  const res = buildMcpServerJson(
+    { transport: 'remote_http', server_url: 'https://discrete/mcp' },
+    { rawConfig: { mcpServers: { zeta: expected, alpha: attacker } } },
+  );
+  assert.equal(res, null);
 });
 
 // --- upsertMcpServer (unified add-json) -------------------------------------
@@ -436,6 +463,30 @@ test('upsertMcpServer: 无 mcp_server 且无 raw_config → {ok:false}，不调�
   assert.equal(res.ok, false);
   assert.equal(res.reason, 'no-mcp-server');
   assert.equal(calls.length, 0, 'no CLI invocation when there is no server config');
+});
+
+test('upsertMcpServer: 歧义 mcpServers wrapper（sink 探针）→ {ok:false} 且零 CLI 调用（不注入密钥）', async () => {
+  const { calls, execFile } = recordingExec();
+  const res = await upsertMcpServer(
+    { id: 'c-sink', slug: 'linear' },
+    {
+      connector_kind: 'mcp',
+      access_token: 'LIVE-CREDENTIAL',
+      token_type: 'bearer',
+      // The probe: two entries — name-sorting the "first" would install `alpha`
+      // (the attacker) and inject the live credential into it.
+      raw_config: {
+        mcpServers: {
+          zeta: { type: 'http', url: 'https://expected/mcp' },
+          alpha: { type: 'http', url: 'https://attacker/mcp' },
+        },
+      },
+    },
+    { execFile, cwd: '/w' },
+  );
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, 'ambiguous-wrapper');
+  assert.equal(calls.length, 0, 'ambiguous wrapper must trigger ZERO claude mcp calls (no remove, no add)');
 });
 
 test('upsertMcpServer (stdio): 缺 command → 跳过并给出 reason，不调用 CLI', async () => {

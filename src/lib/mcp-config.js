@@ -269,25 +269,52 @@ function parseRawConfig(raw) {
 }
 
 /**
+ * Sentinel returned by unwrapMcpServersWrapper when a `mcpServers` wrapper is
+ * ambiguous or unsafe. Callers MUST fail closed on it (build no server, run no
+ * `claude mcp` CLI call) rather than guess an inner server. Distinct from `null`,
+ * which means "no raw_config at all" (assemble from the discrete fields instead).
+ */
+export const WRAPPER_REJECTED = Symbol('mcp-wrapper-rejected');
+
+/**
  * Unwrap a Claude-Desktop-style `{ "mcpServers": { "<name>": {…} } }` wrapper to
- * its single inner server object. Custom-connector JSON is stored FE-side as the
- * verbatim wrapper (the FE enforces exactly one entry), but `claude mcp add-json`
- * wants a bare single-server object — so we take the sole inner server here.
- * Backward/forward compatible: a raw_config that is ALREADY a bare server object
- * (no `mcpServers` key) is returned unchanged. Defensive: an empty or malformed
- * `mcpServers` (no object entry) falls back to the original object. If more than
- * one entry somehow slips past the FE guard, the first (name-sorted, for
- * determinism) is taken rather than failing.
+ * its single inner server object — FAIL-CLOSED on anything ambiguous. Custom-
+ * connector JSON is stored FE-side as the verbatim wrapper (the FE enforces
+ * exactly one entry), but `claude mcp add-json` wants a bare single-server
+ * object, so we unwrap the sole inner server here.
+ *
+ * Backward/forward compatible: a non-object input is returned unchanged (null →
+ * null: the caller reads that as "no raw_config"), and a raw_config that is
+ * ALREADY a bare server object (no `mcpServers` key) is returned unchanged.
+ *
+ * When a `mcpServers` key IS present we accept ONLY an exact, single, unambiguous
+ * wrapper: the top-level object's ONLY own key is `mcpServers`, whose value is a
+ * plain object with EXACTLY ONE own entry that is itself a plain server object
+ * and not a nested wrapper. ANY other shape returns WRAPPER_REJECTED:
+ *   - empty `mcpServers` (no entry),
+ *   - more than one entry — a real sink probe like
+ *     `{mcpServers:{zeta:<expected>, alpha:<attacker>}}` must NOT silently pick
+ *     one (name-sorting the "first" would install the attacker server and inject
+ *     the live credential into it),
+ *   - a non-object entry,
+ *   - a nested `mcpServers` inside the inner entry,
+ *   - extra top-level fields mixed alongside `mcpServers` (a bare+wrapper mix
+ *     whose outer fields would otherwise be silently dropped).
+ * SECURITY: never guess which server was intended — refuse and let the caller
+ * perform ZERO CLI calls.
  */
 export function unwrapMcpServersWrapper(obj) {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return obj;
+  if (!('mcpServers' in obj)) return obj; // already a bare server object
+  // A wrapper is present: accept ONLY the exact { mcpServers: { <one>: {…} } }.
+  if (Object.keys(obj).length !== 1) return WRAPPER_REJECTED; // mixed bare+wrapper
   const servers = obj.mcpServers;
-  if (!servers || typeof servers !== 'object' || Array.isArray(servers)) return obj;
+  if (!servers || typeof servers !== 'object' || Array.isArray(servers)) return WRAPPER_REJECTED;
   const names = Object.keys(servers);
-  if (names.length === 0) return obj;
-  const name = names.length === 1 ? names[0] : [...names].sort()[0];
-  const inner = servers[name];
-  if (!inner || typeof inner !== 'object' || Array.isArray(inner)) return obj;
+  if (names.length !== 1) return WRAPPER_REJECTED; // empty (0) or ambiguous (>1)
+  const inner = servers[names[0]];
+  if (!inner || typeof inner !== 'object' || Array.isArray(inner)) return WRAPPER_REJECTED;
+  if ('mcpServers' in inner) return WRAPPER_REJECTED; // nested wrapper
   return inner;
 }
 
@@ -313,11 +340,16 @@ function appendQuery(url, name, value) {
  * @param {object} mcpServer   the Acquire mcp_server ({ transport, server_url,
  *                             headers_template, command, args, env, raw_config })
  * @param {object} [opts]      { accessToken, tokenType, authInjection, rawConfig }
- * @returns {object} the JSON object to stringify (never mutates the inputs)
+ * @returns {object|null} the JSON object to stringify (never mutates the inputs),
+ *   or null when a rawConfig wrapper is ambiguous/unsafe (caller must fail closed)
  */
 export function buildMcpServerJson(mcpServer, { accessToken, tokenType, authInjection, rawConfig } = {}) {
   const mcp = mcpServer && typeof mcpServer === 'object' ? mcpServer : {};
   const raw = unwrapMcpServersWrapper(parseRawConfig(rawConfig));
+  // Fail closed on an ambiguous/unsafe mcpServers wrapper: return null so the
+  // caller installs nothing (never guess an inner server, never inject the
+  // live credential into an attacker-controlled entry).
+  if (raw === WRAPPER_REJECTED) return null;
   const injection = resolveInjection({ accessToken, tokenType, authInjection });
 
   let base;
@@ -398,6 +430,12 @@ export async function upsertMcpServer(conn, acquireResponse, deps = {}) {
       authInjection: acquireResponse.auth_injection,
       rawConfig,
     });
+    // Fail closed on an ambiguous/unsafe mcpServers wrapper BEFORE touching the
+    // CLI, so a sink probe triggers ZERO `claude mcp` calls (no remove, no add).
+    if (!json) {
+      warn(`[mcp-config] upsert skipped conn=${connId}: ambiguous/unsafe mcpServers wrapper — refusing to install`);
+      return { ok: false, reason: 'ambiguous-wrapper' };
+    }
     const isStdio = String(json.type || '').toLowerCase() === 'stdio';
 
     // Validate BEFORE touching the CLI so a malformed config makes zero calls.

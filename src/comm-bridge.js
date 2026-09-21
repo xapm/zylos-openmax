@@ -30,6 +30,7 @@ import { WsClient, createDeduper } from './lib/ws.js';
 import { resolveInboundContent } from './lib/inbound-content.js';
 import { formatInboundForC4, formatEndpoint, newClientMsgId } from './lib/message.js';
 import { isSystemSender, systemEventPriority } from './lib/system-message.js';
+import { resolveReplyConversationId } from './lib/interaction-receipt.js';
 import { isSiblingAgentSender } from './lib/dm-access.js';
 import { recordParticipants } from './lib/mention.js';
 import { getMediaUrl, downloadMedia } from './cli/as.js';
@@ -1080,9 +1081,18 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
                     || (await fetchMemberName(orgConfig.org_id, msg.sender_id))
                     || msg.sender_id;
     const msgType = (msg.type || msg.message?.type || '').toLowerCase();
+    // Where our answer goes. Same as the message's own conversation for
+    // everything except an interaction receipt, which arrives in the read-only
+    // `interaction_center` system DM and names the card's conversation in its
+    // body (see src/lib/interaction-receipt.js). Answering the system DM would
+    // be rejected by cws-comm, so the C4 envelope must carry the origin.
+    const replyConvId = resolveReplyConversationId(msg);
+    if (replyConvId !== msg.conversation_id) {
+      log(`receipt [${orgConfig.slug}] msg=${msg.id} reply target ${msg.conversation_id} -> ${replyConvId}`);
+    }
     const endpoint = formatEndpoint({
       type: convType,
-      conversationId: msg.conversation_id,
+      conversationId: replyConvId,
       threadConversationId: msg.thread_id || undefined,
       parentMessageId: msg.thread_id ? msg.parent_message_id : undefined,
     });

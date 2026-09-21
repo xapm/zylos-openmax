@@ -79,8 +79,11 @@ test('confirm is passed through when given, and validated when malformed', () =>
   assert.throws(() => buildChoiceRequest({ ...base, options: ['Y'], confirm: {} }), (e) => e.field === 'confirm.text');
 });
 
-test('client_msg_id is only present when supplied', () => {
-  assert.equal('client_msg_id' in buildChoiceRequest({ ...base, options: ['Y'] }), false);
+test('🔴 client_msg_id is always sent, so a retry cannot post a second card', () => {
+  const a = buildChoiceRequest({ ...base, options: ['Y'] });
+  const b = buildChoiceRequest({ ...base, options: ['Y'] });
+  assert.match(a.client_msg_id, /^c_/);
+  assert.notEqual(a.client_msg_id, b.client_msg_id);
   assert.equal(buildChoiceRequest({ ...base, options: ['Y'], clientMsgId: 'k1' }).client_msg_id, 'k1');
 });
 
@@ -94,4 +97,16 @@ test('🔴 no local length or count caps — cws-comm holds those rules', () => 
   });
   assert.equal(body.choice.options.length, 6);
   assert.equal(body.choice.options[5].label.length, 200);
+});
+
+test('🔴 kind and fallbackText are refused, not ignored', () => {
+  // Both were arguments of the old card verb. Ignoring an unknown key is the
+  // same silent drop replyTo and mentions are refused for.
+  for (const field of ['kind', 'fallbackText']) {
+    assert.throws(
+      () => buildChoiceRequest({ ...base, options: ['Y'], [field]: 'x' }),
+      (e) => e instanceof InteractionRequestError && e.field === field,
+      field,
+    );
+  }
 });

@@ -21,6 +21,8 @@
  * makes a range the server accepts unreachable, with an error that blames the
  * caller. The cws-core edge made the same call for the same reason.
  */
+import { newClientMsgId } from './message.js';
+
 export class InteractionRequestError extends Error {
   constructor(field, message) {
     super(`${field}: ${message}`);
@@ -99,13 +101,20 @@ export function buildChoiceRequest(params = {}) {
   // endpoint has no field for either, so passing them through would drop them
   // in silence — and a reply-to that vanishes looks identical to one that was
   // never asked for.
-  for (const [key, field] of [['replyTo', 'replyTo'], ['mentions', 'mentions']]) {
-    if (params[key] !== undefined) {
+  for (const field of ['replyTo', 'mentions', 'kind', 'fallbackText']) {
+    if (params[field] !== undefined) {
       throw new InteractionRequestError(field, 'is not supported by interaction-requests; the endpoint has no field for it');
     }
   }
 
+  // 🔴 Always send a key. The old card path generated one unconditionally, and
+  // losing it would make a retry after a timeout post a SECOND card — two sets
+  // of action ids, two receipts, two answers to reconcile, on the one channel
+  // whose job is authorizing irreversible things. The server de-dupes an
+  // identical key for five minutes; a caller-supplied one still wins.
   const body = { interaction_type: 'choice', choice };
-  if (params.clientMsgId !== undefined) body.client_msg_id = requireText(params.clientMsgId, 'clientMsgId');
+  body.client_msg_id = params.clientMsgId === undefined
+    ? newClientMsgId()
+    : requireText(params.clientMsgId, 'clientMsgId');
   return body;
 }

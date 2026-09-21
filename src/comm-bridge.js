@@ -61,6 +61,7 @@ import {
   createDiagnosticsHandler,
 } from './lib/diagnostics.js';
 import { isSelfMentioned } from './lib/self-mention.js';
+import { describeEmptyStructuredText } from './lib/structured-text.js';
 
 const LOG_PREFIX = '[comm-bridge]';
 const CHANNEL = 'openmax';
@@ -180,6 +181,29 @@ function cacheMessageText(messageId, text) {
       if (now - v.ts > MSG_TEXT_TTL_MS) recentMsgTextCache.delete(k);
     }
   }
+}
+
+/**
+ * Emit a loud signal when a structured message yielded no text. The DECISION
+ * lives in `lib/structured-text.js` (a pure, testable function); this wrapper
+ * only emits, because importing this file starts background tasks, which puts
+ * it out of reach of a test.
+ * Every call site shares that one predicate — do not grow a second copy here:
+ * forward path, group history, recent context, quoted message.
+ */
+function warnIfStructuredTextEmpty(site, msg, text) {
+  const d = describeEmptyStructuredText(msg, text);
+  if (!d) return;
+  // One line, four fields. `msg` is how you fetch the rest; `body_keys` is why
+  // it came back empty; `block_fallback` says whether a readable answer exists
+  // that no arm reached — that last one is what tells the reader what to do.
+  warn(
+    `[structured-text-empty] site=${site}`,
+    `msg=${msg?.id ?? '?'}`,
+    `content_type=${d.contentType || '?'}`,
+    `body_keys=${d.bodyKeys.join('|') || '(none)'}`,
+    `block_fallback=${d.hasBlockFallback ? 'yes' : 'no'}`,
+  );
 }
 
 function getCachedMessageText(messageId) {
@@ -824,6 +848,7 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
         || (typeof msg.message?.content === 'string' ? msg.message.content : '')
         || (typeof msg.content === 'string' ? msg.content : '')
         || '';
+      warnIfStructuredTextEmpty('group-history', msg, entryText);
       const msgType = (msg.type || msg.message?.type || '').toLowerCase();
       const atts = Array.isArray(structured.attachments) ? structured.attachments : [];
       const isImg = msgType === 'image' || msgType === 'agent_card';
@@ -1012,6 +1037,7 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
                    || (typeof m.content === 'string' ? m.content : '')
                    || m.content_text
                    || '';
+          warnIfStructuredTextEmpty('recent-context', m, text);
           const mType = (m.type || m.message?.type || '').toLowerCase();
           const mAttachments = Array.isArray(mStructured.attachments) ? mStructured.attachments
                              : Array.isArray(m.attachments) ? m.attachments : [];
@@ -1044,6 +1070,7 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
      || (typeof msg.message?.content === 'string' ? msg.message.content : '')
      || (typeof msg.content === 'string' ? msg.content : '')
      || '';
+    warnIfStructuredTextEmpty('forward', msg, text);
 
     const allAttachments = Array.isArray(structured.attachments) ? structured.attachments : [];
     // Legacy fallback: if no structured attachments, synthesize one from flat fields.
@@ -1117,6 +1144,7 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
           || (typeof q.message?.content === 'string' ? q.message.content : '')
           || q.message?.fallback_text
           || '';
+        warnIfStructuredTextEmpty('quoted', q, qText);
         // Quoted media: a quoted image/file with no caption yields empty text,
         // which would drop the whole quote. Label it ([image]/[file: name]) and
         // download the referenced attachment, appending `---- <kind>: <path>` so

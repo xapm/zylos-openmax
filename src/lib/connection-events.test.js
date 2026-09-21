@@ -406,6 +406,12 @@ test('connection.authorized (non-MCP direct): must NOT materialize any MCP serve
 
 test('connection.credential_updated (MCP): re-acquires and refreshes the MCP server (new token)', async () => {
   const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  // A real credential_updated follows an authorize that already seeded the index
+  // (slug persisted there), so seed it here to mirror reality. The refreshed server
+  // must be named from that STABLE index slug, so refresh updates the SAME server
+  // authorize registered (and revoke can later remove) — never a mis-named one.
+  const idxPath = indexPathForOrg('org-1', connectDir);
+  upsertConnection({ connection_id: 'conn-mcp-2', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' }, idxPath);
   // Pre-seed a cache file so the credential_updated direct-detector fires.
   fs.mkdirSync(credentialsDir, { recursive: true });
   fs.writeFileSync(path.join(credentialsDir, 'conn-mcp-2.json'), JSON.stringify({ credential_mode: 'direct', access_token: 'old' }));
@@ -417,7 +423,9 @@ test('connection.credential_updated (MCP): re-acquires and refreshes the MCP ser
   const get = async () => { throw new Error('credential_updated must not call GET'); };
   const mcp = recordingMcpExec();
 
-  const frame = { payload: { event: 'connection.credential_updated', data: { connection_id: 'conn-mcp-2', provider: 'linear' } } };
+  // The REAL upstream credential_updated event carries NO provider (the notifier
+  // passes it empty) — the fixture must reflect that sparse shape.
+  const frame = { payload: { event: 'connection.credential_updated', data: { connection_id: 'conn-mcp-2' } } };
   await handleConnectionEvent(baseOrgConfig, frame, {
     get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w',
   });
@@ -425,6 +433,9 @@ test('connection.credential_updated (MCP): re-acquires and refreshes the MCP ser
   const add = mcp.addArgs();
   assert.ok(add, 'credential_updated on an MCP connection must re-materialize the server');
   assert.equal(mcp.addJson().headers.Authorization, 'Bearer mcp-tok-new', `refreshed server must carry the new token: ${JSON.stringify(add)}`);
+  // Even with NO provider on the event, the refreshed server is named from the
+  // index slug (openmax-linear-...), never the openmax-mcp-<id> fallback.
+  assert.equal(add[4], 'openmax-linear-conn-mcp-2', `refresh must reuse the index-slug name, not data.provider: ${JSON.stringify(add)}`);
 });
 
 test('[Problem ①] connection.authorized (MCP stdio): injects the token into the add-json env (not an empty env)', async () => {
@@ -550,6 +561,59 @@ test('P1-2 (regression): sparse authorize + list refresh WITHOUT connector_kind 
     get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp2.exec, mcpCwd: '/w',
   });
   assert.deepEqual(mcp2.removeArgs(), ['mcp', 'remove', '-s', 'local', 'openmax-linear-conn-mcp-6']);
+});
+
+test('P1 (regression): sparse credential_updated (NO provider) refreshes the SAME index-slug server, so a later revoke removes it — nothing orphaned', async () => {
+  // The bug: the refresh path named the server from data.provider, which the REAL
+  // upstream credential_updated event does NOT carry — so refresh registered
+  // `openmax-mcp-<id>` while authorize had registered (and revoke targets)
+  // `openmax-<slug>-<id>` (slug from the index). Consequences: refresh mutated the
+  // WRONG name, and revoke (index slug) could never remove the refreshed server
+  // holding the NEW token → orphaned, breaking rotation AND revocation. The fix
+  // names the refresh from the STABLE index slug, so refresh and revoke agree.
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  const idxPath = indexPathForOrg('org-1', connectDir);
+  // A prior authorize seeded the index with the slug (persisted there). This is the
+  // only local source of the slug once the sparse refresh event arrives.
+  upsertConnection({ connection_id: 'conn-mcp-7', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' }, idxPath);
+  // A cached credential exists (direct-detector for the refresh path).
+  fs.mkdirSync(credentialsDir, { recursive: true });
+  fs.writeFileSync(path.join(credentialsDir, 'conn-mcp-7.json'), JSON.stringify({ credential_mode: 'direct', access_token: 'old' }));
+
+  const post = async () => ({
+    credential_mode: 'direct', connector_kind: 'mcp', access_token: 'mcp-tok-new', token_type: 'bearer',
+    mcp_server: { transport: 'remote_http', server_url: 'https://mcp.linear.app/rpc' },
+  });
+  const get = async () => { throw new Error('credential_updated must not call GET'); };
+
+  // 1) REAL sparse credential_updated: connection_id only, NO provider.
+  const mcpRefresh = recordingMcpExec();
+  const upd = { payload: { event: 'connection.credential_updated', data: { connection_id: 'conn-mcp-7' } } };
+  await handleConnectionEvent(baseOrgConfig, upd, {
+    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcpRefresh.exec, mcpCwd: '/w',
+  });
+  const refreshName = mcpRefresh.addArgs()?.[4];
+  // The refreshed server carries the NEW token AND the index-slug name — NOT the
+  // openmax-mcp-<id> fallback the missing provider used to produce.
+  assert.equal(mcpRefresh.addJson().headers.Authorization, 'Bearer mcp-tok-new', 'refresh must carry the new token');
+  assert.equal(refreshName, 'openmax-linear-conn-mcp-7',
+    `refresh must name the server from the index slug, not data.provider: ${JSON.stringify(mcpRefresh.addArgs())}`);
+  assert.notEqual(refreshName, 'openmax-mcp-conn-mcp-7', 'refresh must NOT use the openmax-mcp-<id> provider-less fallback');
+
+  // 2) A subsequent REAL sparse revoke (also NO provider): reads ONLY the index,
+  // resolves the SAME index-slug name, and removes exactly the server refresh added.
+  const mcpRevoke = recordingMcpExec();
+  const rev = { payload: { event: 'connection.revoked', data: { connection_id: 'conn-mcp-7' } } };
+  await handleConnectionEvent(baseOrgConfig, rev, {
+    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcpRevoke.exec, mcpCwd: '/w',
+  });
+  const revokedName = mcpRevoke.removeArgs()?.[4];
+  // KEY no-orphan assertion: revoke removes the EXACT name refresh registered.
+  assert.equal(revokedName, refreshName,
+    `revoke must remove the same server refresh registered (no orphan): removed ${revokedName} vs refreshed ${refreshName}`);
+  assert.deepEqual(mcpRevoke.removeArgs(), ['mcp', 'remove', '-s', 'local', 'openmax-linear-conn-mcp-7']);
+  // And the connection is dropped from the index — no leftover local MCP server.
+  assert.equal(readIndex(idxPath).connections['conn-mcp-7'], undefined, 'revoke must unindex the connection');
 });
 
 test('MCP sink is best-effort: a throwing command runner never breaks the handler (authorize still caches the credential)', async () => {

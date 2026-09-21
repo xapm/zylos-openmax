@@ -251,7 +251,18 @@ export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
             // its local MCP server so the registered Authorization header carries the
             // fresh token (upsert = remove-then-add). Best-effort; never throws.
             if (isMcpConnection(cred)) {
-              const r = await upsertMcpServer({ id: connectionId, slug: data.provider }, cred, mcpDeps);
+              // Name the refreshed server from the STABLE slug in the connections
+              // index (keyed by connection_id) — exactly the source authorized
+              // persisted and revoked reads — NOT data.provider. The REAL upstream
+              // credential_updated event carries no provider, so data.provider would
+              // fall back to `openmax-mcp-<id>`, a DIFFERENT name than the originally
+              // registered `openmax-<slug>-<id>`: refresh would then add a mis-named
+              // server and revoke (which uses the index slug) could never remove it,
+              // orphaning the server carrying the fresh token. The additive upsert
+              // above never nulls the slug, so the index still holds the original.
+              // Mirror revoked's best-effort fallback (index slug || data.provider).
+              const refreshSlug = readIndex(idxPath).connections[connectionId]?.slug || data.provider;
+              const r = await upsertMcpServer({ id: connectionId, slug: refreshSlug }, cred, mcpDeps);
               if (r && r.ok) log(`[${slug}] MCP server refreshed conn=${connectionId} name=${r.name}`);
               // (P1-2) Persist the Acquire-derived MCP taxonomy so a later teardown
               // recognizes it (the credential_updated event carries no connector_kind).

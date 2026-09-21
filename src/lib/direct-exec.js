@@ -121,6 +121,17 @@ function hasVal(v) {
 }
 
 /**
+ * Encode a PATH-segment value: percent-encode as data (so query-reserved and
+ * unsafe chars are escaped) but PRESERVE the path separator "/". A resource-name
+ * value like "people/me" must stay "people/me" in the path — full
+ * encodeURIComponent turns it into "people%2Fme", which many providers 404.
+ * Only "/" is un-escaped; everything else keeps encodeURIComponent semantics.
+ */
+function encodePathValue(s) {
+  return encodeURIComponent(String(s)).replace(/%2F/gi, '/');
+}
+
+/**
  * Canonicalize a credential `token_type` into the HTTP Authorization scheme word.
  * Mirrors cws-connect's `canonicalAuthScheme` (connection_service.go) EXACTLY:
  *   - ""  / "bearer" (any case) / "api_key" (any case) → "Bearer".
@@ -213,7 +224,11 @@ export function assembleRequest(actionDef, params = {}, token, urlPlaceholders =
   // "{base_url}" → "https://jenkins.example.com").
   const path = pathPart.replace(/\{([^}]+)\}/g, (_, key) => {
     consumed.add(key);
-    if (hasVal(params[key])) return encodeURIComponent(String(params[key]));
+    // Path values are encoded as DATA but keep "/" (RFC-3986 path-safe) so a
+    // resource-name param like "people/me" survives as a real path, not
+    // "people%2Fme". Query encoding (below) is unchanged — it still uses
+    // encodeURIComponent, which correctly escapes "/" in a query value.
+    if (hasVal(params[key])) return encodePathValue(params[key]);
     if (hasVal(uph[key])) return String(uph[key]);
     // Neither source has it. A leading "{base_url}"-style placeholder is a
     // connection-owned URL part the credential should have carried — surface it
@@ -432,12 +447,18 @@ function headersToObject(h) {
  * cap it cancels the stream and THROWS (over-cap is an ERROR, not a silent
  * truncation — a truncated body would be a corrupt/misleading passthrough).
  *
+ * Returns the RAW bytes as a Buffer — it does NOT decode. Decoding is the
+ * caller's job (sendDirect), which decides utf8-vs-base64 from the response
+ * content-type. Force-decoding to utf8 here would irreversibly corrupt binary
+ * bodies (PDFs, images, …), replacing every non-utf8 byte with U+FFFD.
+ *
  * Falls back to `res.text()` only when the response exposes no readable stream
  * (e.g. a minimal test double); that path still enforces the cap, but by then
- * the body is already buffered, so it is a compatibility fallback, not the
- * memory-safety guarantee. Production `fetch` always provides `res.body`.
+ * the body is already buffered (and text() has already lossily decoded binary),
+ * so it is a compatibility fallback, not the memory-safety or binary-fidelity
+ * guarantee. Production `fetch` always provides `res.body`.
  */
-async function readCappedText(res) {
+async function readCappedBytes(res) {
   const reader = res.body && typeof res.body.getReader === 'function' ? res.body.getReader() : null;
   if (!reader) {
     const text = await res.text();
@@ -447,7 +468,7 @@ async function readCappedText(res) {
         { status: 502 },
       );
     }
-    return text;
+    return Buffer.from(text, 'utf8');
   }
   const chunks = [];
   let total = 0;
@@ -468,16 +489,64 @@ async function readCappedText(res) {
   } finally {
     try { reader.releaseLock(); } catch { /* already released/cancelled */ }
   }
-  return Buffer.concat(chunks).toString('utf8');
+  return Buffer.concat(chunks);
+}
+
+/**
+ * Read one header value from a fetch Response's headers, tolerating both a real
+ * `Headers`/`Map` (has `.get`) and a plain object (test doubles). Case-insensitive.
+ */
+function getHeaderValue(h, name) {
+  if (!h) return '';
+  if (typeof h.get === 'function') return h.get(name) || '';
+  const lower = name.toLowerCase();
+  for (const [k, v] of Object.entries(h)) {
+    if (k.toLowerCase() === lower) return v || '';
+  }
+  return '';
+}
+
+/**
+ * Is this response content-type textual (safe to utf8-decode + attempt JSON)?
+ * Textual → utf8/JSON passthrough (today's behavior). Non-textual → binary,
+ * base64-encoded by the caller. An ABSENT/empty content-type is treated as
+ * textual so the existing `{status_code, headers, body}` shape is preserved for
+ * every response that was decoded before this change.
+ */
+function isTextualContentType(contentType) {
+  const t = String(contentType || '').toLowerCase();
+  if (!t) return true; // no content-type → default to textual (preserve prior behavior)
+  const mime = t.split(';', 1)[0].trim();
+  if (!mime) return true;
+  if (mime.startsWith('text/')) return true;              // text/*
+  if (mime === 'application/json') return true;
+  if (mime.endsWith('+json')) return true;                // *+json (e.g. application/ld+json)
+  if (mime === 'application/xml' || mime.endsWith('+xml')) return true; // xml + *+xml (e.g. image/svg+xml)
+  if (mime === 'application/javascript' || mime === 'application/ecmascript') return true;
+  if (mime === 'application/csv') return true;             // text/csv already covered by text/*
+  if (mime === 'application/x-ndjson' || mime === 'application/ndjson') return true;
+  if (mime === 'application/x-www-form-urlencoded') return true;
+  if (mime === 'application/graphql') return true;
+  return false;
 }
 
 /**
  * Send one assembled request and normalize the response into the server-parity
  * shape `{ status_code, headers, body }`. Raw passthrough — the provider body is
- * returned as parsed JSON when it parses, else as the raw string; it is never
- * transformed. The body is read with a streaming cap (see readCappedText): a
- * response over MAX_RESPONSE_BYTES throws (status 502) rather than being
+ * never transformed. The body is read with a streaming cap (see readCappedBytes):
+ * a response over MAX_RESPONSE_BYTES throws (status 502) rather than being
  * buffered whole or silently truncated.
+ *
+ * Body decoding is content-type driven so binary responses survive intact:
+ *   - TEXTUAL content-type (application/json, text/*, xml, *+json, csv, js, …)
+ *     or an absent content-type → utf8-decode, then attempt JSON.parse; on
+ *     failure keep the raw string. This preserves the exact prior behavior and
+ *     the `{ status_code, headers, body }` shape (NO body_encoding field) for
+ *     every current text/JSON caller.
+ *   - BINARY content-type (everything else — PDFs, images, octet-stream, …) →
+ *     base64-encode the raw bytes and add a `body_encoding: 'base64'`
+ *     discriminator so the caller can round-trip losslessly. utf8-decoding these
+ *     would replace every non-utf8 byte with U+FFFD, corrupting the body.
  */
 export async function sendDirect(assembled, { fetchImpl = fetch } = {}) {
   const res = await fetchImpl(assembled.url, {
@@ -486,10 +555,19 @@ export async function sendDirect(assembled, { fetchImpl = fetch } = {}) {
     body: assembled.body !== undefined ? JSON.stringify(assembled.body) : undefined,
   });
 
-  const text = await readCappedText(res);
-  let body;
-  try { body = JSON.parse(text); } catch { body = text; }
-  return { status_code: res.status, headers: headersToObject(res.headers), body };
+  const buf = await readCappedBytes(res);
+  const headers = headersToObject(res.headers);
+  const contentType = getHeaderValue(res.headers, 'content-type');
+
+  if (isTextualContentType(contentType)) {
+    const text = buf.toString('utf8');
+    let body;
+    try { body = JSON.parse(text); } catch { body = text; }
+    return { status_code: res.status, headers, body };
+  }
+
+  // Binary passthrough — base64 so the bytes round-trip losslessly.
+  return { status_code: res.status, headers, body: buf.toString('base64'), body_encoding: 'base64' };
 }
 
 /**

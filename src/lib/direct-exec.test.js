@@ -647,3 +647,127 @@ test('O4 invokeDirect: params failing input_schema → 400 before any send', asy
   );
   assert.equal(calls.length, 0);
 });
+
+// ---------------------------------------------------------------------------
+//  Bug 4 — binary-safe response passthrough (base64 + body_encoding), with
+//  text/JSON responses unchanged.
+// ---------------------------------------------------------------------------
+
+// A fetch double that streams RAW bytes (a Buffer/Uint8Array) verbatim, so a
+// non-utf8 binary body reaches sendDirect exactly as the provider sent it.
+function fakeBinaryFetch({ status = 200, bytes, contentType }) {
+  const chunk = bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes);
+  const headers = new Map();
+  if (contentType !== undefined) headers.set('content-type', contentType);
+  const impl = async () => ({
+    status,
+    headers,
+    body: new ReadableStream({ start(c) { c.enqueue(chunk); c.close(); } }),
+    text: async () => { throw new Error('text() must not be used for a binary body'); },
+  });
+  return { impl };
+}
+
+test('Bug4 sendDirect: a binary (non-utf8) body round-trips losslessly via base64 + body_encoding', async () => {
+  // "%PDF-1.4\n" followed by bytes that are INVALID as utf8 (0xFF, 0xFE, 0x00, 0x80).
+  const pdf = Buffer.concat([Buffer.from('%PDF-1.4\n', 'ascii'), Buffer.from([0xff, 0xfe, 0x00, 0x80, 0xc3, 0x28])]);
+  const { impl } = fakeBinaryFetch({ status: 200, bytes: pdf, contentType: 'application/pdf' });
+  const out = await sendDirect({ url: 'https://x/y', method: 'GET', headers: {} }, { fetchImpl: impl });
+  assert.equal(out.status_code, 200);
+  assert.equal(out.body_encoding, 'base64', 'a binary body must be flagged as base64');
+  // Lossless round-trip: decoding the base64 reproduces the ORIGINAL bytes exactly.
+  const decoded = Buffer.from(out.body, 'base64');
+  assert.ok(decoded.equals(pdf), 'base64 body must decode back to the exact original bytes');
+  // Mutation-sanity: the OLD .toString('utf8') path would have corrupted these
+  // bytes into U+FFFD — so a utf8 decode of the original CANNOT reproduce them.
+  const viaUtf8 = Buffer.from(pdf.toString('utf8'), 'utf8');
+  assert.ok(!viaUtf8.equals(pdf), 'guard: utf8 decoding is lossy for this body (old behavior would corrupt it)');
+});
+
+test('Bug4 sendDirect: octet-stream (unknown binary) is base64-encoded, not utf8-decoded', async () => {
+  const raw = Buffer.from([0x00, 0x01, 0x02, 0xff, 0xfe, 0x80, 0x81]);
+  const { impl } = fakeBinaryFetch({ status: 200, bytes: raw, contentType: 'application/octet-stream' });
+  const out = await sendDirect({ url: 'https://x/y', method: 'GET', headers: {} }, { fetchImpl: impl });
+  assert.equal(out.body_encoding, 'base64');
+  assert.ok(Buffer.from(out.body, 'base64').equals(raw), 'octet-stream bytes must round-trip losslessly');
+});
+
+test('Bug4 sendDirect: a JSON response is UNCHANGED (parsed, no body_encoding field)', async () => {
+  const { impl } = fakeFetch({ status: 200, body: { messages: [{ id: '1' }] } });
+  const out = await sendDirect(assembleRequest(GMAIL_GET, { id: '1' }, 'TOK'), { fetchImpl: impl });
+  assert.deepEqual(out.body, { messages: [{ id: '1' }] });
+  assert.ok(!('body_encoding' in out), 'text/JSON responses must NOT carry a body_encoding discriminator');
+  assert.deepEqual(Object.keys(out).sort(), ['body', 'headers', 'status_code'], 'response shape unchanged for JSON');
+});
+
+test('Bug4 sendDirect: a text/plain response is UNCHANGED (raw string, no body_encoding)', async () => {
+  const { impl } = fakeFetch({ status: 200, body: 'plain text', headers: { 'content-type': 'text/plain; charset=utf-8' } });
+  const out = await sendDirect(assembleRequest(GMAIL_GET, { id: '1' }, 'T'), { fetchImpl: impl });
+  assert.equal(out.body, 'plain text');
+  assert.ok(!('body_encoding' in out), 'text responses must NOT carry a body_encoding discriminator');
+});
+
+test('Bug4 sendDirect: an *+json content-type is treated as textual (parsed, no body_encoding)', async () => {
+  const { impl } = fakeFetch({ status: 200, body: { '@context': 'x' }, headers: { 'content-type': 'application/ld+json' } });
+  const out = await sendDirect(assembleRequest(GMAIL_GET, { id: '1' }, 'T'), { fetchImpl: impl });
+  assert.deepEqual(out.body, { '@context': 'x' });
+  assert.ok(!('body_encoding' in out));
+});
+
+test('Bug4 sendDirect: a body with NO content-type defaults to textual (prior shape preserved)', async () => {
+  const raw = Buffer.from(JSON.stringify({ ok: true }), 'utf8');
+  const { impl } = fakeBinaryFetch({ status: 200, bytes: raw, contentType: undefined });
+  const out = await sendDirect({ url: 'https://x/y', method: 'GET', headers: {} }, { fetchImpl: impl });
+  assert.deepEqual(out.body, { ok: true });
+  assert.ok(!('body_encoding' in out), 'a missing content-type must not switch to base64');
+});
+
+// ---------------------------------------------------------------------------
+//  Bug 1 — a path-param value containing "/" is path-safe encoded (keeps "/"),
+//  while a QUERY value containing "/" is still fully percent-encoded.
+// ---------------------------------------------------------------------------
+
+const PEOPLE_GET = {
+  toolkit: 'google-people', action: 'get', method: 'GET',
+  url_template: 'https://people.googleapis.com/v1/{resourceName}?personFields={fields}',
+  input_schema: '',
+};
+
+test('Bug1 assembleRequest: a path param with "/" stays "/" (people/me → /v1/people/me, NOT people%2Fme)', () => {
+  const req = assembleRequest(PEOPLE_GET, { resourceName: 'people/me', fields: 'names' }, 'TOK');
+  assert.ok(req.url.includes('/v1/people/me'), `path "/" must be preserved: ${req.url}`);
+  assert.ok(!req.url.includes('people%2Fme'), 'the path separator must NOT be percent-encoded');
+  assert.equal(req.url, 'https://people.googleapis.com/v1/people/me?personFields=names');
+});
+
+test('Bug1 assembleRequest: other unsafe chars in a path value ARE still escaped (only "/" preserved)', () => {
+  const def = { toolkit: 't', action: 'a', method: 'GET', url_template: 'https://host/v1/{name}', input_schema: '' };
+  const req = assembleRequest(def, { name: 'a b/c?d#e' }, 'T');
+  // space→%20, ?→%3F, #→%23 all still escaped; only "/" survives.
+  assert.equal(req.url, 'https://host/v1/a%20b/c%3Fd%23e');
+});
+
+test('Bug1 assembleRequest: a QUERY value containing "/" is STILL fully percent-encoded (query untouched)', () => {
+  const req = assembleRequest(PEOPLE_GET, { resourceName: 'people/me', fields: 'names/primary' }, 'TOK');
+  assert.ok(req.url.includes('personFields=names%2Fprimary'), `query "/" must be percent-encoded: ${req.url}`);
+  assert.ok(!req.url.includes('personFields=names/primary'), 'query encoding must not preserve "/"');
+});
+
+test('Bug1 assembleRequest: a QUERY value with other special chars is still percent-encoded', () => {
+  const def = { toolkit: 't', action: 'a', method: 'GET', url_template: 'https://host/x?q={q}', input_schema: '' };
+  const req = assembleRequest(def, { q: 'a b&c=d/e' }, 'T');
+  assert.equal(req.url, 'https://host/x?q=a%20b%26c%3Dd%2Fe');
+});
+
+test('Bug1 invokeDirect: a "/"-bearing path param reaches the wire un-encoded (end-to-end)', async () => {
+  const { impl, calls } = fakeFetch({ status: 200, body: { ok: true } });
+  await invokeDirect(
+    {
+      orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'google-people/get',
+      params: { resourceName: 'people/me', fields: 'names' }, catalog: [PEOPLE_GET],
+      credential: { credential_mode: 'direct', token_type: 'bearer', access_token: 'T' },
+    },
+    { fetchImpl: impl, audit: quietAudit },
+  );
+  assert.equal(calls[0].url, 'https://people.googleapis.com/v1/people/me?personFields=names');
+});

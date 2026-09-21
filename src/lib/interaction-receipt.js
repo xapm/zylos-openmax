@@ -29,11 +29,20 @@ function nonEmptyString(v) {
  * Whether a message is an interaction receipt. Reads both the top-level `type`
  * (real-time WS frames) and the nested `message.type` (get-message detail
  * envelope), mirroring isSystemSender.
+ *
+ * `content_type` is accepted as a second witness because `type` can degrade.
+ * cws-core renders it by trimming the enum prefix off the protobuf value, so a
+ * cws-core built before the receipt type was added renders the unknown enum as
+ * its number — `"12"`, not `"INTERACTION_RECEIPT"`. That window is real: comm
+ * and core ship separately. `content_type` is a passthrough string with no enum
+ * behind it, so it survives the same skew.
  */
 export function isInteractionReceipt(msg) {
   if (!msg) return false;
   const t = String(msg.type || msg.message?.type || '').toUpperCase();
-  return t === 'INTERACTION_RECEIPT';
+  if (t === 'INTERACTION_RECEIPT') return true;
+  const ct = msg.content?.content_type || msg.message?.content?.content_type;
+  return String(ct || '').toLowerCase() === 'interaction_receipt';
 }
 
 /**

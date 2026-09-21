@@ -110,3 +110,18 @@ test('receiptOrigin ignores a non-receipt that happens to carry an origin', () =
   assert.equal(receiptOrigin(impostor), null);
   assert.equal(resolveReplyConversationId(impostor), 'c3');
 });
+
+test('🔴 a receipt still resolves when cws-core renders the type as a number', () => {
+  // cws-core trims the enum prefix off the protobuf value; one built before the
+  // receipt type existed renders the unknown enum as its ordinal. comm and core
+  // ship separately, so that window is reachable — and inside it the reply
+  // would go to the read-only system DM.
+  const degraded = receipt({ type: '12' });
+  assert.ok(isInteractionReceipt(degraded));
+  assert.equal(resolveReplyConversationId(degraded), 'origin-0199');
+});
+
+test('content_type alone does not make a non-system message a receipt', () => {
+  const forged = receipt({ type: '12', sender_type: 'HUMAN' });
+  assert.equal(resolveReplyConversationId(forged), 'sys-dm-0199');
+});

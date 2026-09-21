@@ -125,10 +125,39 @@ function hasVal(v) {
  * unsafe chars are escaped) but PRESERVE the path separator "/". A resource-name
  * value like "people/me" must stay "people/me" in the path — full
  * encodeURIComponent turns it into "people%2Fme", which many providers 404.
- * Only "/" is un-escaped; everything else keeps encodeURIComponent semantics.
+ *
+ * SECURITY (path traversal): keeping "/" literal means a caller-supplied value
+ * could otherwise smuggle a "." or ".." navigation segment (e.g.
+ * "a/../../admin") that the URL/HTTP client resolves UP and OUT of the
+ * catalog-declared path — letting the connection credential reach an adjacent,
+ * UNDECLARED endpoint of the same provider (breaking the "callers can only hit
+ * URLs declared in the catalog" boundary). A bare "." / ".." segment is never a
+ * legitimate resource name, and it cannot be carried as an inert literal in a
+ * URL path (the WHATWG URL parser treats "..", ".%2e", "%2e.", "%2e%2e" — any
+ * case — ALL as navigation, so percent-encoding the dots does not help), so any
+ * such segment is REJECTED (400) rather than passed through. Names that merely
+ * CONTAIN dots ("file.txt", "a.b", "...", ".hidden") are unaffected — only the
+ * exact navigation segments "." / ".." are refused.
+ *
+ * Each remaining segment is encodeURIComponent'd and the segments are rejoined
+ * with "/". For any value WITHOUT a navigation segment this is byte-for-byte
+ * identical to the previous `encodeURIComponent(s).replace(/%2F/g, '/')` (only
+ * an input "/" ever produces "%2F", so splitting on "/" first changes nothing
+ * else); the sole behavioural change is that "." / ".." now throw.
  */
 function encodePathValue(s) {
-  return encodeURIComponent(String(s)).replace(/%2F/gi, '/');
+  return String(s)
+    .split('/')
+    .map((seg) => {
+      if (seg === '.' || seg === '..') {
+        throw Object.assign(
+          new Error(`illegal path segment "${seg}" in path value: "." / ".." navigation is not allowed`),
+          { status: 400 },
+        );
+      }
+      return encodeURIComponent(seg);
+    })
+    .join('/');
 }
 
 /**

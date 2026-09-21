@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { test } from 'node:test';
 
 import {
@@ -770,4 +771,82 @@ test('Bug1 invokeDirect: a "/"-bearing path param reaches the wire un-encoded (e
     { fetchImpl: impl, audit: quietAudit },
   );
   assert.equal(calls[0].url, 'https://people.googleapis.com/v1/people/me?personFields=names');
+});
+
+// ---------------------------------------------------------------------------
+//  Bug 1 SECURITY — a path value must not be able to path-traverse OUT of the
+//  catalog-declared URL. Keeping "/" literal (Bug1) means a caller value like
+//  "a/../../admin" would otherwise be resolved UP and OUT of the declared path
+//  by the URL/HTTP client, reaching an adjacent, undeclared provider endpoint
+//  with the connection's credential. A "." / ".." segment is rejected (400).
+// ---------------------------------------------------------------------------
+
+test('Bug1-SEC assembleRequest: a "." / ".." path-traversal value is REJECTED (400), no URL is built', () => {
+  for (const bad of ['a/../../admin', '..', '.', '../x', 'a/..', 'a/../b', '../../etc/passwd', 'x/./y', 'a/../b/../c']) {
+    assert.throws(
+      () => assembleRequest(PEOPLE_GET, { resourceName: bad, fields: 'names' }, 'TOK'),
+      (e) => e.status === 400 && /navigation is not allowed|illegal path segment/i.test(e.message),
+      `traversal value ${JSON.stringify(bad)} must be rejected with 400`,
+    );
+  }
+});
+
+test('Bug1-SEC assembleRequest: legit names that merely CONTAIN dots are untouched (file.txt, "...", ".hidden", a.b)', () => {
+  for (const ok of ['file.txt', '...', '....', '.hidden', 'a.b', 'v1.2', 'people/me.json']) {
+    const req = assembleRequest(PEOPLE_GET, { resourceName: ok, fields: 'n' }, 'T');
+    assert.ok(req.url.includes(`/v1/${ok}`), `${JSON.stringify(ok)} must pass through unescaped: ${req.url}`);
+    // and it must not have collapsed under URL normalization either
+    assert.equal(new URL(req.url).pathname, `/v1/${ok}`);
+  }
+});
+
+test('Bug1-SEC assembleRequest: a raw percent-encoded dot value is DATA (its "%" is re-encoded → inert, cannot navigate)', () => {
+  const req = assembleRequest(PEOPLE_GET, { resourceName: 'a/%2e%2e/b', fields: 'n' }, 'T');
+  assert.ok(req.url.includes('/v1/a/%252e%252e/b'), `raw "%" must be re-encoded: ${req.url}`);
+  assert.equal(new URL(req.url).pathname, '/v1/a/%252e%252e/b', 'must not climb under URL normalization');
+});
+
+// Real WIRE-LEVEL regression: assert on the path a REAL http server RECEIVES —
+// a string assertion on assembleRequest's URL is INSUFFICIENT because the escape
+// only materializes when fetch/URL normalizes the string before it hits the socket.
+test('Bug1-SEC WIRE: a legit "/"-path reaches a real server un-escaped; the OLD encoding WOULD climb; the fix rejects it', async () => {
+  const received = [];
+  const server = http.createServer((req, res) => {
+    received.push(req.url);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const DEF = { toolkit: 't', action: 'get', method: 'GET', url_template: `${base}/v1/{resourceName}`, input_schema: '' };
+  const cred = { credential_mode: 'direct', token_type: 'bearer', access_token: 'T' };
+  try {
+    // (a) legit slash → the REAL server receives the full, un-escaped path.
+    await invokeDirect(
+      { orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 't/get', params: { resourceName: 'people/me' }, catalog: [DEF], credential: cred },
+      { audit: quietAudit }, // default (real) global fetch
+    );
+    assert.equal(received.at(-1), '/v1/people/me', `real server must receive the un-escaped path, got ${received.at(-1)}`);
+
+    // (b) DEMONSTRATE the vulnerability is real: the OLD encoder's output string,
+    //     sent verbatim over the real wire, climbs OUT to "/admin".
+    const oldEncoderOutput = encodeURIComponent('a/../../admin').replace(/%2F/gi, '/'); // == "a/../../admin"
+    received.length = 0;
+    await fetch(`${base}/v1/${oldEncoderOutput}`);
+    assert.equal(received.at(-1), '/admin', 'guard: the OLD encoding really does escape to /admin on the wire');
+
+    // (c) THE FIX: the traversal value is rejected before any request — the
+    //     provider is NEVER hit.
+    received.length = 0;
+    await assert.rejects(
+      invokeDirect(
+        { orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 't/get', params: { resourceName: 'a/../../admin' }, catalog: [DEF], credential: cred },
+        { audit: quietAudit },
+      ),
+      (e) => e.status === 400 && /navigation is not allowed|illegal path segment/i.test(e.message),
+    );
+    assert.equal(received.length, 0, 'a traversal value must produce NO request to the provider');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });

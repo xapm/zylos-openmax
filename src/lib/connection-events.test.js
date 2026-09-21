@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { handleConnectionEvent, handleConnectionEventSerialized, serializeConnectionEvent, connectionEventKey, acquireCredential, isEventForMe, sendOwnerReauthDm, buildConnectionAuthorizedNotice } from './connection-events.js';
-import { readIndex, indexPathForOrg, upsertConnection } from './connect-store.js';
+import { readIndex, indexPathForOrg, upsertConnection, writeCatalog, catalogPath } from './connect-store.js';
 
 // A manually-resolvable promise, to park a handler mid-flight (e.g. suspended at
 // Acquire) and interleave a second event deterministically.
@@ -844,4 +844,121 @@ test('serializeConnectionEvent: a rejecting task never poisons the chain — the
 test('connectionEventKey: keys by org_id + connection_id (falls back to slug when no org_id)', () => {
   assert.equal(connectionEventKey({ org_id: 'org-1', slug: 'acme' }, 'conn-1'), 'org-1:conn-1');
   assert.equal(connectionEventKey({ slug: 'acme' }, 'conn-1'), 'acme:conn-1');
+});
+
+// ---------------------------------------------------------------------------
+// Revoke/disconnect: the app action-catalog cache is invalidated too, so no
+// orphaned capability metadata survives the connection removal. Regression for
+// the revoke path calling removeConnection + deleteCredentialCache but NEVER
+// invalidateCatalog — leaving action-catalog/<applicationId>.json behind.
+// ---------------------------------------------------------------------------
+for (const event of ['connection.revoked', 'connection.disconnected']) {
+  test(`${event}: clears ALL THREE local caches — index entry, credential, AND app action-catalog (applicationId from the index)`, async () => {
+    const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+    const { get, post } = recordingHttp();
+    const idxPath = indexPathForOrg('org-1', connectDir);
+
+    // Seed a fully-formed, active connection: index entry (carrying applicationId),
+    // a cached credential file, and the app-keyed action-catalog cache.
+    upsertConnection(
+      { connection_id: 'conn-rev', application_id: 'app-rev', application_slug: 'github', credential_mode: 'direct' },
+      idxPath,
+    );
+    fs.mkdirSync(credentialsDir, { recursive: true });
+    fs.writeFileSync(path.join(credentialsDir, 'conn-rev.json'), JSON.stringify({ credential_mode: 'direct', access_token: 'tok' }));
+    writeCatalog('app-rev', [{ action: 'x' }], { dir: catalogDir });
+
+    // Sanity: all three exist before the revoke.
+    assert.ok(readIndex(idxPath).connections['conn-rev'], 'precondition: index entry exists');
+    assert.ok(fs.existsSync(path.join(credentialsDir, 'conn-rev.json')), 'precondition: credential exists');
+    assert.ok(fs.existsSync(catalogPath('app-rev', catalogDir)), 'precondition: catalog exists');
+
+    // A sparse revoke/disconnect event: carries only connection_id + provider (NO
+    // application_id) — the applicationId must be resolved from the index.
+    const frame = { payload: { event, data: { connection_id: 'conn-rev', provider: 'github' } } };
+    await handleConnectionEvent(baseOrgConfig, frame, { get, post, connectDir, credentialsDir, catalogDir });
+
+    assert.equal(readIndex(idxPath).connections['conn-rev'], undefined, `${event} must remove the index entry`);
+    assert.ok(!fs.existsSync(path.join(credentialsDir, 'conn-rev.json')), `${event} must clear the credential cache`);
+    assert.ok(!fs.existsSync(catalogPath('app-rev', catalogDir)), `${event} must invalidate the app action-catalog cache`);
+  });
+}
+
+test('connection.revoked: resolves applicationId from the EVENT payload when the index entry is absent (event carries application_id)', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  const { get, post } = recordingHttp();
+  // No index entry for this connection — only the event carries application_id.
+  writeCatalog('app-evt', [{ action: 'y' }], { dir: catalogDir });
+  assert.ok(fs.existsSync(catalogPath('app-evt', catalogDir)), 'precondition: catalog exists');
+
+  const frame = { payload: { event: 'connection.revoked', data: { connection_id: 'conn-noidx', provider: 'notion', application_id: 'app-evt' } } };
+  await handleConnectionEvent(baseOrgConfig, frame, { get, post, connectDir, credentialsDir, catalogDir });
+
+  assert.ok(!fs.existsSync(catalogPath('app-evt', catalogDir)), 'catalog must be invalidated using the event-supplied application_id');
+});
+
+test('connection.revoked: applicationId unresolvable (sparse event + no index entry) → does NOT throw, unrelated catalogs untouched', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  const { get, post } = recordingHttp();
+  // A different app's catalog must survive (the null-guard must not delete blindly).
+  writeCatalog('app-other', [{ action: 'z' }], { dir: catalogDir });
+
+  const frame = { payload: { event: 'connection.revoked', data: { connection_id: 'conn-ghost', provider: 'slack' } } };
+  await assert.doesNotReject(
+    handleConnectionEvent(baseOrgConfig, frame, { get, post, connectDir, credentialsDir, catalogDir }),
+    'an unresolvable applicationId must skip the catalog delete, never throw',
+  );
+  assert.ok(fs.existsSync(catalogPath('app-other', catalogDir)), 'an unrelated app catalog must be left intact');
+});
+
+// ---------------------------------------------------------------------------
+// Revoke/disconnect catalog cleanup is ORG-AWARE / reference-counted. The
+// action-catalog is GLOBAL (action-catalog/<applicationId>.json is shared across
+// orgs; only the connections index is per-org), so revoking one org's
+// connection must NOT wipe the shared catalog while ANOTHER org still has a
+// connection to the same app. Only the LAST connection to the app across ALL
+// orgs clears it. (The single-org three-caches-cleared test above is the
+// degenerate case: one org = last org → catalog cleared.)
+// ---------------------------------------------------------------------------
+test('connection.revoked: shared app catalog is RETAINED while another org still has a connection, and CLEARED once the last org revokes', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  const { get, post } = recordingHttp();
+
+  const orgAConfig = { ...baseOrgConfig, org_id: 'org-A' };
+  const orgBConfig = { ...baseOrgConfig, org_id: 'org-B' };
+  const idxA = indexPathForOrg('org-A', connectDir);
+  const idxB = indexPathForOrg('org-B', connectDir);
+
+  // Two orgs each hold an ACTIVE connection to the SAME app (app-shared), so the
+  // per-org index files connections-index.org-A.json / connections-index.org-B.json
+  // both exist alongside the ONE shared catalog file.
+  upsertConnection({ connection_id: 'conn-A', application_id: 'app-shared', application_slug: 'github', credential_mode: 'direct' }, idxA);
+  upsertConnection({ connection_id: 'conn-B', application_id: 'app-shared', application_slug: 'github', credential_mode: 'direct' }, idxB);
+  fs.mkdirSync(credentialsDir, { recursive: true });
+  fs.writeFileSync(path.join(credentialsDir, 'conn-A.json'), JSON.stringify({ credential_mode: 'direct', access_token: 'tokA' }));
+  fs.writeFileSync(path.join(credentialsDir, 'conn-B.json'), JSON.stringify({ credential_mode: 'direct', access_token: 'tokB' }));
+  writeCatalog('app-shared', [{ action: 'x' }], { dir: catalogDir });
+
+  // --- Revoke orgA's connection; orgB still references the app ---
+  await handleConnectionEvent(
+    orgAConfig,
+    { payload: { event: 'connection.revoked', data: { connection_id: 'conn-A', provider: 'github' } } },
+    { get, post, connectDir, credentialsDir, catalogDir },
+  );
+
+  assert.equal(readIndex(idxA).connections['conn-A'], undefined, 'orgA index entry removed');
+  assert.ok(!fs.existsSync(path.join(credentialsDir, 'conn-A.json')), 'orgA credential cleared');
+  assert.ok(fs.existsSync(catalogPath('app-shared', catalogDir)), 'shared catalog RETAINED — orgB still has a connection to the app');
+  assert.ok(readIndex(idxB).connections['conn-B'], 'orgB connection left untouched');
+
+  // --- Revoke orgB's connection; now the last one across all orgs ---
+  await handleConnectionEvent(
+    orgBConfig,
+    { payload: { event: 'connection.revoked', data: { connection_id: 'conn-B', provider: 'github' } } },
+    { get, post, connectDir, credentialsDir, catalogDir },
+  );
+
+  assert.equal(readIndex(idxB).connections['conn-B'], undefined, 'orgB index entry removed');
+  assert.ok(!fs.existsSync(path.join(credentialsDir, 'conn-B.json')), 'orgB credential cleared');
+  assert.ok(!fs.existsSync(catalogPath('app-shared', catalogDir)), 'shared catalog CLEARED — last connection across all orgs removed');
 });

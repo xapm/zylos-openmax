@@ -30,6 +30,8 @@
  *     net there. So `forceReconnect` is true ONLY for the realtime path.
  */
 
+import { formatReceiptForModel } from './interaction-receipt.js';
+
 /**
  * Determine whether a (merged notification+detail) message has a usable body.
  *
@@ -41,6 +43,12 @@
  */
 export function messageHasUsableContent(msg) {
   if (!msg || typeof msg !== 'object') return false;
+
+  // An interaction receipt is usable as soon as it carries an answer, even with
+  // no text. The contract requires the text, but a producer that omits it would
+  // otherwise park the whole org's inbox behind one un-advanced cursor — and the
+  // forward path renders a receipt from its structured fields regardless.
+  if (formatReceiptForModel(msg)) return true;
 
   const structured = (msg.content && typeof msg.content === 'object') ? msg.content : {};
 

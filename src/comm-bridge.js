@@ -30,7 +30,7 @@ import { WsClient, createDeduper } from './lib/ws.js';
 import { resolveInboundContent } from './lib/inbound-content.js';
 import { formatInboundForC4, formatEndpoint, newClientMsgId } from './lib/message.js';
 import { isSystemSender, systemEventPriority } from './lib/system-message.js';
-import { resolveReplyConversationId } from './lib/interaction-receipt.js';
+import { formatReceiptForModel, resolveReplyConversationId } from './lib/interaction-receipt.js';
 import { isSiblingAgentSender } from './lib/dm-access.js';
 import { recordParticipants } from './lib/mention.js';
 import { getMediaUrl, downloadMedia } from './cli/as.js';
@@ -1040,8 +1040,14 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
     // and `.media_id`, which silently produced empty content under the
     // current cws-core schema.
     const structured = (msg.content && typeof msg.content === 'object') ? msg.content : {};
+    // A receipt's answer lives in structured fields that the arms below cannot
+    // reach — they read one string, and for a receipt that string is a human
+    // sentence with no option id, no actor and no card in it. Render those
+    // fields instead; anything that is not a trusted receipt returns null here
+    // and takes the ordinary path unchanged.
     const text =
-        structured.body?.text
+        formatReceiptForModel(msg)
+     || structured.body?.text
      || (typeof msg.message?.content === 'string' ? msg.message.content : '')
      || (typeof msg.content === 'string' ? msg.content : '')
      || '';

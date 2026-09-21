@@ -164,3 +164,24 @@ test('bias to transient: last attempt throws (after an empty) → error, not ski
   const r = await resolveInboundContent({ getDetail, notification: syncFrame, sleep: noSleep });
   assert.equal(r.status, 'error', 'a terminal throw biases to transient (never wrongly skip)');
 });
+
+test('a receipt with an answer but no text is usable, not empty', () => {
+  // The contract requires body.text, but a producer that omits it would
+  // otherwise leave the cursor un-advanced and park the org's whole inbox.
+  assert.equal(messageHasUsableContent({
+    type: 'INTERACTION_RECEIPT',
+    sender_type: 'SYSTEM',
+    content: {
+      content_type: 'interaction_receipt',
+      body: { origin: { conversation_id: 'c1' }, selected_action_ids: ['opt_0'] },
+    },
+  }), true);
+});
+
+test('a text-less structured message that is not a receipt is still empty', () => {
+  assert.equal(messageHasUsableContent({
+    type: 'AGENT_STRUCTURED',
+    sender_type: 'AGENT',
+    content: { content_type: 'json', body: { origin: { conversation_id: 'c1' } } },
+  }), false);
+});

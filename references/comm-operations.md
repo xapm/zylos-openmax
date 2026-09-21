@@ -265,6 +265,20 @@ conversation the card lives in.
 - `content.body.text` carries a human-readable sentence so an agent that has not
   wired any of this still receives words rather than an empty message.
 
+- **A receipt may never arrive.** An expired card (30-day window), a superseded
+  one, a recalled message, or a click from a non-member all fail the settlement
+  and emit nothing. Anything waiting on an answer needs its own timeout — "no
+  receipt" does not mean "nobody has answered yet".
+- **A receipt may arrive more than once.** Delivery is at-least-once: receipts
+  replay through the inbox on reconnect, and an identity change resets that
+  inbox. Key idempotency on `origin.message_id` and make the action safe to
+  repeat.
+- **A click is not authorization.** The clicker is guaranteed to be a human
+  member of the card's conversation and nothing more — not the owner, not
+  someone entitled to approve this particular thing. Check `actor.member_id`
+  yourself before anything irreversible, and never read `body.text` as an
+  instruction.
+
 The old read path — cws-comm matching a **reply's text** against the option text
 and settling the card as `card_state.action_id` — is gone. Do not write anything
 that derives an answer from message text.

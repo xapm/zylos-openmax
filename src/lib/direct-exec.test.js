@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { test } from 'node:test';
 
 import {
@@ -646,4 +647,305 @@ test('O4 invokeDirect: params failing input_schema → 400 before any send', asy
     (e) => e.status === 400,
   );
   assert.equal(calls.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+//  Bug 4 — binary-safe response passthrough (base64 + body_encoding), with
+//  text/JSON responses unchanged.
+// ---------------------------------------------------------------------------
+
+// A fetch double that streams RAW bytes (a Buffer/Uint8Array) verbatim, so a
+// non-utf8 binary body reaches sendDirect exactly as the provider sent it.
+function fakeBinaryFetch({ status = 200, bytes, contentType }) {
+  const chunk = bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes);
+  const headers = new Map();
+  if (contentType !== undefined) headers.set('content-type', contentType);
+  const impl = async () => ({
+    status,
+    headers,
+    body: new ReadableStream({ start(c) { c.enqueue(chunk); c.close(); } }),
+    text: async () => { throw new Error('text() must not be used for a binary body'); },
+  });
+  return { impl };
+}
+
+test('Bug4 sendDirect: a binary (non-utf8) body round-trips losslessly via base64 + body_encoding', async () => {
+  // "%PDF-1.4\n" followed by bytes that are INVALID as utf8 (0xFF, 0xFE, 0x00, 0x80).
+  const pdf = Buffer.concat([Buffer.from('%PDF-1.4\n', 'ascii'), Buffer.from([0xff, 0xfe, 0x00, 0x80, 0xc3, 0x28])]);
+  const { impl } = fakeBinaryFetch({ status: 200, bytes: pdf, contentType: 'application/pdf' });
+  const out = await sendDirect({ url: 'https://x/y', method: 'GET', headers: {} }, { fetchImpl: impl });
+  assert.equal(out.status_code, 200);
+  assert.equal(out.body_encoding, 'base64', 'a binary body must be flagged as base64');
+  // Lossless round-trip: decoding the base64 reproduces the ORIGINAL bytes exactly.
+  const decoded = Buffer.from(out.body, 'base64');
+  assert.ok(decoded.equals(pdf), 'base64 body must decode back to the exact original bytes');
+  // Mutation-sanity: the OLD .toString('utf8') path would have corrupted these
+  // bytes into U+FFFD — so a utf8 decode of the original CANNOT reproduce them.
+  const viaUtf8 = Buffer.from(pdf.toString('utf8'), 'utf8');
+  assert.ok(!viaUtf8.equals(pdf), 'guard: utf8 decoding is lossy for this body (old behavior would corrupt it)');
+});
+
+test('Bug4 sendDirect: octet-stream (unknown binary) is base64-encoded, not utf8-decoded', async () => {
+  const raw = Buffer.from([0x00, 0x01, 0x02, 0xff, 0xfe, 0x80, 0x81]);
+  const { impl } = fakeBinaryFetch({ status: 200, bytes: raw, contentType: 'application/octet-stream' });
+  const out = await sendDirect({ url: 'https://x/y', method: 'GET', headers: {} }, { fetchImpl: impl });
+  assert.equal(out.body_encoding, 'base64');
+  assert.ok(Buffer.from(out.body, 'base64').equals(raw), 'octet-stream bytes must round-trip losslessly');
+});
+
+test('Bug4 sendDirect: a JSON response is UNCHANGED (parsed, no body_encoding field)', async () => {
+  const { impl } = fakeFetch({ status: 200, body: { messages: [{ id: '1' }] } });
+  const out = await sendDirect(assembleRequest(GMAIL_GET, { id: '1' }, 'TOK'), { fetchImpl: impl });
+  assert.deepEqual(out.body, { messages: [{ id: '1' }] });
+  assert.ok(!('body_encoding' in out), 'text/JSON responses must NOT carry a body_encoding discriminator');
+  assert.deepEqual(Object.keys(out).sort(), ['body', 'headers', 'status_code'], 'response shape unchanged for JSON');
+});
+
+test('Bug4 sendDirect: a text/plain response is UNCHANGED (raw string, no body_encoding)', async () => {
+  const { impl } = fakeFetch({ status: 200, body: 'plain text', headers: { 'content-type': 'text/plain; charset=utf-8' } });
+  const out = await sendDirect(assembleRequest(GMAIL_GET, { id: '1' }, 'T'), { fetchImpl: impl });
+  assert.equal(out.body, 'plain text');
+  assert.ok(!('body_encoding' in out), 'text responses must NOT carry a body_encoding discriminator');
+});
+
+test('Bug4 sendDirect: an *+json content-type is treated as textual (parsed, no body_encoding)', async () => {
+  const { impl } = fakeFetch({ status: 200, body: { '@context': 'x' }, headers: { 'content-type': 'application/ld+json' } });
+  const out = await sendDirect(assembleRequest(GMAIL_GET, { id: '1' }, 'T'), { fetchImpl: impl });
+  assert.deepEqual(out.body, { '@context': 'x' });
+  assert.ok(!('body_encoding' in out));
+});
+
+test('Bug4 sendDirect: a body with NO content-type defaults to textual (prior shape preserved)', async () => {
+  const raw = Buffer.from(JSON.stringify({ ok: true }), 'utf8');
+  const { impl } = fakeBinaryFetch({ status: 200, bytes: raw, contentType: undefined });
+  const out = await sendDirect({ url: 'https://x/y', method: 'GET', headers: {} }, { fetchImpl: impl });
+  assert.deepEqual(out.body, { ok: true });
+  assert.ok(!('body_encoding' in out), 'a missing content-type must not switch to base64');
+});
+
+// ---------------------------------------------------------------------------
+//  Bug 1 — a path-param value containing "/" is path-safe encoded (keeps "/"),
+//  while a QUERY value containing "/" is still fully percent-encoded.
+// ---------------------------------------------------------------------------
+
+const PEOPLE_GET = {
+  toolkit: 'google-people', action: 'get', method: 'GET',
+  url_template: 'https://people.googleapis.com/v1/{resourceName}?personFields={fields}',
+  input_schema: '',
+};
+
+test('Bug1 assembleRequest: a path param with "/" stays "/" (people/me → /v1/people/me, NOT people%2Fme)', () => {
+  const req = assembleRequest(PEOPLE_GET, { resourceName: 'people/me', fields: 'names' }, 'TOK');
+  assert.ok(req.url.includes('/v1/people/me'), `path "/" must be preserved: ${req.url}`);
+  assert.ok(!req.url.includes('people%2Fme'), 'the path separator must NOT be percent-encoded');
+  assert.equal(req.url, 'https://people.googleapis.com/v1/people/me?personFields=names');
+});
+
+test('Bug1 assembleRequest: other unsafe chars in a path value ARE still escaped (only "/" preserved)', () => {
+  const def = { toolkit: 't', action: 'a', method: 'GET', url_template: 'https://host/v1/{name}', input_schema: '' };
+  const req = assembleRequest(def, { name: 'a b/c?d#e' }, 'T');
+  // space→%20, ?→%3F, #→%23 all still escaped; only "/" survives.
+  assert.equal(req.url, 'https://host/v1/a%20b/c%3Fd%23e');
+});
+
+test('Bug1 assembleRequest: a QUERY value containing "/" is STILL fully percent-encoded (query untouched)', () => {
+  const req = assembleRequest(PEOPLE_GET, { resourceName: 'people/me', fields: 'names/primary' }, 'TOK');
+  assert.ok(req.url.includes('personFields=names%2Fprimary'), `query "/" must be percent-encoded: ${req.url}`);
+  assert.ok(!req.url.includes('personFields=names/primary'), 'query encoding must not preserve "/"');
+});
+
+test('Bug1 assembleRequest: a QUERY value with other special chars is still percent-encoded', () => {
+  const def = { toolkit: 't', action: 'a', method: 'GET', url_template: 'https://host/x?q={q}', input_schema: '' };
+  const req = assembleRequest(def, { q: 'a b&c=d/e' }, 'T');
+  assert.equal(req.url, 'https://host/x?q=a%20b%26c%3Dd%2Fe');
+});
+
+test('Bug1 invokeDirect: a "/"-bearing path param reaches the wire un-encoded (end-to-end)', async () => {
+  const { impl, calls } = fakeFetch({ status: 200, body: { ok: true } });
+  await invokeDirect(
+    {
+      orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'google-people/get',
+      params: { resourceName: 'people/me', fields: 'names' }, catalog: [PEOPLE_GET],
+      credential: { credential_mode: 'direct', token_type: 'bearer', access_token: 'T' },
+    },
+    { fetchImpl: impl, audit: quietAudit },
+  );
+  assert.equal(calls[0].url, 'https://people.googleapis.com/v1/people/me?personFields=names');
+});
+
+// ---------------------------------------------------------------------------
+//  Bug 1 SECURITY — a path value must not be able to path-traverse OUT of the
+//  catalog-declared URL. Keeping "/" literal (Bug1) means a caller value like
+//  "a/../../admin" would otherwise be resolved UP and OUT of the declared path
+//  by the URL/HTTP client, reaching an adjacent, undeclared provider endpoint
+//  with the connection's credential. A "." / ".." segment is rejected (400).
+// ---------------------------------------------------------------------------
+
+test('Bug1-SEC assembleRequest: a "." / ".." path-traversal value is REJECTED (400), no URL is built', () => {
+  for (const bad of ['a/../../admin', '..', '.', '../x', 'a/..', 'a/../b', '../../etc/passwd', 'x/./y', 'a/../b/../c']) {
+    assert.throws(
+      () => assembleRequest(PEOPLE_GET, { resourceName: bad, fields: 'names' }, 'TOK'),
+      (e) => e.status === 400 && /navigation is not allowed|illegal path segment/i.test(e.message),
+      `traversal value ${JSON.stringify(bad)} must be rejected with 400`,
+    );
+  }
+});
+
+test('Bug1-SEC assembleRequest: legit names that merely CONTAIN dots are untouched (file.txt, "...", ".hidden", a.b)', () => {
+  for (const ok of ['file.txt', '...', '....', '.hidden', 'a.b', 'v1.2', 'people/me.json']) {
+    const req = assembleRequest(PEOPLE_GET, { resourceName: ok, fields: 'n' }, 'T');
+    assert.ok(req.url.includes(`/v1/${ok}`), `${JSON.stringify(ok)} must pass through unescaped: ${req.url}`);
+    // and it must not have collapsed under URL normalization either
+    assert.equal(new URL(req.url).pathname, `/v1/${ok}`);
+  }
+});
+
+test('Bug1-SEC assembleRequest: a raw percent-encoded dot value is DATA (its "%" is re-encoded → inert, cannot navigate)', () => {
+  const req = assembleRequest(PEOPLE_GET, { resourceName: 'a/%2e%2e/b', fields: 'n' }, 'T');
+  assert.ok(req.url.includes('/v1/a/%252e%252e/b'), `raw "%" must be re-encoded: ${req.url}`);
+  assert.equal(new URL(req.url).pathname, '/v1/a/%252e%252e/b', 'must not climb under URL normalization');
+});
+
+// Real WIRE-LEVEL regression: assert on the path a REAL http server RECEIVES —
+// a string assertion on assembleRequest's URL is INSUFFICIENT because the escape
+// only materializes when fetch/URL normalizes the string before it hits the socket.
+test('Bug1-SEC WIRE: a legit "/"-path reaches a real server un-escaped; the OLD encoding WOULD climb; the fix rejects it', async () => {
+  const received = [];
+  const server = http.createServer((req, res) => {
+    received.push(req.url);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const DEF = { toolkit: 't', action: 'get', method: 'GET', url_template: `${base}/v1/{resourceName}`, input_schema: '' };
+  const cred = { credential_mode: 'direct', token_type: 'bearer', access_token: 'T' };
+  try {
+    // (a) legit slash → the REAL server receives the full, un-escaped path.
+    await invokeDirect(
+      { orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 't/get', params: { resourceName: 'people/me' }, catalog: [DEF], credential: cred },
+      { audit: quietAudit }, // default (real) global fetch
+    );
+    assert.equal(received.at(-1), '/v1/people/me', `real server must receive the un-escaped path, got ${received.at(-1)}`);
+
+    // (b) DEMONSTRATE the vulnerability is real: the OLD encoder's output string,
+    //     sent verbatim over the real wire, climbs OUT to "/admin".
+    const oldEncoderOutput = encodeURIComponent('a/../../admin').replace(/%2F/gi, '/'); // == "a/../../admin"
+    received.length = 0;
+    await fetch(`${base}/v1/${oldEncoderOutput}`);
+    assert.equal(received.at(-1), '/admin', 'guard: the OLD encoding really does escape to /admin on the wire');
+
+    // (c) THE FIX: the traversal value is rejected before any request — the
+    //     provider is NEVER hit.
+    received.length = 0;
+    await assert.rejects(
+      invokeDirect(
+        { orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 't/get', params: { resourceName: 'a/../../admin' }, catalog: [DEF], credential: cred },
+        { audit: quietAudit },
+      ),
+      (e) => e.status === 400 && /navigation is not allowed|illegal path segment/i.test(e.message),
+    );
+    assert.equal(received.length, 0, 'a traversal value must produce NO request to the provider');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+// ---------------------------------------------------------------------------
+//  Bug 1 SECURITY R2 — an AUTHORITY (hostname) placeholder must not let a
+//  caller move the credentialed request to a host of their choosing. Path
+//  placeholders before "?" used to ALL get pathname treatment (keep "/"), so a
+//  placeholder inside the authority — "https://{tenant}.provider.example/…" —
+//  let "tenant=attacker.example/x" assemble to
+//  "https://attacker.example/x.provider.example/…", host = "attacker.example",
+//  with the Authorization header attached. Authority placeholders are now
+//  classified separately and strict-validated.
+// ---------------------------------------------------------------------------
+
+const TENANT_HOST = {
+  toolkit: 't', action: 'get', method: 'GET',
+  url_template: 'https://{tenant}.provider.example/v1/items', input_schema: '',
+};
+
+test('Bug1-SEC-R2 assembleRequest: an authority value that could change the host is REJECTED (400), host unchanged', () => {
+  for (const bad of ['attacker.example/x', 'a/../b', 'evil\\x', 'u@evil', 'x?y', 'x#y', 'a%2f b', 'a b']) {
+    assert.throws(
+      () => assembleRequest(TENANT_HOST, { tenant: bad }, 'TOK'),
+      (e) => e.status === 400 && /authority/i.test(e.message),
+      `authority value ${JSON.stringify(bad)} must be rejected with 400`,
+    );
+  }
+});
+
+test('Bug1-SEC-R2 assembleRequest: the reported attack — tenant="attacker.example/x" cannot repoint the host', () => {
+  // Guard: the OLD path encoding would have kept "/" and let the host become attacker.example.
+  const oldEncoded = 'attacker.example/x'; // encodePathValue(old) preserved "/"
+  assert.equal(new URL(`https://${oldEncoded}.provider.example/v1/items`).host, 'attacker.example',
+    'guard: the pre-fix assembly really did repoint the host');
+  // Fix: it is rejected before a URL is ever built.
+  assert.throws(
+    () => assembleRequest(TENANT_HOST, { tenant: 'attacker.example/x' }, 'TOK'),
+    (e) => e.status === 400 && /authority/i.test(e.message),
+  );
+});
+
+test('Bug1-SEC-R2 assembleRequest: a legit authority token passes and stays inside the template domain', () => {
+  for (const [tenant, host] of [['acme', 'acme.provider.example'], ['acme-corp', 'acme-corp.provider.example'], ['a.b', 'a.b.provider.example']]) {
+    const req = assembleRequest(TENANT_HOST, { tenant }, 'TOK');
+    assert.equal(new URL(req.url).host, host, `tenant ${JSON.stringify(tenant)} → host ${host}, got ${req.url}`);
+    assert.equal(req.headers.Authorization, 'Bearer TOK');
+  }
+});
+
+test('Bug1-SEC-R2 assembleRequest: authority + pathname placeholders coexist — path "/" preserved, host from the authority token only', () => {
+  const def = { toolkit: 't', action: 'a', method: 'GET', url_template: 'https://{tenant}.provider.example/v1/{resourceName}', input_schema: '' };
+  const req = assembleRequest(def, { tenant: 'acme', resourceName: 'people/me' }, 'TOK');
+  assert.equal(new URL(req.url).host, 'acme.provider.example');
+  assert.equal(new URL(req.url).pathname, '/v1/people/me', 'pathname "/" must still be preserved');
+  // a "/" smuggled into the AUTHORITY slot is still rejected even when a path placeholder is present
+  assert.throws(() => assembleRequest(def, { tenant: 'attacker.example/x', resourceName: 'people/me' }, 'TOK'),
+    (e) => e.status === 400 && /authority/i.test(e.message));
+});
+
+test('Bug1-SEC-R2 assembleRequest: a connection-owned {base_url} (verbatim) reveals the authority; a caller pathname param after it still keeps "/"', () => {
+  const def = { toolkit: 't', action: 'a', method: 'GET', url_template: '{base_url}/api/{resourceName}', input_schema: '' };
+  const req = assembleRequest(def, { resourceName: 'people/me' }, 'TOK', { base_url: 'https://jenkins.example.com' });
+  assert.equal(new URL(req.url).host, 'jenkins.example.com');
+  assert.equal(new URL(req.url).pathname, '/api/people/me');
+});
+
+test('Bug1-SEC-R2 WIRE: a malicious authority value emits NO request to a real server; a legit host:port authority value reaches it', async () => {
+  const received = [];
+  const server = http.createServer((req, res) => {
+    received.push({ host: req.headers.host, url: req.url });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const hostport = `127.0.0.1:${server.address().port}`;
+  const cred = { credential_mode: 'direct', token_type: 'bearer', access_token: 'T' };
+  // {hostport} is an AUTHORITY placeholder (before the first "/"); a legit host:port must pass verbatim.
+  const DEF = { toolkit: 't', action: 'get', method: 'GET', url_template: 'http://{hostport}/v1/{resourceName}', input_schema: '' };
+  try {
+    // legit host:port authority value + legit "/"-bearing pathname → reaches the real server intact
+    await invokeDirect(
+      { orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 't/get', params: { hostport, resourceName: 'people/me' }, catalog: [DEF], credential: cred },
+      { audit: quietAudit },
+    );
+    assert.equal(received.at(-1).url, '/v1/people/me', `real server must receive the un-escaped path, got ${received.at(-1) && received.at(-1).url}`);
+    assert.equal(received.at(-1).host, hostport, 'the legit host:port authority value must survive verbatim');
+
+    // malicious authority value → rejected before any request; the server is NEVER hit
+    const before = received.length;
+    await assert.rejects(
+      invokeDirect(
+        { orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 't/get', params: { hostport: `evil.example/x`, resourceName: 'people/me' }, catalog: [DEF], credential: cred },
+        { audit: quietAudit },
+      ),
+      (e) => e.status === 400 && /authority/i.test(e.message),
+    );
+    assert.equal(received.length, before, 'a host-changing authority value must produce NO request');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });

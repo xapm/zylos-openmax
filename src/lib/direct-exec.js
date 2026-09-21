@@ -121,6 +121,79 @@ function hasVal(v) {
 }
 
 /**
+ * Encode a PATH-segment value: percent-encode as data (so query-reserved and
+ * unsafe chars are escaped) but PRESERVE the path separator "/". A resource-name
+ * value like "people/me" must stay "people/me" in the path — full
+ * encodeURIComponent turns it into "people%2Fme", which many providers 404.
+ *
+ * SECURITY (path traversal): keeping "/" literal means a caller-supplied value
+ * could otherwise smuggle a "." or ".." navigation segment (e.g.
+ * "a/../../admin") that the URL/HTTP client resolves UP and OUT of the
+ * catalog-declared path — letting the connection credential reach an adjacent,
+ * UNDECLARED endpoint of the same provider (breaking the "callers can only hit
+ * URLs declared in the catalog" boundary). A bare "." / ".." segment is never a
+ * legitimate resource name, and it cannot be carried as an inert literal in a
+ * URL path (the WHATWG URL parser treats "..", ".%2e", "%2e.", "%2e%2e" — any
+ * case — ALL as navigation, so percent-encoding the dots does not help), so any
+ * such segment is REJECTED (400) rather than passed through. Names that merely
+ * CONTAIN dots ("file.txt", "a.b", "...", ".hidden") are unaffected — only the
+ * exact navigation segments "." / ".." are refused.
+ *
+ * Each remaining segment is encodeURIComponent'd and the segments are rejoined
+ * with "/". For any value WITHOUT a navigation segment this is byte-for-byte
+ * identical to the previous `encodeURIComponent(s).replace(/%2F/g, '/')` (only
+ * an input "/" ever produces "%2F", so splitting on "/" first changes nothing
+ * else); the sole behavioural change is that "." / ".." now throw.
+ */
+function encodePathValue(s) {
+  return String(s)
+    .split('/')
+    .map((seg) => {
+      if (seg === '.' || seg === '..') {
+        throw Object.assign(
+          new Error(`illegal path segment "${seg}" in path value: "." / ".." navigation is not allowed`),
+          { status: 400 },
+        );
+      }
+      return encodeURIComponent(seg);
+    })
+    .join('/');
+}
+
+/**
+ * Validate a caller value that fills a placeholder located in the URL's
+ * SCHEME/AUTHORITY (e.g. a tenant subdomain in
+ * "https://{tenant}.provider.example/..."). Unlike a path value, an authority
+ * value must NEVER be able to end or restructure the authority, or the caller
+ * could move the whole (credentialed) request to a host of their choosing.
+ *
+ * SECURITY: with "/" preserved (as encodePathValue does), `tenant =
+ * "attacker.example/x"` on the template above assembles to
+ * "https://attacker.example/x.provider.example/..." whose host parses as
+ * "attacker.example" — sending the connection's Authorization header to an
+ * attacker-chosen host (SSRF + credential exfiltration). So we ALLOWLIST only
+ * the characters a real authority token needs — host-label chars
+ * (alphanumerics, "-", "."), ":" (port) and "[" "]" (IPv6 literal) — and reject
+ * everything else (400). That refuses the authority-boundary characters "/",
+ * "\" (WHATWG treats it as "/"), "?", "#", "@" (userinfo), and "%" (no
+ * percent-encoding games), which are the ways a value could escape the host.
+ * A value that passes is authority-safe, so it is substituted VERBATIM
+ * (percent-encoding ":" would corrupt a legitimate "host:port"). A legit
+ * tenant/subdomain that merely adds a label (e.g. "acme") stays inside the
+ * template's own registrable domain ("acme.provider.example").
+ */
+function encodeAuthorityValue(s) {
+  const str = String(s);
+  if (!/^[A-Za-z0-9._:[\]-]+$/.test(str)) {
+    throw Object.assign(
+      new Error('illegal character in URL authority value (only host-label / port / IPv6 characters are allowed — it must not be able to change the request host)'),
+      { status: 400 },
+    );
+  }
+  return str;
+}
+
+/**
  * Canonicalize a credential `token_type` into the HTTP Authorization scheme word.
  * Mirrors cws-connect's `canonicalAuthScheme` (connection_service.go) EXACTLY:
  *   - ""  / "bearer" (any case) / "api_key" (any case) → "Bearer".
@@ -208,16 +281,47 @@ export function assembleRequest(actionDef, params = {}, token, urlPlaceholders =
   const pathPart = qIdx >= 0 ? template.slice(0, qIdx) : template;
   const queryPart = qIdx >= 0 ? template.slice(qIdx + 1) : '';
 
-  // Path placeholders — required. Params first (URL-encoded data), then
-  // connection-owned url_placeholders (verbatim structural prefix, e.g.
-  // "{base_url}" → "https://jenkins.example.com").
-  const path = pathPart.replace(/\{([^}]+)\}/g, (_, key) => {
+  // Path placeholders — required. Resolved in TWO passes so a caller value can
+  // never alter the URL authority (host):
+  //   Pass 1 substitutes the connection-owned url_placeholders VERBATIM. These
+  //     are trusted structural parts (scheme/host/base-URL prefix, e.g.
+  //     "{base_url}" → "https://jenkins.example.com") and legitimately contain
+  //     "://" and "/". Caller (params) placeholders are LEFT in place.
+  //   With the trusted parts revealed, we locate the URL authority (between
+  //     "scheme://" and the next "/"). Pass 2 then substitutes each caller
+  //     (params) placeholder, choosing the encoder by WHERE it sits: an
+  //     authority placeholder must not keep "/" (encodeAuthorityValue, rejects
+  //     host-boundary chars); a pathname placeholder keeps "/" for real
+  //     resource names like "people/me" (encodePathValue). Params still win over
+  //     url_placeholders on a name clash (a params placeholder is deferred to
+  //     pass 2, never overwritten by pass 1).
+  const pass1 = pathPart.replace(/\{([^}]+)\}/g, (m, key) => {
+    if (hasVal(params[key])) return m;              // caller value → defer to pass 2
+    if (hasVal(uph[key])) { consumed.add(key); return String(uph[key]); } // trusted, verbatim
+    return m;                                       // unresolved → pass 2 throws
+  });
+  // Authority span = after "scheme://" up to the next "/" (or end). Caller
+  // placeholders whose offset falls inside it fill the host/authority.
+  const schemeM = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.exec(pass1);
+  const authStart = schemeM ? schemeM[0].length : -1;
+  let authEnd = -1;
+  if (authStart >= 0) {
+    const slash = pass1.indexOf('/', authStart);
+    authEnd = slash === -1 ? pass1.length : slash;
+  }
+  const path = pass1.replace(/\{([^}]+)\}/g, (m, key, offset) => {
     consumed.add(key);
-    if (hasVal(params[key])) return encodeURIComponent(String(params[key]));
-    if (hasVal(uph[key])) return String(uph[key]);
-    // Neither source has it. A leading "{base_url}"-style placeholder is a
-    // connection-owned URL part the credential should have carried — surface it
-    // as a 422 (connection/credential too old) rather than a missing-param 400.
+    if (hasVal(params[key])) {
+      const inAuthority = authStart >= 0 && offset >= authStart && offset < authEnd;
+      // Authority values NEVER keep "/" (host-safe, rejects boundary chars);
+      // pathname values are DATA that keeps "/" so "people/me" stays a real
+      // path. Query encoding (below) is unchanged (always encodeURIComponent).
+      return inAuthority ? encodeAuthorityValue(params[key]) : encodePathValue(params[key]);
+    }
+    // Neither source has it (uph was already folded in pass 1). A leading
+    // "{base_url}"-style placeholder is a connection-owned URL part the
+    // credential should have carried — surface it as a 422 (connection/
+    // credential too old) rather than a missing-param 400.
     if (pathPart.startsWith(`{${key}}`)) {
       throw Object.assign(
         new Error(`connection is missing URL placeholder "${key}" (e.g. base_url) — reconnect the connection or refresh the credential; url_placeholders did not provide it`),
@@ -432,12 +536,18 @@ function headersToObject(h) {
  * cap it cancels the stream and THROWS (over-cap is an ERROR, not a silent
  * truncation — a truncated body would be a corrupt/misleading passthrough).
  *
+ * Returns the RAW bytes as a Buffer — it does NOT decode. Decoding is the
+ * caller's job (sendDirect), which decides utf8-vs-base64 from the response
+ * content-type. Force-decoding to utf8 here would irreversibly corrupt binary
+ * bodies (PDFs, images, …), replacing every non-utf8 byte with U+FFFD.
+ *
  * Falls back to `res.text()` only when the response exposes no readable stream
  * (e.g. a minimal test double); that path still enforces the cap, but by then
- * the body is already buffered, so it is a compatibility fallback, not the
- * memory-safety guarantee. Production `fetch` always provides `res.body`.
+ * the body is already buffered (and text() has already lossily decoded binary),
+ * so it is a compatibility fallback, not the memory-safety or binary-fidelity
+ * guarantee. Production `fetch` always provides `res.body`.
  */
-async function readCappedText(res) {
+async function readCappedBytes(res) {
   const reader = res.body && typeof res.body.getReader === 'function' ? res.body.getReader() : null;
   if (!reader) {
     const text = await res.text();
@@ -447,7 +557,7 @@ async function readCappedText(res) {
         { status: 502 },
       );
     }
-    return text;
+    return Buffer.from(text, 'utf8');
   }
   const chunks = [];
   let total = 0;
@@ -468,16 +578,64 @@ async function readCappedText(res) {
   } finally {
     try { reader.releaseLock(); } catch { /* already released/cancelled */ }
   }
-  return Buffer.concat(chunks).toString('utf8');
+  return Buffer.concat(chunks);
+}
+
+/**
+ * Read one header value from a fetch Response's headers, tolerating both a real
+ * `Headers`/`Map` (has `.get`) and a plain object (test doubles). Case-insensitive.
+ */
+function getHeaderValue(h, name) {
+  if (!h) return '';
+  if (typeof h.get === 'function') return h.get(name) || '';
+  const lower = name.toLowerCase();
+  for (const [k, v] of Object.entries(h)) {
+    if (k.toLowerCase() === lower) return v || '';
+  }
+  return '';
+}
+
+/**
+ * Is this response content-type textual (safe to utf8-decode + attempt JSON)?
+ * Textual → utf8/JSON passthrough (today's behavior). Non-textual → binary,
+ * base64-encoded by the caller. An ABSENT/empty content-type is treated as
+ * textual so the existing `{status_code, headers, body}` shape is preserved for
+ * every response that was decoded before this change.
+ */
+function isTextualContentType(contentType) {
+  const t = String(contentType || '').toLowerCase();
+  if (!t) return true; // no content-type → default to textual (preserve prior behavior)
+  const mime = t.split(';', 1)[0].trim();
+  if (!mime) return true;
+  if (mime.startsWith('text/')) return true;              // text/*
+  if (mime === 'application/json') return true;
+  if (mime.endsWith('+json')) return true;                // *+json (e.g. application/ld+json)
+  if (mime === 'application/xml' || mime.endsWith('+xml')) return true; // xml + *+xml (e.g. image/svg+xml)
+  if (mime === 'application/javascript' || mime === 'application/ecmascript') return true;
+  if (mime === 'application/csv') return true;             // text/csv already covered by text/*
+  if (mime === 'application/x-ndjson' || mime === 'application/ndjson') return true;
+  if (mime === 'application/x-www-form-urlencoded') return true;
+  if (mime === 'application/graphql') return true;
+  return false;
 }
 
 /**
  * Send one assembled request and normalize the response into the server-parity
  * shape `{ status_code, headers, body }`. Raw passthrough — the provider body is
- * returned as parsed JSON when it parses, else as the raw string; it is never
- * transformed. The body is read with a streaming cap (see readCappedText): a
- * response over MAX_RESPONSE_BYTES throws (status 502) rather than being
+ * never transformed. The body is read with a streaming cap (see readCappedBytes):
+ * a response over MAX_RESPONSE_BYTES throws (status 502) rather than being
  * buffered whole or silently truncated.
+ *
+ * Body decoding is content-type driven so binary responses survive intact:
+ *   - TEXTUAL content-type (application/json, text/*, xml, *+json, csv, js, …)
+ *     or an absent content-type → utf8-decode, then attempt JSON.parse; on
+ *     failure keep the raw string. This preserves the exact prior behavior and
+ *     the `{ status_code, headers, body }` shape (NO body_encoding field) for
+ *     every current text/JSON caller.
+ *   - BINARY content-type (everything else — PDFs, images, octet-stream, …) →
+ *     base64-encode the raw bytes and add a `body_encoding: 'base64'`
+ *     discriminator so the caller can round-trip losslessly. utf8-decoding these
+ *     would replace every non-utf8 byte with U+FFFD, corrupting the body.
  */
 export async function sendDirect(assembled, { fetchImpl = fetch } = {}) {
   const res = await fetchImpl(assembled.url, {
@@ -486,10 +644,19 @@ export async function sendDirect(assembled, { fetchImpl = fetch } = {}) {
     body: assembled.body !== undefined ? JSON.stringify(assembled.body) : undefined,
   });
 
-  const text = await readCappedText(res);
-  let body;
-  try { body = JSON.parse(text); } catch { body = text; }
-  return { status_code: res.status, headers: headersToObject(res.headers), body };
+  const buf = await readCappedBytes(res);
+  const headers = headersToObject(res.headers);
+  const contentType = getHeaderValue(res.headers, 'content-type');
+
+  if (isTextualContentType(contentType)) {
+    const text = buf.toString('utf8');
+    let body;
+    try { body = JSON.parse(text); } catch { body = text; }
+    return { status_code: res.status, headers, body };
+  }
+
+  // Binary passthrough — base64 so the bytes round-trip losslessly.
+  return { status_code: res.status, headers, body: buf.toString('base64'), body_encoding: 'base64' };
 }
 
 /**

@@ -188,6 +188,98 @@ test('replaceIndexFromList 整体重建也捕获 credentialMode（走 toEntry）
   assert.ok(!('credentialSource' in readIndex(idx).connections.c2));
 });
 
+// --- connector taxonomy: connectorKind（Route A：MCP 分流字段）----------------
+
+test('toEntry 捕获 connectorKind（mcp 与 http 都认，含 camelCase 别名），缺省为 null', () => {
+  const idx = tmpIndex();
+  upsertConnection(
+    { connection_id: 'c1', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' },
+    idx,
+  );
+  upsertConnection(
+    { connection_id: 'c2', application_slug: 'gmail', connectorKind: 'http', credential_mode: 'direct', status: 'active' },
+    idx,
+  );
+  upsertConnection({ connection_id: 'c3', application_slug: 'notion', status: 'active' }, idx);
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp');
+  assert.equal(readIndex(idx).connections.c2.connectorKind, 'http'); // camelCase 别名也认
+  assert.equal(readIndex(idx).connections.c3.connectorKind, null);   // 缺省不臆造
+});
+
+test('upsert 叠加：稀疏事件（无 connector_kind）不清空已知的 mcp（撤销/reauth 拆除路径依赖它）', () => {
+  const idx = tmpIndex();
+  upsertConnection(
+    { connection_id: 'c1', application_id: 'app-1', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' },
+    idx,
+  );
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp');
+  // 后续只带 slug 的事件（如 credential_updated / revoke，均不带 connector_kind）不得冲成 null
+  upsertConnection({ connection_id: 'c1', provider: 'linear', status: 'active' }, idx);
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp');
+});
+
+test('replaceIndexFromList 整体重建也捕获 connectorKind（走 toEntry）', () => {
+  const idx = tmpIndex();
+  replaceIndexFromList([
+    { id: 'c1', application_id: 'app-1', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' },
+    { id: 'c2', application_id: 'app-2', application_slug: 'gmail', connectorKind: 'http', credential_mode: 'direct', status: 'active' },
+  ], idx);
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp');
+  assert.equal(readIndex(idx).connections.c2.connectorKind, 'http');
+});
+
+// --- [Problem ②] connectorKind must NOT be nulled by a refresh ---------------
+// conn.index {refresh:true} → refreshIndex → replaceIndexFromList rebuilds
+// wholesale from conn.list, which may NOT carry connector_kind. Nulling it broke
+// teardown (revoke/reauth read ONLY the index → no removeMcpServer → orphaned
+// local MCP server). The refresh must re-derive an omitted connector_kind.
+
+test('[Problem ②] replaceIndexFromList: 列表不带 connector_kind 时保留上一版已知的 mcp（不冲成 null）', () => {
+  const idx = tmpIndex();
+  // authorize/acquire wrote connectorKind:'mcp'
+  upsertConnection({ connection_id: 'c1', application_id: 'app-1', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' }, idx);
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp');
+  // conn.index {refresh:true}: conn.list returns the connection WITHOUT connector_kind
+  replaceIndexFromList([
+    { id: 'c1', application_id: 'app-1', application_slug: 'linear', credential_mode: 'direct', status: 'active' },
+  ], idx);
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp', 'refresh 不得把已有 mcp 冲成 null');
+});
+
+test('[Problem ②] replaceIndexFromList: 上一版为空时，从每连接凭据文件回推 connector_kind', () => {
+  const idx = tmpIndex();
+  const credentialsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'connect-cred-'));
+  // The per-connection credential file still carries connector_kind (saved
+  // verbatim from the Acquire response), even when the index entry lost it.
+  fs.writeFileSync(
+    path.join(credentialsDir, 'c1.json'),
+    JSON.stringify({ credential_mode: 'direct', connector_kind: 'mcp', access_token: 'tok' }),
+  );
+  // The index has NO prior connectorKind for c1, and the list omits it too.
+  replaceIndexFromList([
+    { id: 'c1', application_id: 'app-1', application_slug: 'linear', credential_mode: 'direct', status: 'active' },
+  ], idx, { credentialsDir });
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp', '应从凭据文件回推 connector_kind');
+});
+
+test('[Problem ②] replaceIndexFromList: 列表显式 connector_kind 覆盖旧值（真正变更仍生效）', () => {
+  const idx = tmpIndex();
+  upsertConnection({ connection_id: 'c1', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' }, idx);
+  // An explicit value in the list wins over the preserved one.
+  replaceIndexFromList([
+    { id: 'c1', application_id: 'app-1', application_slug: 'linear', connector_kind: 'http', credential_mode: 'direct', status: 'active' },
+  ], idx);
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'http', '显式 connector_kind 优先');
+});
+
+test('[Problem ②] replaceIndexFromList: 无任何来源知晓时 connectorKind 仍为 null（不臆造）', () => {
+  const idx = tmpIndex();
+  replaceIndexFromList([
+    { id: 'c1', application_id: 'app-1', application_slug: 'gmail', credential_mode: 'direct', status: 'active' },
+  ], idx);
+  assert.equal(readIndex(idx).connections.c1.connectorKind, null);
+});
+
 // --- replaceIndexFromList 孤儿剪枝（全量刷新纠正本地索引）---------------------
 
 test('replaceIndexFromList 剪除孤儿条目（slug 与 credentialMode 皆 null），保留 direct/proxy', () => {

@@ -43,7 +43,7 @@ import { createReadinessTrigger } from './lib/readiness-trigger.js';
 import { getAccessToken, getWsTicket, invalidate as invalidateToken } from './lib/token.js';
 import fs from 'fs';
 import { loadOrgSession, saveOrgSession, RUNTIME_DIR } from './lib/session.js';
-import { handleConnectionEvent, sendOwnerReauthDm, buildConnectionAuthorizedNotice } from './lib/connection-events.js';
+import { handleConnectionEventSerialized, sendOwnerReauthDm, buildConnectionAuthorizedNotice } from './lib/connection-events.js';
 import { createInboxLedger } from './lib/inbox-ledger.js';
 import { seedSessionFromLedger, commitIdentityRebind } from './lib/inbox-rebind.js';
 import { deliverWithInSweepRetry } from './lib/sync-head-retry.js';
@@ -1596,8 +1596,13 @@ async function handleSystemEvent(orgConfig, frame) {
 // module's log/warn in as the only override, production HTTP/storage defaults
 // otherwise.
 
+// SERIALIZED per (org + connection_id): the system-frame dispatch fires this
+// fire-and-forget, so two events for the SAME connection (e.g. an in-flight
+// credential_updated refresh and a following revoke) must not overlap and
+// resurrect a torn-down MCP server. handleConnectionEventSerialized chains them in
+// arrival order per key; different connections/orgs still run in parallel.
 function handleConnectionEventForOrg(orgConfig, frame) {
-  return handleConnectionEvent(orgConfig, frame, {
+  return handleConnectionEventSerialized(orgConfig, frame, {
     log, warn,
     notify: (info) => notifyConnectionAuthorized(orgConfig, info),
     notifyReauth: (info) => notifyReauthNeeded(orgConfig, info),

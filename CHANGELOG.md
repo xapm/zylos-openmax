@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   cws-comm has not shipped the receipt message yet, so this path is wired from the contract (cws-docs `interaction-receipt-contract.md`) and has not been exercised against a real receipt.
 
+- **A receipt reaches the agent as structured data, not as a sentence.** The forward path reads one string per message, so a receipt's answer, actor and originating card were dropped before the model saw them — making the contract's own instruction (use the structured fields, don't parse the sentence) impossible to follow. Those values now ride in an `<interaction-receipt/>` header element alongside `<org-context/>` and `<message-context/>`: `selected-action-ids`, `selected-count`, `actor-member-id`, `actor-kind`, `card-conversation-id`, `card-message-id`, `settled-at`. The element is used rather than message text because message text is forgeable — a member can type lines that read like a receipt, including an actor naming anyone — while an element cannot be typed, since angle brackets in content are escaped. Attribute values are stripped of quotes and line breaks so no value can open an attribute of its own. A readable block still accompanies it, as a reading of the element rather than the source of truth.
+
+  `messageHasUsableContent` treats a receipt carrying an answer as usable even with no text: the contract requires the text, but a producer omitting it would leave the sync cursor un-advanced and park the org's entire inbox behind one message.
+
+  Not included: machine-enforced idempotency. `card-message-id` lets the model recognize a repeat, which is not the same as preventing one; real dedup must be persistent, because the replay it guards against happens across a restart.
+
 ## [2.20.0] — 2026-09-17
 
 ### Added

@@ -185,12 +185,16 @@ node src/cli/comm.js comm.sync '{
 node src/cli/comm.js comm.unread '{"conversationId":"<conv-uuid>"}'
 ```
 
-## Display cards (`cws.card.v1`)
+## Choice cards (`interaction.request`)
 
 When the user is picking from a few fixed answers — yes/no, approve/reject, one
-of three environments — send a **display card** with quick-reply buttons instead
-of a plain-text question. The answer comes back as a stable **action id** rather
-than free text, so you never have to parse "yes" / "Yes." / "好的".
+of three environments — send a **choice card** instead of a plain-text question.
+The answer comes back as a stable **action id** rather than free text, so you
+never have to parse "yes" / "Yes." / "好的".
+
+You do not build the card. You state what you want — a title, a body, the
+choices — and cws-comm builds it. That is why nothing below names an operation,
+a URL, a handler, or an option id.
 
 ```bash
 node src/cli/comm.js comm.send_card '{
@@ -201,89 +205,69 @@ node src/cli/comm.js comm.send_card '{
 }'
 ```
 
-`options` accepts a bare string (shorthand for the option text) or
-`{text, label?, id?, style?}`. `style` is `primary` | `secondary` | `danger` and
-is a rendering hint only.
+`summary` doubles as the plain-text projection for clients that cannot render a
+card, so it is required rather than derived. The card body defaults to a single
+text block holding `summary`; pass `text` for different wording, or `blocks` for
+anything richer. `options` accepts a bare string (shorthand for the button
+label) or `{label, style?}`.
 
-**How the answer gets back to you.** Tapping a quick-reply button posts an
-ordinary reply on the user's behalf carrying that button's option text.
-cws-comm matches that reply text against the card's quick-reply options and
-records the conclusion on the card as `card_state.action_id` — the `id` of the
-button whose text matched. That match is also *why* two buttons may not share
-one option text: the read path would have no grounds to pick between them.
+The response is `{message_id, seq, created_at, action_ids}`.
 
-**Reading the answer back** — match on `card_state.action_id`, **never on the
-label**: the label is display text that can be reworded at any time, while the
-id is the stable identity. Derived ids are the slugified option text
-(`"Yes please"` → `yes-please`); text with no `[a-z0-9_-]` characters (e.g. pure
-CJK), and any derived id that would collide with an earlier one (`"Yes!"` and
-`"Yes?"` both slugify to `yes`), fall back to a positional `option-1`,
-`option-2`, … Pass `id` explicitly whenever you want to match on something
-meaningful — an id you supply is never rewritten **regardless of where it sits
-in the list**: a derived id that would take it yields to the positional form
-instead. A duplicate among ids *you* chose is an error rather than a silent
-renumbering.
+🔴 **Keep `action_ids`.** They are the server's ids for your options, in the
+order you supplied them, and they are how the answer is read back. Nothing else
+recovers which option was which.
 
-An option longer than the 32-code-point label cap needs an explicit shorter
-`label`: the option text itself may run to 200 code points, but it cannot
-double as the button label.
+### What you may not put in it
 
-### When the user does not press a button
+Each of these is refused with the offending field named, not dropped:
 
-The match is on reply text, so an answer in the user's own words settles
-nothing:
-
-- The user **taps a button**, or types text **exactly equal** to an option
-  (after trim + NFC) → the card settles and `card_state.action_id` is set.
-- The user replies **in their own words** ("sounds good", "行吧") → no match, no
-  `card_state`, and you are back to reading a plain reply. Handle that path;
-  it is not the exception it looks like.
-
-And note what a settled display card proves. Settlement is derived from a
-matching **reply**, not from a click — the domain comment is explicit that it
-"only means somebody answered". So treat `card_state.action_id` as *the answer*,
-never as evidence that a particular person pressed a particular button.
-
-That reply-derived settlement is confined to display cards, and cws-comm calls
-that limit a security boundary rather than an optimization: were it to apply to
-interactive cards, anyone in the conversation could post text equal to a button's
-option text and make a business card read as settled while the business never
-happened.
-
-### Three different fields all called "type"
-
-The most common way to get a 422. They must all line up, and `comm.send_card`
-sets the first two for you:
-
-| Level | Field | Value for a card |
-|---|---|---|
-| Message | `type` | `CARD` |
-| Content | `content.content_type` | `card` |
-| Block | `blocks[].type` | `text`, `markdown`, `fields`, … |
-
-### Limits (enforced locally before the request goes out)
-
-Mirrored from the cws-comm validator, so a malformed card names the offending
-field instead of returning an opaque 422. **Counts are code points, not bytes** —
-200 CJK characters are 200 code points and 600 bytes.
-
-| Field | Limit |
+| You pass | Why it is refused |
 |---|---|
-| `title` | 200 code points |
-| `summary` | 1000 code points |
-| `text` (block) | 2000 code points |
-| `fallbackText` | 512 code points — a fallback *derived* from `text` is truncated; one you pass explicitly is rejected rather than silently cut |
-| `options` | at most 5; two options may not share one option text — compared after the same trim + NFC normalization the backend applies (Go `unicode.IsSpace`, which is *not* JS `String.trim` — it strips U+0085 and keeps U+FEFF), so `"Yes"` and `"Yes "` are one option. The text you wrote is never rewritten; normalization decides equality only — or one id |
-| option text | 200 code points |
-| option label | 32 code points |
-| whole body | 64 KB serialized |
+| an option `id` | cws-comm generates ids and returns them as `action_ids`. A dropped `id` would leave you matching the answer against something the server never saw |
+| zero options | the protocol has no interaction type for a card with nothing to choose |
+| `replyTo` / `mentions` | the endpoint has no field for either. A reply-to that vanished looks exactly like one that was never asked for |
 
-### Scope
+Business parameters — an operation, a URL, a handler, an amount — have no field
+here either. This verb requests a **choice**; interactive cards that carry a
+business operation go through their own path with a registered operation and a
+`context`.
 
-`comm.send_card` sends **display-mode** cards only (`mode: "display"`), which any
-sender may post. Interactive cards — the ones carrying a business operation —
-additionally require a `context` and a registered operation, and are not covered
-by this verb.
+### Limits live in cws-comm, not here
+
+Block types, how many options, label length, duplicate-label rejection: cws-comm
+holds all of it and names the offending field when something violates it. This
+CLI deliberately does **not** restate those rules. A second copy drifts, and it
+drifts toward the stricter side — a local cap tighter than the server's makes a
+range the server accepts unreachable, with an error that blames you for it.
+
+### Reading the answer back
+
+⏳ **Not live yet.** cws-comm is still implementing the receipt message; until it
+ships, a click produces no receipt. What follows is the contract that shape will
+honour (cws-docs `interaction-receipt-contract.md`), not something observed on
+the wire.
+
+When someone answers, cws-comm posts an `INTERACTION_RECEIPT` message — and it
+posts it into the read-only `interaction_center` system DM, **not** into the
+conversation the card lives in.
+
+- **Which conversation to answer in**: `content.body.origin.conversation_id`,
+  never the receipt's own `conversation_id`. Answering the system DM is rejected
+  (`system member dm is read-only`), so getting this wrong fails loudly rather
+  than posting where nobody is reading. The bridge already resolves this — see
+  `src/lib/interaction-receipt.js`.
+- **What was chosen**: `selected_action_ids`, matched against the `action_ids`
+  you kept from the send. It is an array from day one even though today's
+  choice cards are single-select.
+- **Who chose it**: `actor.member_id` and `actor.kind`. A click is not
+  authorization — anyone in the conversation can press the button. Verify the
+  actor yourself before doing anything irreversible.
+- `content.body.text` carries a human-readable sentence so an agent that has not
+  wired any of this still receives words rather than an empty message.
+
+The old read path — cws-comm matching a **reply's text** against the option text
+and settling the card as `card_state.action_id` — is gone. Do not write anything
+that derives an answer from message text.
 
 ## Relationship with SKILL.md
 

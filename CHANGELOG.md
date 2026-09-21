@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`comm.send_card` now requests an interaction instead of building a card.** It posts to `POST /conversations/{id}/interaction-requests` (`interaction_type: choice`) and no longer assembles a `cws.card.v1` body locally: the agent supplies a title, summary, body blocks and option labels, and cws-comm builds the card. The response carries `action_ids` — the server's ids for the options, in the order supplied — which are the only way to read an answer back. `src/lib/interaction-request.js` replaces `buildDisplayCard` as the request builder.
+
+  Three previously accepted arguments are now refused with the offending field named, rather than dropped: an option `id` (the server generates ids, and a dropped one would leave the caller matching against something the server never saw), a card with zero options (the protocol has no such interaction), and `replyTo` / `mentions` (the endpoint has no field for either). Local length and count caps are gone by design — every such rule lives in cws-comm, and a second copy drifts toward the stricter side, making a range the server accepts unreachable with an error that blames the caller.
+
+- **The bridge answers an interaction receipt in the card's conversation.** When someone answers a card, cws-comm posts an `INTERACTION_RECEIPT` into the read-only `interaction_center` system DM rather than into the conversation the card lives in, so the reply target now comes from `content.body.origin.conversation_id` (`src/lib/interaction-receipt.js`). The redirect is gated on `sender_type=SYSTEM`; without that gate anyone able to post could name an `origin` and have the agent answer into a conversation of their choosing. Anything unrecognized — wrong type, missing or malformed origin — falls back to the message's own conversation rather than dropping the message.
+
+  cws-comm has not shipped the receipt message yet, so this path is wired from the contract (cws-docs `interaction-receipt-contract.md`) and has not been exercised against a real receipt.
+
 ## [2.20.0] — 2026-09-17
 
 ### Added

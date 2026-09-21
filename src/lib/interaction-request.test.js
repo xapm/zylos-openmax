@@ -79,12 +79,18 @@ test('confirm is passed through when given, and validated when malformed', () =>
   assert.throws(() => buildChoiceRequest({ ...base, options: ['Y'], confirm: {} }), (e) => e.field === 'confirm.text');
 });
 
-test('🔴 client_msg_id is always sent, so a retry cannot post a second card', () => {
+test('a key is always sent, and an identical one only comes from the caller', () => {
+  // The generated key de-dupes a retry of the same request object. Two calls
+  // are two keys, so re-running after a lost response posts a second card —
+  // surviving that is the caller's job, by keeping and resending its own id.
   const a = buildChoiceRequest({ ...base, options: ['Y'] });
   const b = buildChoiceRequest({ ...base, options: ['Y'] });
   assert.match(a.client_msg_id, /^c_/);
   assert.notEqual(a.client_msg_id, b.client_msg_id);
-  assert.equal(buildChoiceRequest({ ...base, options: ['Y'], clientMsgId: 'k1' }).client_msg_id, 'k1');
+  const k1 = buildChoiceRequest({ ...base, options: ['Y'], clientMsgId: 'k1' });
+  const k2 = buildChoiceRequest({ ...base, options: ['Y'], clientMsgId: 'k1' });
+  assert.equal(k1.client_msg_id, 'k1');
+  assert.equal(k2.client_msg_id, 'k1');
 });
 
 test('🔴 no local length or count caps — cws-comm holds those rules', () => {

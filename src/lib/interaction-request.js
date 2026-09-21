@@ -107,11 +107,18 @@ export function buildChoiceRequest(params = {}) {
     }
   }
 
-  // 🔴 Always send a key. The old card path generated one unconditionally, and
-  // losing it would make a retry after a timeout post a SECOND card — two sets
-  // of action ids, two receipts, two answers to reconcile, on the one channel
-  // whose job is authorizing irreversible things. The server de-dupes an
-  // identical key for five minutes; a caller-supplied one still wins.
+  // Always send a key, because the old card path did and a body without one
+  // cannot be de-duplicated at all. Be precise about what the generated one
+  // buys: the server de-dupes an IDENTICAL key for five minutes, and a fresh
+  // uuid per call is identical only within the call that made it. So it covers
+  // a retry of the same request object — nothing more.
+  //
+  // 🔴 It does NOT make a re-invocation safe. If the first request reached the
+  // server and only the response was lost, running the same command again mints
+  // a new key and posts a SECOND card: two sets of action ids, two receipts, two
+  // answers to reconcile, on the one channel whose job is authorizing
+  // irreversible things. A caller that wants to survive that has to keep its own
+  // `clientMsgId` and pass the same one back.
   const body = { interaction_type: 'choice', choice };
   body.client_msg_id = params.clientMsgId === undefined
     ? newClientMsgId()

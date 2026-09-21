@@ -584,8 +584,10 @@ Messages
                             # content: string | {text|body, markdown?} | {type,body} | [{type,body}]
                             # mentions auto-resolved from @name in text if omitted (array of member_id or {type,member_id})
   comm.send_card            {conversationId, title, summary, text?|blocks?, options, confirm?, clientMsgId?}
-                            # client_msg_id is generated when omitted — a retry after a timeout
-                            #   reuses it and cannot post a second card
+                            # client_msg_id is generated when omitted, which only de-dupes a retry
+                            #   of the same request. To survive a lost response, KEEP your own
+                            #   clientMsgId and pass the same one back — otherwise re-running
+                            #   posts a second card
                             # asks a choice: options ["Yes","No"] or [{label,style?}] — at least one, no id
                             # KEEP the response's action_ids: they are the server's option ids, in order,
                             # and the only way to read back which option was chosen

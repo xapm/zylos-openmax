@@ -133,70 +133,52 @@ test('validation: member_add with neither id, remove without id, batch with empt
   assert.match((await captureFailure('comm.member_remove_batch', { conversationId: 'cv-1', memberIds: [] })).error, /non-empty/);
 });
 
-test('send_card → POST .../messages with type CARD and a cws.card.v1 display body', async () => {
+test('send_card → POST .../interaction-requests with an interaction_type=choice body', async () => {
   const request = await captureRequest('comm.send_card', {
     conversationId: 'cv-card-1',
-    title: '需要确认',
-    summary: '是否继续部署?',
-    options: ['是', '否'],
+    title: 'Confirm',
+    summary: 'Continue the deploy?',
+    options: ['Yes', 'No'],
   });
 
   assert.equal(request.method, 'POST');
-  assert.equal(request.url, '/api/v1/conversations/cv-card-1/messages');
-  // The message-level type, the content-level content_type and the schema are
-  // three different fields that all have to line up; cws-core rejects the
-  // message if any one of them is wrong.
-  assert.equal(request.body.type, 'CARD');
-  assert.equal(request.body.content.content_type, 'card');
-  assert.equal(request.body.content.body.schema, 'cws.card.v1');
-  assert.equal(request.body.content.body.mode, 'display');
-  assert.deepEqual(
-    request.body.content.body.actions.map((a) => [a.kind, a.operation, a.params.text]),
-    [['ui', 'ui.quick_reply', '是'], ['ui', 'ui.quick_reply', '否']],
-  );
-  assert.ok(request.body.client_msg_id, 'client_msg_id is always generated');
+  assert.equal(request.url, '/api/v1/conversations/cv-card-1/interaction-requests');
+  assert.equal(request.body.interaction_type, 'choice');
+  assert.equal(request.body.choice.title, 'Confirm');
+  assert.deepEqual(request.body.choice.options, [{ label: 'Yes' }, { label: 'No' }]);
+  // The card body is cws-comm's to build: nothing here names a schema, a mode,
+  // an operation or an option id.
+  assert.equal(request.body.choice.schema, undefined);
+  assert.equal(request.body.type, undefined);
 });
 
-test('send_card passes replyTo and an explicit mentions array through', async () => {
-  const request = await captureRequest('comm.send_card', {
-    conversationId: 'cv-card-2',
-    title: 't',
-    summary: 's',
-    replyTo: 'msg-parent',
-    mentions: ['member-9'],
-  });
-
-  assert.equal(request.body.parent_id, 'msg-parent');
-  assert.deepEqual(request.body.mentions, [{ type: 'member', member_id: 'member-9' }]);
-});
-
-test('send_card refuses a malformed card locally, naming the field', async () => {
-  // Six choices is over the frozen cap of five. The request must never leave
-  // the CLI — catching it here is the whole point of the local validation.
+test('send_card refuses an option id rather than dropping it', async () => {
+  // The server generates the ids and returns them as action_ids. A dropped id
+  // would leave the caller matching the answer against one the server never saw.
   const failure = await captureFailure('comm.send_card', {
     conversationId: 'cv-card-3',
     title: 't',
     summary: 's',
-    options: ['a', 'b', 'c', 'd', 'e', 'f'],
+    options: [{ label: 'Yes', id: 'yes' }],
   });
-  assert.match(failure.error, /^options: /);
+  assert.match(failure.error, /^options\[0\]\.id: /);
   assert.equal(failure.status, undefined, 'no HTTP round trip happened');
 });
 
-test('send_card ignores a stray body param instead of letting it hijack the card', async () => {
-  // buildSendBody has an escape hatch: a `body` carrying both `content` and
-  // `type` is passed through verbatim. send_card spreads the caller's params,
-  // so without stripping it a stray `body` would silently send something other
-  // than the card that was just built and validated.
-  const request = await captureRequest('comm.send_card', {
-    conversationId: 'cv-card-4',
-    title: 't',
-    summary: 's',
-    options: ['是'],
-    body: { type: 'AGENT_TEXT', content: { content_type: 'text', body: { text: 'hijacked' } } },
-  });
+test('send_card refuses replyTo and mentions — the endpoint has no field for them', async () => {
+  for (const extra of [{ replyTo: 'msg-parent' }, { mentions: ['member-9'] }]) {
+    const failure = await captureFailure('comm.send_card', {
+      conversationId: 'cv-card-2', title: 't', summary: 's', options: ['Yes'], ...extra,
+    });
+    assert.match(failure.error, /is not supported by interaction-requests/);
+    assert.equal(failure.status, undefined, 'no HTTP round trip happened');
+  }
+});
 
-  assert.equal(request.body.type, 'CARD');
-  assert.equal(request.body.content.content_type, 'card');
-  assert.equal(request.body.content.body.schema, 'cws.card.v1');
+test('send_card refuses a card with no options', async () => {
+  const failure = await captureFailure('comm.send_card', {
+    conversationId: 'cv-card-4', title: 't', summary: 's',
+  });
+  assert.match(failure.error, /^options: /);
+  assert.equal(failure.status, undefined, 'no HTTP round trip happened');
 });

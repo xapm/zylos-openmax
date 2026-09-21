@@ -26,7 +26,7 @@
 import { randomUUID } from 'crypto';
 import { getForOrg, postForOrg, delForOrg, apiPath } from '../lib/client.js';
 import { looksLikeMarkdown } from '../lib/message.js';
-import { buildDisplayCard } from '../lib/card.js';
+import { buildChoiceRequest } from '../lib/interaction-request.js';
 import {
   buildMentions,
   needsRosterHydration,
@@ -443,29 +443,24 @@ const COMMANDS = {
     return post(apiPath(`/conversations/${params.conversationId}/messages`), buildSendBody(params));
   },
 
-  // ✅ POST /api/v1/conversations/{id}/messages  (type: CARD)
-  //   Send a `cws.card.v1` display card: a title/summary plus up to five
-  //   `ui.quick_reply` buttons. Use it instead of a plain-text question when
-  //   the user is picking from a few fixed answers (yes/no, approve/reject) —
-  //   the reply comes back as a stable action id rather than free text.
-  //   Interactive (business-operation) cards are out of scope here; they need
-  //   a context plus a registry entry.
-  //   buildDisplayCard() enforces the cws-comm caps locally, so a malformed
-  //   card names the offending field instead of returning an opaque 422.
-  'comm.send_card': async () => {
-    const cardBody = buildDisplayCard(params);
-    // Drop any caller-supplied `body`: buildSendBody treats one carrying both
-    // `content` and `type` as a verbatim override, which would silently send
-    // that instead of the card just built and validated here.
-    const { body: _ignoredOverride, ...rest } = params;
-    // The card body is not text, so buildSendBody's @name resolution cannot
-    // run over it; an explicit `mentions` array still passes through.
-    return post(apiPath(`/conversations/${params.conversationId}/messages`), buildSendBody({
-      ...rest,
-      type:    'CARD',
-      content: { content_type: 'card', body: cardBody },
-    }));
-  },
+  // ✅ POST /api/v1/conversations/{id}/interaction-requests
+  //   Ask the humans in a conversation to pick one of a few fixed answers.
+  //   Use it instead of a plain-text question when the answer is a choice
+  //   (yes/no, approve/reject); use plain text for open questions, for more
+  //   choices than the server allows, or when a typed explanation is wanted.
+  //
+  //   The agent states what it wants — title, body blocks, option labels — and
+  //   cws-comm builds the card. Nothing here names an operation, a URL, a
+  //   handler or an option id.
+  //
+  //   🔴 Keep the `action_ids` from the response. They are the server's ids for
+  //   the options, in the order supplied, and they are how the answer is read
+  //   back later; there is no way to recover which option was which without
+  //   them.
+  'comm.send_card': async () => post(
+    apiPath(`/conversations/${params.conversationId}/interaction-requests`),
+    buildChoiceRequest(params),
+  ),
 
   // ✅ GET /api/v1/conversations/{id}/messages/{msg_id}
   'comm.get_message': () => get(
@@ -588,9 +583,10 @@ Messages
   comm.send                 {conversationId, content, replyTo?, clientMsgId?, mentions?}
                             # content: string | {text|body, markdown?} | {type,body} | [{type,body}]
                             # mentions auto-resolved from @name in text if omitted (array of member_id or {type,member_id})
-  comm.send_card            {conversationId, title, summary, text?, options?, kind?, fallbackText?, replyTo?, mentions?}
-                            # display card + up to 5 ui.quick_reply buttons; options: ["是","否"] or [{text,label?,id?,style?}]
-                            # read the answer back from card_state.action_id (match the id, never the label)
+  comm.send_card            {conversationId, title, summary, text?|blocks?, options, confirm?, clientMsgId?}
+                            # asks a choice: options ["Yes","No"] or [{label,style?}] — at least one, no id
+                            # KEEP the response's action_ids: they are the server's option ids, in order,
+                            # and the only way to read back which option was chosen
   comm.get_messages         {conversationId, afterSeq?, beforeSeq?, limit?}
   comm.get_message          {conversationId, messageId}
 

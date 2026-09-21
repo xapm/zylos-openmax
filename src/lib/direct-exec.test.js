@@ -1151,7 +1151,7 @@ test('Bug3 invokeDirect: a SIBLING SUBDOMAIN not in the catalog set is REJECTED 
         },
         { fetchImpl: impl, audit: quietAudit },
       ),
-      (e) => e.status === 403 && /SSRF|not a known host/i.test(e.message),
+      (e) => e.status === 403 && /SSRF|not a known origin/i.test(e.message),
     );
     assert.equal(calls.length, 0, 'a sibling subdomain not in the catalog set emits no request');
     assert.equal(received.length, 0, 'the real server is never hit');
@@ -1175,9 +1175,42 @@ test('Bug3 invokeDirect: no derivable trusted host (empty allowlist) → 422, no
       },
       { fetchImpl: impl, audit: quietAudit },
     ),
-    (e) => e.status === 422 && /provider host/i.test(e.message),
+    (e) => e.status === 422 && /provider origin/i.test(e.message),
   );
-  assert.equal(calls.length, 0, 'an undeterminable provider host must produce NO request');
+  assert.equal(calls.length, 0, 'an undeterminable provider origin must produce NO request');
+});
+
+test('Bug3-SEC P1 invokeDirect: SAME HOST, DIFFERENT PORT is REJECTED (403), zero request (origin, not hostname)', async () => {
+  // Catalog origin is :443 (default https); a download to the SAME host on :8443
+  // is a different service/origin and must NOT receive the connection token.
+  const PORTED = { toolkit: 't', action: 'dl', method: 'GET', url_template: 'https://tenant.example:443/api/files/{id}', input_schema: '' };
+  const { impl, calls } = fakeFetch({ status: 200, body: {} });
+  // sanity: the legit same-origin (:443 normalizes to no port) download would be allowed
+  const trustedOK = 'https://tenant.example/api/files/9';
+  const port8443 = 'https://tenant.example:8443/admin';
+  await assert.rejects(
+    () => invokeDirect(
+      {
+        orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 't/dl',
+        params: { _download: { url: port8443 } }, catalog: [PORTED], credential: DRIVE_CRED,
+      },
+      { fetchImpl: impl, audit: quietAudit },
+    ),
+    (e) => e.status === 403 && /origin/i.test(e.message),
+    'same host on a different port must be refused',
+  );
+  assert.equal(calls.length, 0, 'a different-port target emits NO request (token never attached)');
+  // and confirm the same-origin (:443) target passes (uses a real fetch double)
+  const { impl: okImpl, calls: okCalls } = fakeFetch({ status: 200, body: { ok: true } });
+  const out = await invokeDirect(
+    {
+      orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 't/dl',
+      params: { _download: { url: trustedOK } }, catalog: [PORTED], credential: DRIVE_CRED,
+    },
+    { fetchImpl: okImpl, audit: quietAudit },
+  );
+  assert.equal(out.status_code, 200);
+  assert.equal(okCalls[0].opts.headers.Authorization, 'Bearer DLTOK', 'a legit same-origin download still gets the token');
 });
 
 test('Bug3 invokeDirect: a 3xx from the provider is NOT auto-followed with the token (returned as-is)', async () => {
@@ -1331,6 +1364,118 @@ test('Bug3 invokeDirect: the download host allowlist also derives from a connect
       (e) => e.status === 403,
     );
     assert.equal(calls.length, before, 'an off-provider host emits no request');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('Bug3-SEC P2 invokeDirect: an expired credential → download runs the PROACTIVE refresh, then succeeds with the new token', async () => {
+  const now = 2_000_000_000_000;
+  const rawBytes = Buffer.from([0xff, 0x00, 0x10]);
+  const received = [];
+  const server = http.createServer((req, res) => {
+    received.push({ auth: req.headers.authorization });
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.end(rawBytes);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { impl, calls } = forwardingFetch(`http://127.0.0.1:${server.address().port}`);
+  const acquired = [];
+  const saved = [];
+  try {
+    const out = await invokeDirect(
+      {
+        orgId: 'org-1', connection: { id: 'conn-1', applicationId: 'a' }, actionSlug: 'googledrive/files_get',
+        params: { _download: { url: 'https://www.googleapis.com/drive/v3/files/X?alt=media' } },
+        catalog: [DRIVE_GET],
+        credential: { credential_mode: 'direct', token_type: 'bearer', access_token: 'OLD', expires_at: now + 1_000 },
+      },
+      {
+        fetchImpl: impl, now: () => now,
+        acquire: async (oid, cid) => { acquired.push([oid, cid]); return { credential_mode: 'direct', token_type: 'bearer', access_token: 'NEW', expires_at: now + 3_600_000 }; },
+        saveCache: (cid, cred) => saved.push([cid, cred.access_token]),
+        audit: quietAudit,
+      },
+    );
+    assert.deepEqual(acquired, [['org-1', 'conn-1']], 'the download must proactively refresh a near-expiry token BEFORE the GET');
+    assert.deepEqual(saved, [['conn-1', 'NEW']], 'the refreshed token is re-saved');
+    assert.equal(received.at(-1).auth, 'Bearer NEW', 'the download GET uses the refreshed token');
+    assert.equal(out.status_code, 200);
+    assert.ok(Buffer.from(out.body, 'base64').equals(rawBytes));
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('Bug3-SEC P2 invokeDirect: a provider 401 on the download → exactly ONE acquire + ONE retry, then succeeds', async () => {
+  const attempts = [];
+  const server = http.createServer((req, res) => {
+    attempts.push(req.headers.authorization);
+    if (attempts.length === 1) { res.writeHead(401, { 'content-type': 'application/json' }); res.end('{"error":"expired"}'); return; }
+    res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { impl, calls } = forwardingFetch(`http://127.0.0.1:${server.address().port}`);
+  let acquires = 0;
+  try {
+    const out = await invokeDirect(
+      {
+        orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'googledrive/files_get',
+        params: { _download: { url: 'https://www.googleapis.com/drive/v3/files/X?alt=media' } },
+        catalog: [DRIVE_GET],
+        credential: { credential_mode: 'direct', token_type: 'bearer', access_token: 'OLD' }, // no expires_at → no proactive
+      },
+      {
+        fetchImpl: impl,
+        acquire: async () => { acquires += 1; return { credential_mode: 'direct', token_type: 'bearer', access_token: 'NEW' }; },
+        audit: quietAudit,
+      },
+    );
+    assert.equal(acquires, 1, 'exactly one reactive refresh');
+    assert.equal(calls.length, 2, 'original + exactly one retry');
+    assert.equal(attempts[0], 'Bearer OLD');
+    assert.equal(attempts[1], 'Bearer NEW', 'the retry carries the refreshed token');
+    assert.equal(out.status_code, 200);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('Bug3-SEC P2 invokeDirect: after a refresh that CHANGES url_placeholders so the target is no longer trusted, the retry is REFUSED (403) with ZERO second request', async () => {
+  // {base_url}-templated action: the trusted origin comes from url_placeholders.
+  const SELF = { toolkit: 'self', action: 'dl', method: 'GET', url_template: '{base_url}/api/files/{id}', input_schema: '' };
+  let serverHits = 0;
+  const server = http.createServer((req, res) => {
+    serverHits += 1;
+    res.writeHead(401, { 'content-type': 'application/json' }); // always 401 → triggers reactive refresh
+    res.end('{"error":"expired"}');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { impl, calls } = forwardingFetch(`http://127.0.0.1:${server.address().port}`);
+  let acquires = 0;
+  try {
+    await assert.rejects(
+      () => invokeDirect(
+        {
+          orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'self/dl',
+          params: { _download: { url: 'https://files.provider.example/raw/9' } },
+          catalog: [SELF],
+          // initial cred trusts files.provider.example; no expires_at → first GET runs, gets 401
+          credential: { credential_mode: 'direct', token_type: 'bearer', access_token: 'OLD', url_placeholders: { base_url: 'https://files.provider.example' } },
+        },
+        {
+          fetchImpl: impl,
+          // the refresh returns a credential whose base_url has MOVED to a different origin
+          acquire: async () => { acquires += 1; return { credential_mode: 'direct', token_type: 'bearer', access_token: 'NEW', url_placeholders: { base_url: 'https://elsewhere.example' } }; },
+          audit: quietAudit,
+        },
+      ),
+      (e) => e.status === 403 && /origin/i.test(e.message),
+      'the retry must be refused because the refreshed credential no longer trusts the target origin',
+    );
+    assert.equal(acquires, 1, 'the reactive refresh happened once');
+    assert.equal(serverHits, 1, 'ONLY the first (401) request hit the server — the retry was refused before any second GET');
+    assert.equal(calls.length, 1, 'no second fetch was issued with the new token to the now-untrusted origin');
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

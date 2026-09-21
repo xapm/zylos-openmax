@@ -727,70 +727,87 @@ export async function sendDirect(assembled, { fetchImpl = fetch } = {}) {
 // host is proven to belong to the SAME provider as the invoked action/connection.
 
 /**
- * Extract the literal lowercase hostname from a single action `url_template`,
- * substituting the connection-owned url_placeholders VERBATIM first (exactly
- * like assembleRequest's pass 1 — so a "{base_url}/…" template resolves to its
- * real host). Returns null when the template is absent, or when its authority
- * STILL contains an unresolved "{…}" placeholder after substitution (a CALLER
- * placeholder such as "{tenant}.provider.example" — we must never trust a caller
- * value to define the allowlist), or when the authority is unparseable.
+ * Extract the HTTPS/HTTP ORIGIN (scheme://host:port, with the default port
+ * normalized away) from a single action `url_template`, substituting the
+ * connection-owned url_placeholders VERBATIM first (exactly like
+ * assembleRequest's pass 1 — so a "{base_url}/…" template resolves to its real
+ * origin). Matching on ORIGIN (not just hostname) means a different port is a
+ * different service and is NOT admitted. Returns null when the template is
+ * absent, or when its authority STILL contains an unresolved "{…}" placeholder
+ * after substitution (a CALLER placeholder such as "{tenant}.provider.example" —
+ * we must never trust a caller value to define the allowlist), or when the
+ * authority is unparseable.
  */
-function templateHost(template, uph) {
+function templateOrigin(template, uph) {
   if (typeof template !== 'string' || !template) return null;
   const resolved = template.replace(/\{([^}]+)\}/g, (m, key) => (hasVal(uph[key]) ? String(uph[key]) : m));
   const schemeM = /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/]*)/.exec(resolved);
   if (!schemeM || !schemeM[2] || schemeM[2].includes('{') || schemeM[2].includes('}')) return null;
-  try { return new URL(`${schemeM[1]}${schemeM[2]}`).hostname.toLowerCase().replace(/\.$/, ''); }
+  try { const o = new URL(`${schemeM[1]}${schemeM[2]}`).origin; return o && o !== 'null' ? o : null; }
   catch { return null; }
 }
 
 /**
- * Collect the EXACT-host allowlist for a Bug3 download, from
+ * Collect the EXACT-ORIGIN allowlist for a Bug3 download, from
  * operator/provider-controlled (never caller-supplied) sources only:
- *   - the hostname of EVERY entry in the local action `catalog`'s url_template
+ *   - the origin of EVERY entry in the local action `catalog`'s url_template
  *     (the full provider surface this connection is scoped to), plus the invoked
- *     `actionDef`'s own host, each resolved via templateHost (connection
+ *     `actionDef`'s own origin, each resolved via templateOrigin (connection
  *     url_placeholders substituted verbatim; templates whose authority is still
  *     a caller "{…}" placeholder are skipped), and
- *   - the hostname of the connection's `url_placeholders.base_url` (self-hosted
- *     connectors whose base_url IS the provider host).
- * De-duplicated, lowercase, trailing dot stripped.
+ *   - the origin of the connection's `url_placeholders.base_url` (self-hosted
+ *     connectors whose base_url IS the provider origin).
+ * De-duplicated. Each member is `scheme://host[:port]` (default port removed).
  *
- * SECURITY: this is an EXACT-host allowlist — the download host must equal a
- * member. There is deliberately NO registrable-domain / sibling-subdomain
- * admission: without a Public Suffix List that heuristic cannot tell a real
- * registrable domain from a multi-label public suffix or a tenant-per-subdomain
- * SaaS, so it would admit e.g. attacker.atlassian.net under acme.atlassian.net
- * and exfiltrate the connection token. If a provider's genuine download host is
- * not among its own catalog hosts, failing closed (403) is the correct default;
- * a per-connection operator allowlist is a possible future opt-in, not a hole
- * opened by default.
+ * SECURITY: this is an EXACT-ORIGIN allowlist — the download URL's origin must
+ * equal a member. Origin (not hostname) so a SAME-HOST DIFFERENT-PORT target
+ * (e.g. catalog "https://tenant.example:443/…" vs download
+ * "https://tenant.example:8443/admin") is a different service and is REFUSED.
+ * There is deliberately NO registrable-domain / sibling-subdomain admission:
+ * without a Public Suffix List that heuristic cannot tell a real registrable
+ * domain from a multi-label public suffix or a tenant-per-subdomain SaaS, so it
+ * would admit e.g. attacker.atlassian.net under acme.atlassian.net and
+ * exfiltrate the connection token. If a provider's genuine download origin is
+ * not among its own catalog origins, failing closed (403) is the correct
+ * default; a per-connection operator allowlist is a possible future opt-in, not
+ * a hole opened by default.
  */
-function deriveTrustedHosts(catalog, actionDef, urlPlaceholders) {
+function deriveTrustedOrigins(catalog, actionDef, urlPlaceholders) {
   const uph = (urlPlaceholders && typeof urlPlaceholders === 'object') ? urlPlaceholders : {};
-  const hosts = new Set();
-  const add = (h) => { if (h) hosts.add(h); };
+  const origins = new Set();
+  const add = (o) => { if (o) origins.add(o); };
   if (typeof uph.base_url === 'string' && uph.base_url) {
-    try { add(new URL(uph.base_url).hostname.toLowerCase().replace(/\.$/, '')); } catch { /* unparseable → ignore */ }
+    try { const o = new URL(uph.base_url).origin; if (o && o !== 'null') add(o); } catch { /* unparseable → ignore */ }
   }
-  add(templateHost(actionDef && actionDef.url_template, uph));
+  add(templateOrigin(actionDef && actionDef.url_template, uph));
   if (Array.isArray(catalog)) {
-    for (const entry of catalog) add(templateHost(entry && entry.url_template, uph));
+    for (const entry of catalog) add(templateOrigin(entry && entry.url_template, uph));
   }
-  return [...hosts];
+  return [...origins];
 }
 
 /**
- * Execute a Bug3 download. SSRF-guards the caller URL against this invoke's
- * EXACT-host provider allowlist (deriveTrustedHosts), attaches the connection
- * auth (via the SAME applyAuthToRequest path as normal assembly) ONLY once the
- * host passes, GETs the bytes, and normalizes them through the SAME response
- * path sendDirect uses (streaming cap + content-type branching → base64 for
- * binary, parsed text/JSON otherwise). Throws BEFORE any network call when the
- * target is invalid, non-https, or off the provider allowlist — so a rejected
- * target emits NO request.
+ * Execute a Bug3 download, integrated with the SAME OAuth refresh lifecycle as a
+ * normal invoke:
+ *   1. Validate the target (shape, https, EXACT-ORIGIN allowlist) — fail-closed
+ *      BEFORE any refresh, token attach, or network call.
+ *   2. Proactive near-expiry refresh (refreshable/OAuth only), like invokeDirect.
+ *   3. GET with the connection auth attached (same applyAuthToRequest path) —
+ *      redirect:'manual' so a 3xx is returned as-is, never auto-followed with the
+ *      token.
+ *   4. Reactive-401 backstop: on a provider 401, refresh ONCE and retry ONCE.
+ *      CRITICAL — after ANY refresh the trusted origins are RE-DERIVED from the
+ *      (possibly changed) credential and the target is RE-VALIDATED before the
+ *      retry GET, so a mutated credential can never send the token to a
+ *      now-untrusted origin.
+ * The response is normalized through the SAME path sendDirect uses (streaming
+ * cap + content-type branching → base64 for binary, parsed text/JSON otherwise).
  */
-async function invokeDownload({ catalog, actionDef, download, cred, fetchImpl, audit }) {
+async function invokeDownload({
+  catalog, actionDef, download, credential, orgId, connId,
+  fetchImpl, acquire, saveCache = () => {}, now = Date.now, skewMs = DEFAULT_EXPIRY_SKEW_MS,
+  audit, log = () => {}, warn = () => {},
+}) {
   if (download === null || typeof download !== 'object' || Array.isArray(download)
       || typeof download.url !== 'string' || !download.url) {
     throw Object.assign(new Error('_download must be an object of shape { url: "<https provider uri>" }'), { status: 400 });
@@ -801,49 +818,84 @@ async function invokeDownload({ catalog, actionDef, download, cred, fetchImpl, a
   if (parsed.protocol !== 'https:') {
     throw Object.assign(new Error(`_download.url must be https (refused non-https target "${parsed.protocol}//${parsed.host}")`), { status: 400 });
   }
-  const trusted = deriveTrustedHosts(catalog, actionDef, cred && cred.url_placeholders);
-  if (trusted.length === 0) {
-    throw Object.assign(
-      new Error('cannot determine the provider host(s) for this connection/catalog from a trusted source — a download target cannot be validated, so it is refused'),
-      { status: 422 },
-    );
-  }
-  const dlHost = parsed.hostname.toLowerCase().replace(/\.$/, '');
-  if (!trusted.includes(dlHost)) {
-    throw Object.assign(
-      new Error(`_download.url host "${dlHost}" is not a known host of this connection's provider (allowed: ${trusted.join(', ')}) — refused to prevent SSRF / credential exfiltration`),
-      { status: 403 },
-    );
-  }
-  // Host passed the allowlist → NOW attach the connection credential (same
-  // scheme/injection as assembleRequest). The token never travels with a URL
-  // that failed the check above.
-  const headers = {};
-  const url = applyAuthToRequest(
-    parsed.toString(),
-    headers,
-    cred && cred.access_token,
-    cred && cred.token_type,
-    cred && cred.auth_injection,
-  );
-  // Audit the origin+path only (never the query — an auth_injection=query
-  // provider would otherwise carry the token there).
-  audit(`[conn.direct] ↓ GET ${parsed.origin}${parsed.pathname} (download)`);
 
-  // REDIRECT SAFETY: fetch with redirect:'manual' so the runtime does NOT
-  // auto-follow a 3xx. A followed redirect would carry the connection token to a
-  // Location that has NOT been validated against the allowlist above (an open
-  // redirect on the provider → SSRF + credential exfiltration to an arbitrary
-  // host). On a 3xx we return the redirect response AS-IS (status_code + the
-  // Location header, no body / no body_encoding) without reading or following
-  // it, so the token never rides onward. A caller that trusts the Location can
-  // re-invoke _download with it (re-validated against the allowlist).
-  const res = await fetchImpl(url, { method: 'GET', headers, redirect: 'manual' });
-  if (res.status >= 300 && res.status < 400) {
-    try { if (res.body && typeof res.body.cancel === 'function') await res.body.cancel(); } catch { /* best-effort */ }
-    return { status_code: res.status, headers: headersToObject(res.headers) };
+  // Origin allowlist check against a given credential. Throws (422/403) BEFORE
+  // anything is sent; the token is never attached to a URL that fails this.
+  const validateOrigin = (c) => {
+    const trusted = deriveTrustedOrigins(catalog, actionDef, c && c.url_placeholders);
+    if (trusted.length === 0) {
+      throw Object.assign(
+        new Error('cannot determine the provider origin(s) for this connection/catalog from a trusted source — a download target cannot be validated, so it is refused'),
+        { status: 422 },
+      );
+    }
+    if (!trusted.includes(parsed.origin)) {
+      throw Object.assign(
+        new Error(`_download.url origin "${parsed.origin}" is not a known origin of this connection's provider (allowed: ${trusted.join(', ')}) — refused to prevent SSRF / credential exfiltration`),
+        { status: 403 },
+      );
+    }
+  };
+  // Re-validate against `c`, then attach the connection auth (same scheme/
+  // injection as assembleRequest). Returns the { url, headers } to GET.
+  const buildRequest = (c) => {
+    validateOrigin(c);
+    const headers = {};
+    const url = applyAuthToRequest(
+      parsed.toString(), headers,
+      c && c.access_token, c && c.token_type, c && c.auth_injection,
+    );
+    return { url, headers };
+  };
+  // A 3xx is returned AS-IS (status + Location header, no body / body_encoding)
+  // and NEVER auto-followed (redirect:'manual'), so the token never rides an
+  // open redirect to an unvalidated origin. Otherwise normalize as usual.
+  const finalize = async (res) => {
+    if (res.status >= 300 && res.status < 400) {
+      try { if (res.body && typeof res.body.cancel === 'function') await res.body.cancel(); } catch { /* best-effort */ }
+      return { status_code: res.status, headers: headersToObject(res.headers) };
+    }
+    return normalizeResponse(res);
+  };
+
+  let cred = credential;
+  // (1) fail-fast validation against the current credential, pre-refresh.
+  validateOrigin(cred);
+
+  // (2) Proactive near-expiry refresh — refreshable (OAuth) tokens with an
+  // at/near expires_at only; api_key untouched. Non-fatal on failure.
+  if (acquire && isTokenRefreshable(cred) && isTokenNearExpiry(cred, now(), skewMs)) {
+    try {
+      const fresh = await acquire(orgId, connId);
+      if (fresh && fresh.access_token) { saveCache(connId, fresh); cred = fresh; }
+      log(`[conn.direct] refreshed near-expiry token conn=${connId} (download)`);
+    } catch (e) {
+      warn(`[conn.direct] proactive refresh failed conn=${connId} (download): ${e.message}`);
+    }
   }
-  return normalizeResponse(res);
+
+  // (3) Build (RE-validates against the possibly-refreshed cred) + GET.
+  let { url, headers } = buildRequest(cred);
+  audit(`[conn.direct] ↓ GET ${parsed.origin}${parsed.pathname} (download)`);
+  let res = await fetchImpl(url, { method: 'GET', headers, redirect: 'manual' });
+
+  // (4) Reactive-401 backstop (refreshable/OAuth only): refresh ONCE + retry
+  // ONCE. RE-DERIVE + RE-VALIDATE the origin against the refreshed credential
+  // (buildRequest) BEFORE the retry — a changed credential that no longer trusts
+  // this origin throws 403 here, so the token is never sent on the retry.
+  if (res.status === 401 && acquire && isTokenRefreshable(cred)) {
+    log(`[conn.direct] provider 401 conn=${connId} (download); reactive refresh + retry once`);
+    const fresh = await acquire(orgId, connId); // if refresh itself throws, surface it
+    if (fresh && fresh.access_token) {
+      saveCache(connId, fresh);
+      cred = fresh;
+      ({ url, headers } = buildRequest(cred)); // re-validate before re-attaching the token
+      audit(`[conn.direct] ↓ GET ${parsed.origin}${parsed.pathname} (download retry)`);
+      res = await fetchImpl(url, { method: 'GET', headers, redirect: 'manual' });
+    }
+  }
+
+  return finalize(res);
 }
 
 /**
@@ -885,11 +937,17 @@ export async function invokeDirect(
   // diverts to a raw byte GET of a caller-supplied provider URI (the ONLY path
   // that may fetch a caller URL), gated to the same provider as this action/
   // connection. It intentionally skips input_schema validation (the action's
-  // body schema does not describe a download) and does NOT run token refresh —
-  // it uses the current cached credential. When `_download` is absent, none of
-  // this runs and the normal action-template flow below is entirely unaffected.
+  // body schema does not describe a download) but runs the SAME OAuth refresh
+  // lifecycle as a normal invoke (proactive near-expiry + reactive-401-once),
+  // re-validating the target origin after any refresh. When `_download` is
+  // absent, none of this runs and the normal action-template flow below is
+  // entirely unaffected.
   if (params && params._download != null) {
-    return invokeDownload({ catalog, actionDef, download: params._download, cred: credential, fetchImpl, audit });
+    return invokeDownload({
+      catalog, actionDef, download: params._download, credential,
+      orgId, connId: connection.id,
+      fetchImpl, acquire, saveCache, now, skewMs, audit, log, warn,
+    });
   }
 
   const v = validateParams(params, actionDef.input_schema);

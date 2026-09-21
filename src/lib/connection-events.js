@@ -18,6 +18,8 @@ import {
   readIndex,
   replaceIndexFromList,
   writeCatalog,
+  invalidateCatalog,
+  countConnectionsForApp,
 } from './connect-store.js';
 import { saveCredentialCache, deleteCredentialCache, hasCredentialCache } from './credential-cache.js';
 import { upsertMcpServer, removeMcpServer, isMcpConnection } from './mcp-config.js';
@@ -282,11 +284,44 @@ export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
       // threaded index entry is our only local signal. Tear down its local MCP
       // server (best-effort) so the agent no longer holds it. Read + capture the
       // entry first; removeConnection deletes it right after.
-      const wasMcp = isMcpConnection(readIndex(idxPath).connections[connectionId]);
-      const removedSlug = readIndex(idxPath).connections[connectionId]?.slug || data.provider;
+      const existingEntry = readIndex(idxPath).connections[connectionId];
+      const wasMcp = isMcpConnection(existingEntry);
+      const removedSlug = existingEntry?.slug || data.provider;
+      // Resolve the applicationId for the catalog cleanup BEFORE removeConnection
+      // deletes the index entry. Prefer the event's application_id when it carries
+      // one, else fall back to the captured index entry (a sparse revoke/disconnect
+      // event usually carries no application_id). The action-catalog is app-keyed
+      // (connect-store.js), so without this the local action-catalog/<appId>.json
+      // survives the revoke and leaves orphaned capability metadata behind — the
+      // same cleanup the execute-time 422 path already performs (conn.js).
+      const applicationId = data.application_id || existingEntry?.applicationId || null;
       removeConnection(connectionId, idxPath);
       deleteCredentialCache(connectionId, credentialsDir);
-      log(`[${slug}] connection unindexed + credential cache cleared conn=${connectionId}`);
+      // Catalog cleanup is ORG-AWARE / reference-counted. The action-catalog is
+      // GLOBAL (action-catalog/<applicationId>.json is shared across every org —
+      // the index is per-org, the catalog is not), so a revoke in ONE org must
+      // NOT wipe the shared catalog while ANOTHER org still has a connection to
+      // the same app. removeConnection already deleted THIS connection's entry
+      // from this org's index; countConnectionsForApp then scans ALL org indexes
+      // (excludeConnectionId is belt-and-suspenders in case the entry lingered)
+      // and only a zero count — this was the last connection to the app across
+      // every org — permits the delete.
+      //
+      // Null-guard: if the applicationId can't be resolved (sparse event + no
+      // index entry), skip the catalog delete rather than throw. invalidateCatalog
+      // is idempotent and app-keyed; its `dir` override is positional (catalogDir,
+      // undefined in production → the default CATALOG_DIR).
+      if (applicationId) {
+        const others = countConnectionsForApp(applicationId, { dir: connectDir, excludeConnectionId: connectionId });
+        if (others === 0) {
+          invalidateCatalog(applicationId, catalogDir);
+          log(`[${slug}] connection unindexed + credential cache cleared + action-catalog invalidated conn=${connectionId} app=${applicationId} (last connection across all orgs)`);
+        } else {
+          log(`[${slug}] connection unindexed + credential cache cleared conn=${connectionId} app=${applicationId} (action-catalog retained — ${others} other connection(s) in other orgs still use this app)`);
+        }
+      } else {
+        log(`[${slug}] connection unindexed + credential cache cleared conn=${connectionId} (applicationId unresolved — catalog cache left as-is)`);
+      }
       if (wasMcp) {
         const r = await removeMcpServer({ id: connectionId, slug: removedSlug }, mcpDeps);
         if (r && r.ok) log(`[${slug}] MCP server removed conn=${connectionId} name=${r.name}`);

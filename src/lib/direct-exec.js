@@ -221,6 +221,45 @@ function fillTemplateValue(str, params, urlPlaceholders, consumed) {
 }
 
 /**
+ * Apply the GENERIC connection auth to a request in place. Mirrors cws-connect
+ * (and matches assembleRequest's original inline logic EXACTLY). Two paths:
+ *   - `authInjection` descriptor present ({ location, name, value_template }) →
+ *     expand value_template's literal "{token}" with the token, then place it:
+ *     location==='query' appends name=encodeURIComponent(expanded) to the URL
+ *     (URL-encoded — it rides in the query); location==='header' sets
+ *     headers[name] VERBATIM, after dropping any templated header of the same
+ *     name (case-insensitive) so the descriptor truly wins (no comma-merge).
+ *   - descriptor absent (today's 100% path) → set
+ *     headers.Authorization = canonicalAuthScheme(tokenType) + ' ' + token.
+ * Returns the (possibly query-appended) URL. `headers` is mutated in place.
+ *
+ * Extracted so BOTH normal request assembly and the Bug3 download branch inject
+ * the connection credential identically — one auth code path, no drift.
+ */
+function applyAuthToRequest(url, headers, token, tokenType, authInjection) {
+  if (authInjection && typeof authInjection === 'object' && authInjection.location && authInjection.name) {
+    const vt = typeof authInjection.value_template === 'string' ? authInjection.value_template : '{token}';
+    const expanded = vt.replace(/\{token\}/g, token == null ? '' : String(token));
+    if (authInjection.location === 'query') {
+      // Query value IS URL-encoded (it rides in the URL); header value is verbatim.
+      return `${url}${url.includes('?') ? '&' : '?'}${authInjection.name}=${encodeURIComponent(expanded)}`;
+    }
+    // Drop any templated header of the SAME NAME case-insensitively before
+    // setting ours — otherwise a template `x-api-key` and an injected
+    // `X-API-Key` both survive as distinct object keys and Node/fetch merges
+    // them into one comma-joined value, so the descriptor would not truly win.
+    const lower = authInjection.name.toLowerCase();
+    for (const k of Object.keys(headers)) {
+      if (k.toLowerCase() === lower) delete headers[k];
+    }
+    headers[authInjection.name] = expanded;
+    return url;
+  }
+  headers.Authorization = `${canonicalAuthScheme(tokenType)} ${token}`;
+  return url;
+}
+
+/**
  * Build the concrete HTTP request from an action definition + params + token.
  * Returns { method, url, headers, body }. `body` is undefined when there is no
  * body to send. Throws (status 422) when the action has no url_template (catalog
@@ -351,6 +390,31 @@ export function assembleRequest(actionDef, params = {}, token, urlPlaceholders =
   }
   let url = path + (outPairs.length ? `?${outPairs.join('&')}` : '');
 
+  // Bug2 — generic caller query passthrough. Some actions need extra query
+  // params the catalog template doesn't declare (e.g. Drive about-get's
+  // `fields=`). A caller may pass a namespaced `params._query` object whose
+  // key/values are appended to the query string just assembled above.
+  //   - QUERY-ONLY: we only ever append to the query section of the URL that
+  //     path/query assembly already produced, so `_query` can NEVER influence
+  //     the scheme, host, or path.
+  //   - Absent (or non-object) `_query` → this block is skipped entirely, so the
+  //     assembled URL is byte-for-byte identical to before this change.
+  //   - Marked consumed (BELOW, before the body is built) so it never leaks into
+  //     the request body.
+  //   - Appended BEFORE the auth-injection query append (which follows), so the
+  //     existing `?`/`&` separator logic and auth_injection behavior still hold.
+  if (params._query !== null && typeof params._query === 'object' && !Array.isArray(params._query)) {
+    consumed.add('_query');
+    for (const [k, v] of Object.entries(params._query)) {
+      if (!hasVal(v)) continue;
+      // An Array value → one `k=<enc>` pair per element; a scalar → a single pair.
+      const vals = Array.isArray(v) ? v : [v];
+      for (const el of vals) {
+        url += `${url.includes('?') ? '&' : '?'}${encodeURIComponent(k)}=${encodeURIComponent(String(el))}`;
+      }
+    }
+  }
+
   // Headers — templated headers first (Authorization is ours, never the
   // template's), then the generic auth injection is applied last so it wins.
   const headers = {};
@@ -363,27 +427,8 @@ export function assembleRequest(actionDef, params = {}, token, urlPlaceholders =
   // Generic auth injection (mirrors cws-connect). A descriptor, when present,
   // fully controls placement and wins over any templated header of the same
   // name; otherwise we fall back to the canonical Authorization header — the
-  // path taken by 100% of connections today.
-  if (authInjection && typeof authInjection === 'object' && authInjection.location && authInjection.name) {
-    const vt = typeof authInjection.value_template === 'string' ? authInjection.value_template : '{token}';
-    const expanded = vt.replace(/\{token\}/g, token == null ? '' : String(token));
-    if (authInjection.location === 'query') {
-      // Query value IS URL-encoded (it rides in the URL); header value is verbatim.
-      url += `${url.includes('?') ? '&' : '?'}${authInjection.name}=${encodeURIComponent(expanded)}`;
-    } else {
-      // Drop any templated header of the SAME NAME case-insensitively before
-      // setting ours — otherwise a template `x-api-key` and an injected
-      // `X-API-Key` both survive as distinct object keys and Node/fetch merges
-      // them into one comma-joined value, so the descriptor would not truly win.
-      const lower = authInjection.name.toLowerCase();
-      for (const k of Object.keys(headers)) {
-        if (k.toLowerCase() === lower) delete headers[k];
-      }
-      headers[authInjection.name] = expanded;
-    }
-  } else {
-    headers.Authorization = `${canonicalAuthScheme(tokenType)} ${token}`;
-  }
+  // path taken by 100% of connections today. (Applied after any _query pairs.)
+  url = applyAuthToRequest(url, headers, token, tokenType, authInjection);
 
   // Body — every param not consumed by a placeholder, for body-bearing methods.
   let body;
@@ -637,13 +682,14 @@ function isTextualContentType(contentType) {
  *     discriminator so the caller can round-trip losslessly. utf8-decoding these
  *     would replace every non-utf8 byte with U+FFFD, corrupting the body.
  */
-export async function sendDirect(assembled, { fetchImpl = fetch } = {}) {
-  const res = await fetchImpl(assembled.url, {
-    method: assembled.method,
-    headers: assembled.headers,
-    body: assembled.body !== undefined ? JSON.stringify(assembled.body) : undefined,
-  });
-
+/**
+ * Normalize a fetch Response into the server-parity `{ status_code, headers,
+ * body }` shape, reading the body with the streaming byte cap and choosing the
+ * decode from the content-type (textual → utf8/JSON; binary → base64 +
+ * body_encoding). Extracted so the normal send path and the Bug3 download branch
+ * share ONE response path (same cap, same content-type branching) — no drift.
+ */
+async function normalizeResponse(res) {
   const buf = await readCappedBytes(res);
   const headers = headersToObject(res.headers);
   const contentType = getHeaderValue(res.headers, 'content-type');
@@ -657,6 +703,142 @@ export async function sendDirect(assembled, { fetchImpl = fetch } = {}) {
 
   // Binary passthrough — base64 so the bytes round-trip losslessly.
   return { status_code: res.status, headers, body: buf.toString('base64'), body_encoding: 'base64' };
+}
+
+export async function sendDirect(assembled, { fetchImpl = fetch } = {}) {
+  const res = await fetchImpl(assembled.url, {
+    method: assembled.method,
+    headers: assembled.headers,
+    body: assembled.body !== undefined ? JSON.stringify(assembled.body) : undefined,
+  });
+  return normalizeResponse(res);
+}
+
+// ---------------------------------------------------------------------------
+//  Bug3 — generic, SSRF-safe download branch
+// ---------------------------------------------------------------------------
+//
+// Drive file download (and similar) needs to GET raw bytes from a provider URI
+// (`.../files/{id}?alt=media`, or a `downloadUri` returned by a prior call). No
+// action template can fetch a caller-supplied URI, and a free-URI fetch was
+// deliberately disallowed (SSRF + credential exfiltration). This branch adds one
+// generic, provider-scoped exception: a caller may pass `params._download = {
+// url }`, and the URL is fetched with the connection credential ONLY when its
+// host is proven to belong to the SAME provider as the invoked action/connection.
+
+/**
+ * Reduce a hostname to a registrable-domain CANDIDATE used to admit sibling
+ * subdomains of the same provider (so an action host "www.googleapis.com" admits
+ * "*.googleapis.com"). We strip exactly ONE leftmost sub-domain label and floor
+ * the result at two labels, so we can never reduce to a bare TLD. This is a
+ * label-aware heuristic, NOT a Public Suffix List lookup: a provider hosted
+ * directly under a multi-label public suffix (e.g. "*.co.uk", or a
+ * tenant-per-subdomain SaaS like "*.atlassian.net") could over-admit sibling
+ * subdomains. See the design note reported with this change; for the mainline
+ * providers (googleapis.com, github.com, dropboxapi.com, …) it is exact.
+ */
+function registrableDomain(host) {
+  const labels = String(host || '').toLowerCase().split('.').filter(Boolean);
+  if (labels.length <= 2) return labels.join('.');
+  return labels.slice(1).join('.');
+}
+
+/**
+ * Same-provider host check. Allow iff the download host EQUALS the trusted host,
+ * is a SUBDOMAIN of it, or equals / is a subdomain of the trusted host's
+ * registrable-domain candidate. Strictly label-boundary aware — never a
+ * substring `includes` (which would wrongly admit "evilgoogleapis.com" or
+ * "googleapis.com.attacker.example").
+ */
+function hostWithinTrusted(downloadHost, trustedHost) {
+  const d = String(downloadHost || '').toLowerCase().replace(/\.$/, '');
+  const t = String(trustedHost || '').toLowerCase().replace(/\.$/, '');
+  if (!d || !t) return false;
+  if (d === t) return true;                 // exact host
+  if (d.endsWith(`.${t}`)) return true;     // subdomain of the trusted host
+  const reg = registrableDomain(t);
+  if (!reg || reg.indexOf('.') === -1) return false; // never treat a bare TLD as the base
+  return d === reg || d.endsWith(`.${reg}`);
+}
+
+/**
+ * Collect the TRUSTED provider hostnames for this invoke, from two
+ * operator/provider-controlled (never caller-supplied) sources:
+ *   - the invoked action's `url_template` authority (after substituting the
+ *     connection-owned url_placeholders VERBATIM, exactly like assembleRequest's
+ *     pass 1 — so a "{base_url}/…" template resolves to its real host), and
+ *   - the connection's `url_placeholders.base_url` host.
+ * A template whose authority still contains a CALLER placeholder (e.g.
+ * "{tenant}.provider.example") after that yields no literal host from the
+ * template (we cannot trust a caller value to define the allowlist). Returns a
+ * de-duplicated array of lowercase hostnames.
+ */
+function deriveTrustedHosts(actionDef, urlPlaceholders) {
+  const uph = (urlPlaceholders && typeof urlPlaceholders === 'object') ? urlPlaceholders : {};
+  const hosts = new Set();
+  const addFromUrl = (u) => { try { const h = new URL(u).hostname; if (h) hosts.add(h.toLowerCase()); } catch { /* unparseable → ignore */ } };
+  if (typeof uph.base_url === 'string' && uph.base_url) addFromUrl(uph.base_url);
+  const tmpl = actionDef && typeof actionDef.url_template === 'string' ? actionDef.url_template : '';
+  if (tmpl) {
+    const resolved = tmpl.replace(/\{([^}]+)\}/g, (m, key) => (hasVal(uph[key]) ? String(uph[key]) : m));
+    const schemeM = /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/]*)/.exec(resolved);
+    if (schemeM && schemeM[2] && !schemeM[2].includes('{') && !schemeM[2].includes('}')) {
+      addFromUrl(`${schemeM[1]}${schemeM[2]}`);
+    }
+  }
+  return [...hosts];
+}
+
+/**
+ * Execute a Bug3 download. SSRF-guards the caller URL against this invoke's
+ * trusted provider hosts, attaches the connection auth (via the SAME
+ * applyAuthToRequest path as normal assembly) ONLY once the host passes, GETs
+ * the bytes, and normalizes them through the SAME response path sendDirect uses
+ * (streaming cap + content-type branching → base64 for binary, parsed text/JSON
+ * otherwise). Throws BEFORE any network call when the target is invalid,
+ * non-https, or off the provider allowlist — so a rejected target emits NO
+ * request.
+ */
+async function invokeDownload({ actionDef, download, cred, fetchImpl, audit }) {
+  if (download === null || typeof download !== 'object' || Array.isArray(download)
+      || typeof download.url !== 'string' || !download.url) {
+    throw Object.assign(new Error('_download must be an object of shape { url: "<https provider uri>" }'), { status: 400 });
+  }
+  let parsed;
+  try { parsed = new URL(download.url); }
+  catch { throw Object.assign(new Error(`_download.url is not a valid absolute URL: ${download.url}`), { status: 400 }); }
+  if (parsed.protocol !== 'https:') {
+    throw Object.assign(new Error(`_download.url must be https (refused non-https target "${parsed.protocol}//${parsed.host}")`), { status: 400 });
+  }
+  const trusted = deriveTrustedHosts(actionDef, cred && cred.url_placeholders);
+  if (trusted.length === 0) {
+    throw Object.assign(
+      new Error('cannot determine the provider host for this connection/action from a trusted source — a download target cannot be validated, so it is refused'),
+      { status: 422 },
+    );
+  }
+  if (!trusted.some((t) => hostWithinTrusted(parsed.hostname, t))) {
+    throw Object.assign(
+      new Error(`_download.url host "${parsed.hostname}" is not within this connection's provider (allowed: ${trusted.join(', ')}) — refused to prevent SSRF / credential exfiltration`),
+      { status: 403 },
+    );
+  }
+  // Host passed the allowlist → NOW attach the connection credential (same
+  // scheme/injection as assembleRequest). The token never travels with a URL
+  // that failed the check above.
+  const headers = {};
+  const url = applyAuthToRequest(
+    parsed.toString(),
+    headers,
+    cred && cred.access_token,
+    cred && cred.token_type,
+    cred && cred.auth_injection,
+  );
+  // Audit the origin+path only (never the query — an auth_injection=query
+  // provider would otherwise carry the token there).
+  audit(`[conn.direct] ↓ GET ${parsed.origin}${parsed.pathname} (download)`);
+  const res = await fetchImpl(url, { method: 'GET', headers });
+  return normalizeResponse(res);
 }
 
 /**
@@ -693,6 +875,18 @@ export async function invokeDirect(
   if (!actionDef) {
     throw Object.assign(new Error(`unknown action "${actionSlug}" for app (not in local catalog)`), { status: 404 });
   }
+
+  // Bug3 — SSRF-safe download branch. A reserved `params._download = { url }`
+  // diverts to a raw byte GET of a caller-supplied provider URI (the ONLY path
+  // that may fetch a caller URL), gated to the same provider as this action/
+  // connection. It intentionally skips input_schema validation (the action's
+  // body schema does not describe a download) and does NOT run token refresh —
+  // it uses the current cached credential. When `_download` is absent, none of
+  // this runs and the normal action-template flow below is entirely unaffected.
+  if (params && params._download != null) {
+    return invokeDownload({ actionDef, download: params._download, cred: credential, fetchImpl, audit });
+  }
+
   const v = validateParams(params, actionDef.input_schema);
   if (!v.ok) {
     throw Object.assign(new Error(`params failed input_schema validation: ${v.errors.join('; ')}`), { status: 400 });

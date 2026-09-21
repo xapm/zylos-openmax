@@ -949,3 +949,534 @@ test('Bug1-SEC-R2 WIRE: a malicious authority value emits NO request to a real s
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+// ---------------------------------------------------------------------------
+//  Bug 2 — generic caller query passthrough. A namespaced `params._query`
+//  object is appended to the already-assembled query string (QUERY-ONLY: it can
+//  never touch scheme/host/path), then marked consumed so it never leaks into
+//  the body. Absent `_query` → byte-for-byte identical URL to before.
+// ---------------------------------------------------------------------------
+
+const NOQUERY_GET = {
+  toolkit: 't', action: 'get', method: 'GET',
+  url_template: 'https://host.example/x', input_schema: '',
+};
+
+test('Bug2 assembleRequest: _query appends onto an existing template query with "&"', () => {
+  // GMAIL_GET already has ?format={format}; _query must append with "&".
+  const req = assembleRequest(GMAIL_GET, { id: 'x', format: 'full', _query: { fields: 'a,b' } }, 'TOK');
+  assert.equal(req.url, 'https://gmail.googleapis.com/gmail/v1/users/me/messages/x?format=full&fields=a%2Cb');
+});
+
+test('Bug2 assembleRequest: _query appends with "?" when the template had no query', () => {
+  const req = assembleRequest(NOQUERY_GET, { _query: { a: '1' } }, 'TOK');
+  assert.equal(req.url, 'https://host.example/x?a=1');
+});
+
+test('Bug2 assembleRequest: multiple _query keys append in order', () => {
+  const req = assembleRequest(NOQUERY_GET, { _query: { a: '1', b: '2', c: '3' } }, 'TOK');
+  assert.equal(req.url, 'https://host.example/x?a=1&b=2&c=3');
+});
+
+test('Bug2 assembleRequest: _query keys AND values are percent-encoded', () => {
+  const req = assembleRequest(NOQUERY_GET, { _query: { 'x y': 'a b&c=d/e' } }, 'TOK');
+  assert.equal(req.url, 'https://host.example/x?x%20y=a%20b%26c%3Dd%2Fe');
+});
+
+test('Bug2 assembleRequest: an Array _query value → one repeated k=<enc> pair per element', () => {
+  const req = assembleRequest(NOQUERY_GET, { _query: { ids: ['1', '2', 'a/b'] } }, 'TOK');
+  assert.equal(req.url, 'https://host.example/x?ids=1&ids=2&ids=a%2Fb');
+});
+
+test('Bug2 assembleRequest: _query is QUERY-ONLY — it cannot alter scheme/host/path', () => {
+  // Values that WOULD repoint host/path if mishandled are inert: they are
+  // percent-encoded into the query section only.
+  const req = assembleRequest(NOQUERY_GET, { _query: { evil: 'https://attacker.example/../../admin' } }, 'TOK');
+  const u = new URL(req.url);
+  assert.equal(u.protocol, 'https:');
+  assert.equal(u.host, 'host.example');
+  assert.equal(u.pathname, '/x');
+  assert.equal(u.searchParams.get('evil'), 'https://attacker.example/../../admin');
+});
+
+test('Bug2 assembleRequest: _query does NOT leak into the request body (POST)', () => {
+  // GMAIL_SEND is a POST with no template query; _query rides the URL, `raw` is
+  // the sole body field, and `_query` must never appear in the body.
+  const req = assembleRequest(GMAIL_SEND, { raw: 'BASE64', _query: { fields: 'id' } }, 'TOK');
+  assert.equal(req.method, 'POST');
+  assert.equal(req.url, 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send?fields=id');
+  assert.deepEqual(req.body, { raw: 'BASE64' });
+  assert.ok(!('_query' in req.body), '_query must never appear in the body');
+});
+
+test('Bug2 assembleRequest: absent _query → byte-for-byte identical URL to before', () => {
+  const withoutKey = assembleRequest(GMAIL_GET, { id: 'x', format: 'full' }, 'TOK');
+  const withUndef = assembleRequest(GMAIL_GET, { id: 'x', format: 'full', _query: undefined }, 'TOK');
+  const withNull = assembleRequest(GMAIL_GET, { id: 'x', format: 'full', _query: null }, 'TOK');
+  const baseline = 'https://gmail.googleapis.com/gmail/v1/users/me/messages/x?format=full';
+  assert.equal(withoutKey.url, baseline);
+  assert.equal(withUndef.url, baseline);
+  assert.equal(withNull.url, baseline);
+});
+
+test('Bug2 assembleRequest: _query is appended BEFORE an auth_injection query pair (both survive)', () => {
+  const req = assembleRequest(
+    NOQUERY_GET, { _query: { fields: 'id' } }, 'TOK', {}, 'api_key',
+    { location: 'query', name: 'api_key', value_template: '{token}' },
+  );
+  assert.equal(req.url, 'https://host.example/x?fields=id&api_key=TOK');
+});
+
+test('Bug2 invokeDirect: _query reaches the wire and is absent from the POST body (end-to-end)', async () => {
+  const { impl, calls } = fakeFetch({ status: 200, body: { ok: true } });
+  await invokeDirect(
+    {
+      orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'gmail-messages/send',
+      params: { raw: 'B64', _query: { uploadType: 'media' } }, catalog: [GMAIL_SEND],
+      credential: { credential_mode: 'direct', token_type: 'bearer', access_token: 'T' },
+    },
+    { fetchImpl: impl, audit: quietAudit },
+  );
+  assert.equal(calls[0].url, 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send?uploadType=media');
+  assert.equal(calls[0].opts.body, JSON.stringify({ raw: 'B64' }), 'the body must carry only real body fields, never _query');
+});
+
+// ---------------------------------------------------------------------------
+//  Bug 3 — generic, SSRF-safe download branch. `params._download = { url }`
+//  GETs raw bytes from a caller-supplied provider URI, but ONLY when the URL is
+//  https AND its host is within the SAME provider as the invoked action/
+//  connection (derived from the trusted action url_template host / base_url
+//  host). Rejected targets emit NO request. Bytes flow back through the SAME
+//  streaming-cap + content-type path sendDirect uses.
+// ---------------------------------------------------------------------------
+
+const DRIVE_GET = {
+  toolkit: 'googledrive', action: 'files_get', method: 'GET',
+  url_template: 'https://www.googleapis.com/drive/v3/files/{fileId}', input_schema: '',
+};
+const DRIVE_CRED = { credential_mode: 'direct', token_type: 'bearer', access_token: 'DLTOK' };
+
+// The SSRF guard validates the URL string (scheme + host) BEFORE any socket use,
+// so we can drive it with a real node:http server via a thin forwarding fetch
+// that maps the validated https provider URL onto the loopback server. The
+// request still crosses a real socket and the response still streams back
+// through the production readCappedBytes path.
+function forwardingFetch(localBase) {
+  const calls = [];
+  const impl = async (url, opts) => {
+    calls.push({ url, opts });
+    const u = new URL(url);
+    return fetch(`${localBase}${u.pathname}${u.search}`, opts); // real fetch → real http server
+  };
+  return { impl, calls };
+}
+
+test('Bug3 invokeDirect: an allowed same-domain download → GET reaches a real server, token attached, bytes base64 round-trip', async () => {
+  // A body that is INVALID as utf8 (0xFF 0xFE 0x00 0x80) — proves no corruption.
+  const rawBytes = Buffer.from([0x25, 0x50, 0x44, 0x46, 0xff, 0xfe, 0x00, 0x80, 0xc3, 0x28]);
+  const received = [];
+  const server = http.createServer((req, res) => {
+    received.push({ url: req.url, auth: req.headers.authorization });
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.end(rawBytes);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { impl, calls } = forwardingFetch(`http://127.0.0.1:${server.address().port}`);
+  try {
+    const out = await invokeDirect(
+      {
+        orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'googledrive/files_get',
+        params: { _download: { url: 'https://www.googleapis.com/drive/v3/files/FILEID?alt=media' } },
+        catalog: [DRIVE_GET], credential: DRIVE_CRED,
+      },
+      { fetchImpl: impl, audit: quietAudit },
+    );
+    assert.equal(calls[0].url, 'https://www.googleapis.com/drive/v3/files/FILEID?alt=media', 'the validated provider URL is fetched');
+    assert.equal(received.at(-1).url, '/drive/v3/files/FILEID?alt=media', 'the real server received the GET');
+    assert.equal(received.at(-1).auth, 'Bearer DLTOK', 'the connection token is attached');
+    assert.equal(out.status_code, 200);
+    assert.equal(out.body_encoding, 'base64', 'binary content-type → base64 shape');
+    assert.ok(Buffer.from(out.body, 'base64').equals(rawBytes), 'bytes round-trip losslessly (no utf8 corruption)');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('Bug3 invokeDirect: a download host that equals ANOTHER catalog entry\'s host is allowed (exact-host union over the full catalog)', async () => {
+  // Invoked action is Drive (www.googleapis.com), but the catalog also carries a
+  // Slides action on slides.googleapis.com. A download to slides.googleapis.com
+  // is admitted because it EXACTLY matches a catalog host — not because it is a
+  // sibling subdomain (there is NO registrable-domain admission any more).
+  const SLIDES_GET = { toolkit: 'googleslides', action: 'get', method: 'GET', url_template: 'https://slides.googleapis.com/v1/presentations/{id}', input_schema: '' };
+  const received = [];
+  const server = http.createServer((req, res) => {
+    received.push({ url: req.url, auth: req.headers.authorization });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { impl, calls } = forwardingFetch(`http://127.0.0.1:${server.address().port}`);
+  try {
+    const out = await invokeDirect(
+      {
+        orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'googledrive/files_get',
+        params: { _download: { url: 'https://slides.googleapis.com/v1/presentations/P/thumbnail' } },
+        catalog: [DRIVE_GET, SLIDES_GET], credential: DRIVE_CRED,
+      },
+      { fetchImpl: impl, audit: quietAudit },
+    );
+    assert.equal(calls.length, 1, 'an exact match against any catalog host is fetched');
+    assert.equal(received.at(-1).auth, 'Bearer DLTOK');
+    assert.equal(out.status_code, 200);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('Bug3 invokeDirect: a SIBLING SUBDOMAIN not in the catalog set is REJECTED (403), zero request (tenant-SaaS hole closed)', async () => {
+  // The exact hole the registrable-domain heuristic would have opened: connection
+  // scoped to acme.atlassian.net, download pointed at attacker.atlassian.net.
+  const ATLASSIAN = { toolkit: 'jira', action: 'issue', method: 'GET', url_template: 'https://acme.atlassian.net/rest/api/3/issue/{id}', input_schema: '' };
+  const received = [];
+  const server = http.createServer((req, res) => { received.push(req.url); res.writeHead(200); res.end('{}'); });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { impl, calls } = forwardingFetch(`http://127.0.0.1:${server.address().port}`);
+  try {
+    await assert.rejects(
+      () => invokeDirect(
+        {
+          orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'jira/issue',
+          params: { _download: { url: 'https://attacker.atlassian.net/steal' } },
+          catalog: [ATLASSIAN], credential: DRIVE_CRED,
+        },
+        { fetchImpl: impl, audit: quietAudit },
+      ),
+      (e) => e.status === 403 && /SSRF|not a known origin/i.test(e.message),
+    );
+    assert.equal(calls.length, 0, 'a sibling subdomain not in the catalog set emits no request');
+    assert.equal(received.length, 0, 'the real server is never hit');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('Bug3 invokeDirect: no derivable trusted host (empty allowlist) → 422, no request', async () => {
+  // A "{base_url}"-templated action but NO url_placeholders.base_url on the
+  // credential → the authority stays an unresolved caller-less "{base_url}", so
+  // no trusted host can be derived → fail closed.
+  const SELF = { toolkit: 'self', action: 'dl', method: 'GET', url_template: '{base_url}/api/files/{id}', input_schema: '' };
+  const { impl, calls } = fakeFetch({ status: 200, body: {} });
+  await assert.rejects(
+    () => invokeDirect(
+      {
+        orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'self/dl',
+        params: { _download: { url: 'https://anything.example/x' } },
+        catalog: [SELF], credential: { credential_mode: 'direct', token_type: 'bearer', access_token: 'T' }, // no url_placeholders
+      },
+      { fetchImpl: impl, audit: quietAudit },
+    ),
+    (e) => e.status === 422 && /provider origin/i.test(e.message),
+  );
+  assert.equal(calls.length, 0, 'an undeterminable provider origin must produce NO request');
+});
+
+test('Bug3-SEC P1 invokeDirect: SAME HOST, DIFFERENT PORT is REJECTED (403), zero request (origin, not hostname)', async () => {
+  // Catalog origin is :443 (default https); a download to the SAME host on :8443
+  // is a different service/origin and must NOT receive the connection token.
+  const PORTED = { toolkit: 't', action: 'dl', method: 'GET', url_template: 'https://tenant.example:443/api/files/{id}', input_schema: '' };
+  const { impl, calls } = fakeFetch({ status: 200, body: {} });
+  // sanity: the legit same-origin (:443 normalizes to no port) download would be allowed
+  const trustedOK = 'https://tenant.example/api/files/9';
+  const port8443 = 'https://tenant.example:8443/admin';
+  await assert.rejects(
+    () => invokeDirect(
+      {
+        orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 't/dl',
+        params: { _download: { url: port8443 } }, catalog: [PORTED], credential: DRIVE_CRED,
+      },
+      { fetchImpl: impl, audit: quietAudit },
+    ),
+    (e) => e.status === 403 && /origin/i.test(e.message),
+    'same host on a different port must be refused',
+  );
+  assert.equal(calls.length, 0, 'a different-port target emits NO request (token never attached)');
+  // and confirm the same-origin (:443) target passes (uses a real fetch double)
+  const { impl: okImpl, calls: okCalls } = fakeFetch({ status: 200, body: { ok: true } });
+  const out = await invokeDirect(
+    {
+      orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 't/dl',
+      params: { _download: { url: trustedOK } }, catalog: [PORTED], credential: DRIVE_CRED,
+    },
+    { fetchImpl: okImpl, audit: quietAudit },
+  );
+  assert.equal(out.status_code, 200);
+  assert.equal(okCalls[0].opts.headers.Authorization, 'Bearer DLTOK', 'a legit same-origin download still gets the token');
+});
+
+test('Bug3 invokeDirect: a 3xx from the provider is NOT auto-followed with the token (returned as-is)', async () => {
+  let hits = 0;
+  const server = http.createServer((req, res) => {
+    hits += 1;
+    // Redirect to a DIFFERENT (unvalidated) host — must never be followed with the token.
+    res.writeHead(302, { location: 'https://attacker.example/evil', 'content-type': 'text/plain' });
+    res.end('redirecting');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { impl, calls } = forwardingFetch(`http://127.0.0.1:${server.address().port}`);
+  try {
+    const out = await invokeDirect(
+      {
+        orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'googledrive/files_get',
+        params: { _download: { url: 'https://www.googleapis.com/drive/v3/files/X?alt=media' } },
+        catalog: [DRIVE_GET], credential: DRIVE_CRED,
+      },
+      { fetchImpl: impl, audit: quietAudit },
+    );
+    assert.equal(calls.length, 1, 'redirect:manual → exactly one request, no auto-follow');
+    assert.equal(calls[0].opts.redirect, 'manual', 'the download fetch must use redirect:manual');
+    assert.equal(hits, 1, 'the provider is hit once; the Location host is NEVER contacted with the token');
+    assert.equal(out.status_code, 302, 'the redirect status is returned as-is');
+    assert.equal(String(out.headers.location || out.headers.Location), 'https://attacker.example/evil', 'the Location is surfaced to the caller');
+    assert.ok(!('body_encoding' in out), 'a redirect passthrough carries no body_encoding');
+    assert.ok(!('body' in out), 'a redirect body is not read/followed');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('Bug3 invokeDirect: a cross-domain / off-allowlist URL is REJECTED (403) and emits NO request', async () => {
+  const received = [];
+  const server = http.createServer((req, res) => { received.push(req.url); res.writeHead(200); res.end('{}'); });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { impl, calls } = forwardingFetch(`http://127.0.0.1:${server.address().port}`);
+  try {
+    for (const badUrl of [
+      'https://evil.example/steal',                 // unrelated domain
+      'https://www.googleapis.com.attacker.example/x', // suffix-spoof (naive includes would allow)
+      'https://notgoogleapis.com/x',                // substring-spoof
+    ]) {
+      await assert.rejects(
+        () => invokeDirect(
+          {
+            orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'googledrive/files_get',
+            params: { _download: { url: badUrl } }, catalog: [DRIVE_GET], credential: DRIVE_CRED,
+          },
+          { fetchImpl: impl, audit: quietAudit },
+        ),
+        (e) => e.status === 403 && /SSRF|not within/i.test(e.message),
+        `${badUrl} must be rejected`,
+      );
+    }
+    assert.equal(calls.length, 0, 'no fetch may be issued for an off-allowlist target');
+    assert.equal(received.length, 0, 'the real server must never be hit for an off-allowlist target');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('Bug3 invokeDirect: a non-https download URL is REJECTED (400), no request', async () => {
+  const { impl, calls } = fakeFetch({ status: 200, body: {} });
+  await assert.rejects(
+    () => invokeDirect(
+      {
+        orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'googledrive/files_get',
+        params: { _download: { url: 'http://www.googleapis.com/drive/v3/files/X?alt=media' } },
+        catalog: [DRIVE_GET], credential: DRIVE_CRED,
+      },
+      { fetchImpl: impl, audit: quietAudit },
+    ),
+    (e) => e.status === 400 && /https/i.test(e.message),
+  );
+  assert.equal(calls.length, 0, 'a non-https target must produce NO request');
+});
+
+test('Bug3 invokeDirect: a textual content-type download returns the TEXT shape (no body_encoding)', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('plain download body');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { impl } = forwardingFetch(`http://127.0.0.1:${server.address().port}`);
+  try {
+    const out = await invokeDirect(
+      {
+        orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'googledrive/files_get',
+        params: { _download: { url: 'https://www.googleapis.com/drive/v3/files/X?alt=media' } },
+        catalog: [DRIVE_GET], credential: DRIVE_CRED,
+      },
+      { fetchImpl: impl, audit: quietAudit },
+    );
+    assert.equal(out.status_code, 200);
+    assert.equal(out.body, 'plain download body');
+    assert.ok(!('body_encoding' in out), 'a textual download must NOT carry a body_encoding discriminator');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('Bug3 invokeDirect: absent _download → the normal action-template flow is unaffected', async () => {
+  const { impl, calls } = fakeFetch({ status: 200, body: { ok: true } });
+  await invokeDirect(
+    {
+      orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'googledrive/files_get',
+      params: { fileId: 'ABC' }, catalog: [DRIVE_GET], credential: DRIVE_CRED,
+    },
+    { fetchImpl: impl, audit: quietAudit },
+  );
+  assert.equal(calls[0].url, 'https://www.googleapis.com/drive/v3/files/ABC', 'normal template assembly, no download branch');
+  assert.equal(calls[0].opts.method, 'GET');
+});
+
+test('Bug3 invokeDirect: the download host allowlist also derives from a connection base_url (self-hosted)', async () => {
+  const received = [];
+  const server = http.createServer((req, res) => {
+    received.push({ url: req.url, auth: req.headers.authorization });
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.end(Buffer.from([0x01, 0x02, 0x03]));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { impl, calls } = forwardingFetch(`http://127.0.0.1:${server.address().port}`);
+  // A "{base_url}"-templated action: the trusted host must come from url_placeholders.base_url.
+  const SELF = { toolkit: 'self', action: 'dl', method: 'GET', url_template: '{base_url}/api/files/{id}', input_schema: '' };
+  const cred = { credential_mode: 'direct', token_type: 'api_key', access_token: 'K', url_placeholders: { base_url: 'https://files.selfhosted.example' } };
+  try {
+    // allowed: same host as base_url
+    const out = await invokeDirect(
+      {
+        orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'self/dl',
+        params: { _download: { url: 'https://files.selfhosted.example/raw/9' } }, catalog: [SELF], credential: cred,
+      },
+      { fetchImpl: impl, audit: quietAudit },
+    );
+    assert.equal(received.at(-1).auth, 'Bearer K', 'api_key token_type still injects a Bearer Authorization header');
+    assert.equal(out.body_encoding, 'base64');
+
+    // rejected: a different host entirely
+    const before = calls.length;
+    await assert.rejects(
+      () => invokeDirect(
+        {
+          orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'self/dl',
+          params: { _download: { url: 'https://other.example/raw/9' } }, catalog: [SELF], credential: cred,
+        },
+        { fetchImpl: impl, audit: quietAudit },
+      ),
+      (e) => e.status === 403,
+    );
+    assert.equal(calls.length, before, 'an off-provider host emits no request');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('Bug3-SEC P2 invokeDirect: an expired credential → download runs the PROACTIVE refresh, then succeeds with the new token', async () => {
+  const now = 2_000_000_000_000;
+  const rawBytes = Buffer.from([0xff, 0x00, 0x10]);
+  const received = [];
+  const server = http.createServer((req, res) => {
+    received.push({ auth: req.headers.authorization });
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.end(rawBytes);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { impl, calls } = forwardingFetch(`http://127.0.0.1:${server.address().port}`);
+  const acquired = [];
+  const saved = [];
+  try {
+    const out = await invokeDirect(
+      {
+        orgId: 'org-1', connection: { id: 'conn-1', applicationId: 'a' }, actionSlug: 'googledrive/files_get',
+        params: { _download: { url: 'https://www.googleapis.com/drive/v3/files/X?alt=media' } },
+        catalog: [DRIVE_GET],
+        credential: { credential_mode: 'direct', token_type: 'bearer', access_token: 'OLD', expires_at: now + 1_000 },
+      },
+      {
+        fetchImpl: impl, now: () => now,
+        acquire: async (oid, cid) => { acquired.push([oid, cid]); return { credential_mode: 'direct', token_type: 'bearer', access_token: 'NEW', expires_at: now + 3_600_000 }; },
+        saveCache: (cid, cred) => saved.push([cid, cred.access_token]),
+        audit: quietAudit,
+      },
+    );
+    assert.deepEqual(acquired, [['org-1', 'conn-1']], 'the download must proactively refresh a near-expiry token BEFORE the GET');
+    assert.deepEqual(saved, [['conn-1', 'NEW']], 'the refreshed token is re-saved');
+    assert.equal(received.at(-1).auth, 'Bearer NEW', 'the download GET uses the refreshed token');
+    assert.equal(out.status_code, 200);
+    assert.ok(Buffer.from(out.body, 'base64').equals(rawBytes));
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('Bug3-SEC P2 invokeDirect: a provider 401 on the download → exactly ONE acquire + ONE retry, then succeeds', async () => {
+  const attempts = [];
+  const server = http.createServer((req, res) => {
+    attempts.push(req.headers.authorization);
+    if (attempts.length === 1) { res.writeHead(401, { 'content-type': 'application/json' }); res.end('{"error":"expired"}'); return; }
+    res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { impl, calls } = forwardingFetch(`http://127.0.0.1:${server.address().port}`);
+  let acquires = 0;
+  try {
+    const out = await invokeDirect(
+      {
+        orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'googledrive/files_get',
+        params: { _download: { url: 'https://www.googleapis.com/drive/v3/files/X?alt=media' } },
+        catalog: [DRIVE_GET],
+        credential: { credential_mode: 'direct', token_type: 'bearer', access_token: 'OLD' }, // no expires_at → no proactive
+      },
+      {
+        fetchImpl: impl,
+        acquire: async () => { acquires += 1; return { credential_mode: 'direct', token_type: 'bearer', access_token: 'NEW' }; },
+        audit: quietAudit,
+      },
+    );
+    assert.equal(acquires, 1, 'exactly one reactive refresh');
+    assert.equal(calls.length, 2, 'original + exactly one retry');
+    assert.equal(attempts[0], 'Bearer OLD');
+    assert.equal(attempts[1], 'Bearer NEW', 'the retry carries the refreshed token');
+    assert.equal(out.status_code, 200);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('Bug3-SEC P2 invokeDirect: after a refresh that CHANGES url_placeholders so the target is no longer trusted, the retry is REFUSED (403) with ZERO second request', async () => {
+  // {base_url}-templated action: the trusted origin comes from url_placeholders.
+  const SELF = { toolkit: 'self', action: 'dl', method: 'GET', url_template: '{base_url}/api/files/{id}', input_schema: '' };
+  let serverHits = 0;
+  const server = http.createServer((req, res) => {
+    serverHits += 1;
+    res.writeHead(401, { 'content-type': 'application/json' }); // always 401 → triggers reactive refresh
+    res.end('{"error":"expired"}');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { impl, calls } = forwardingFetch(`http://127.0.0.1:${server.address().port}`);
+  let acquires = 0;
+  try {
+    await assert.rejects(
+      () => invokeDirect(
+        {
+          orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'self/dl',
+          params: { _download: { url: 'https://files.provider.example/raw/9' } },
+          catalog: [SELF],
+          // initial cred trusts files.provider.example; no expires_at → first GET runs, gets 401
+          credential: { credential_mode: 'direct', token_type: 'bearer', access_token: 'OLD', url_placeholders: { base_url: 'https://files.provider.example' } },
+        },
+        {
+          fetchImpl: impl,
+          // the refresh returns a credential whose base_url has MOVED to a different origin
+          acquire: async () => { acquires += 1; return { credential_mode: 'direct', token_type: 'bearer', access_token: 'NEW', url_placeholders: { base_url: 'https://elsewhere.example' } }; },
+          audit: quietAudit,
+        },
+      ),
+      (e) => e.status === 403 && /origin/i.test(e.message),
+      'the retry must be refused because the refreshed credential no longer trusts the target origin',
+    );
+    assert.equal(acquires, 1, 'the reactive refresh happened once');
+    assert.equal(serverHits, 1, 'ONLY the first (401) request hit the server — the retry was refused before any second GET');
+    assert.equal(calls.length, 1, 'no second fetch was issued with the new token to the now-untrusted origin');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});

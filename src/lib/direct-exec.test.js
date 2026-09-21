@@ -1102,7 +1102,12 @@ test('Bug3 invokeDirect: an allowed same-domain download → GET reaches a real 
   }
 });
 
-test('Bug3 invokeDirect: an allowed SUBDOMAIN of the provider registrable domain is accepted', async () => {
+test('Bug3 invokeDirect: a download host that equals ANOTHER catalog entry\'s host is allowed (exact-host union over the full catalog)', async () => {
+  // Invoked action is Drive (www.googleapis.com), but the catalog also carries a
+  // Slides action on slides.googleapis.com. A download to slides.googleapis.com
+  // is admitted because it EXACTLY matches a catalog host — not because it is a
+  // sibling subdomain (there is NO registrable-domain admission any more).
+  const SLIDES_GET = { toolkit: 'googleslides', action: 'get', method: 'GET', url_template: 'https://slides.googleapis.com/v1/presentations/{id}', input_schema: '' };
   const received = [];
   const server = http.createServer((req, res) => {
     received.push({ url: req.url, auth: req.headers.authorization });
@@ -1112,18 +1117,95 @@ test('Bug3 invokeDirect: an allowed SUBDOMAIN of the provider registrable domain
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { impl, calls } = forwardingFetch(`http://127.0.0.1:${server.address().port}`);
   try {
-    // action host www.googleapis.com ⇒ registrable googleapis.com ⇒ allow drive.googleapis.com (sibling subdomain)
     const out = await invokeDirect(
       {
         orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'googledrive/files_get',
-        params: { _download: { url: 'https://drive.googleapis.com/download/x' } },
+        params: { _download: { url: 'https://slides.googleapis.com/v1/presentations/P/thumbnail' } },
+        catalog: [DRIVE_GET, SLIDES_GET], credential: DRIVE_CRED,
+      },
+      { fetchImpl: impl, audit: quietAudit },
+    );
+    assert.equal(calls.length, 1, 'an exact match against any catalog host is fetched');
+    assert.equal(received.at(-1).auth, 'Bearer DLTOK');
+    assert.equal(out.status_code, 200);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('Bug3 invokeDirect: a SIBLING SUBDOMAIN not in the catalog set is REJECTED (403), zero request (tenant-SaaS hole closed)', async () => {
+  // The exact hole the registrable-domain heuristic would have opened: connection
+  // scoped to acme.atlassian.net, download pointed at attacker.atlassian.net.
+  const ATLASSIAN = { toolkit: 'jira', action: 'issue', method: 'GET', url_template: 'https://acme.atlassian.net/rest/api/3/issue/{id}', input_schema: '' };
+  const received = [];
+  const server = http.createServer((req, res) => { received.push(req.url); res.writeHead(200); res.end('{}'); });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { impl, calls } = forwardingFetch(`http://127.0.0.1:${server.address().port}`);
+  try {
+    await assert.rejects(
+      () => invokeDirect(
+        {
+          orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'jira/issue',
+          params: { _download: { url: 'https://attacker.atlassian.net/steal' } },
+          catalog: [ATLASSIAN], credential: DRIVE_CRED,
+        },
+        { fetchImpl: impl, audit: quietAudit },
+      ),
+      (e) => e.status === 403 && /SSRF|not a known host/i.test(e.message),
+    );
+    assert.equal(calls.length, 0, 'a sibling subdomain not in the catalog set emits no request');
+    assert.equal(received.length, 0, 'the real server is never hit');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('Bug3 invokeDirect: no derivable trusted host (empty allowlist) → 422, no request', async () => {
+  // A "{base_url}"-templated action but NO url_placeholders.base_url on the
+  // credential → the authority stays an unresolved caller-less "{base_url}", so
+  // no trusted host can be derived → fail closed.
+  const SELF = { toolkit: 'self', action: 'dl', method: 'GET', url_template: '{base_url}/api/files/{id}', input_schema: '' };
+  const { impl, calls } = fakeFetch({ status: 200, body: {} });
+  await assert.rejects(
+    () => invokeDirect(
+      {
+        orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'self/dl',
+        params: { _download: { url: 'https://anything.example/x' } },
+        catalog: [SELF], credential: { credential_mode: 'direct', token_type: 'bearer', access_token: 'T' }, // no url_placeholders
+      },
+      { fetchImpl: impl, audit: quietAudit },
+    ),
+    (e) => e.status === 422 && /provider host/i.test(e.message),
+  );
+  assert.equal(calls.length, 0, 'an undeterminable provider host must produce NO request');
+});
+
+test('Bug3 invokeDirect: a 3xx from the provider is NOT auto-followed with the token (returned as-is)', async () => {
+  let hits = 0;
+  const server = http.createServer((req, res) => {
+    hits += 1;
+    // Redirect to a DIFFERENT (unvalidated) host — must never be followed with the token.
+    res.writeHead(302, { location: 'https://attacker.example/evil', 'content-type': 'text/plain' });
+    res.end('redirecting');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { impl, calls } = forwardingFetch(`http://127.0.0.1:${server.address().port}`);
+  try {
+    const out = await invokeDirect(
+      {
+        orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 'googledrive/files_get',
+        params: { _download: { url: 'https://www.googleapis.com/drive/v3/files/X?alt=media' } },
         catalog: [DRIVE_GET], credential: DRIVE_CRED,
       },
       { fetchImpl: impl, audit: quietAudit },
     );
-    assert.equal(calls.length, 1, 'a same-registrable-domain subdomain is fetched');
-    assert.equal(received.at(-1).auth, 'Bearer DLTOK');
-    assert.equal(out.status_code, 200);
+    assert.equal(calls.length, 1, 'redirect:manual → exactly one request, no auto-follow');
+    assert.equal(calls[0].opts.redirect, 'manual', 'the download fetch must use redirect:manual');
+    assert.equal(hits, 1, 'the provider is hit once; the Location host is NEVER contacted with the token');
+    assert.equal(out.status_code, 302, 'the redirect status is returned as-is');
+    assert.equal(String(out.headers.location || out.headers.Location), 'https://attacker.example/evil', 'the Location is surfaced to the caller');
+    assert.ok(!('body_encoding' in out), 'a redirect passthrough carries no body_encoding');
+    assert.ok(!('body' in out), 'a redirect body is not read/followed');
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

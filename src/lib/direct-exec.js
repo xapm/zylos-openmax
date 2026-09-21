@@ -727,79 +727,70 @@ export async function sendDirect(assembled, { fetchImpl = fetch } = {}) {
 // host is proven to belong to the SAME provider as the invoked action/connection.
 
 /**
- * Reduce a hostname to a registrable-domain CANDIDATE used to admit sibling
- * subdomains of the same provider (so an action host "www.googleapis.com" admits
- * "*.googleapis.com"). We strip exactly ONE leftmost sub-domain label and floor
- * the result at two labels, so we can never reduce to a bare TLD. This is a
- * label-aware heuristic, NOT a Public Suffix List lookup: a provider hosted
- * directly under a multi-label public suffix (e.g. "*.co.uk", or a
- * tenant-per-subdomain SaaS like "*.atlassian.net") could over-admit sibling
- * subdomains. See the design note reported with this change; for the mainline
- * providers (googleapis.com, github.com, dropboxapi.com, …) it is exact.
+ * Extract the literal lowercase hostname from a single action `url_template`,
+ * substituting the connection-owned url_placeholders VERBATIM first (exactly
+ * like assembleRequest's pass 1 — so a "{base_url}/…" template resolves to its
+ * real host). Returns null when the template is absent, or when its authority
+ * STILL contains an unresolved "{…}" placeholder after substitution (a CALLER
+ * placeholder such as "{tenant}.provider.example" — we must never trust a caller
+ * value to define the allowlist), or when the authority is unparseable.
  */
-function registrableDomain(host) {
-  const labels = String(host || '').toLowerCase().split('.').filter(Boolean);
-  if (labels.length <= 2) return labels.join('.');
-  return labels.slice(1).join('.');
+function templateHost(template, uph) {
+  if (typeof template !== 'string' || !template) return null;
+  const resolved = template.replace(/\{([^}]+)\}/g, (m, key) => (hasVal(uph[key]) ? String(uph[key]) : m));
+  const schemeM = /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/]*)/.exec(resolved);
+  if (!schemeM || !schemeM[2] || schemeM[2].includes('{') || schemeM[2].includes('}')) return null;
+  try { return new URL(`${schemeM[1]}${schemeM[2]}`).hostname.toLowerCase().replace(/\.$/, ''); }
+  catch { return null; }
 }
 
 /**
- * Same-provider host check. Allow iff the download host EQUALS the trusted host,
- * is a SUBDOMAIN of it, or equals / is a subdomain of the trusted host's
- * registrable-domain candidate. Strictly label-boundary aware — never a
- * substring `includes` (which would wrongly admit "evilgoogleapis.com" or
- * "googleapis.com.attacker.example").
+ * Collect the EXACT-host allowlist for a Bug3 download, from
+ * operator/provider-controlled (never caller-supplied) sources only:
+ *   - the hostname of EVERY entry in the local action `catalog`'s url_template
+ *     (the full provider surface this connection is scoped to), plus the invoked
+ *     `actionDef`'s own host, each resolved via templateHost (connection
+ *     url_placeholders substituted verbatim; templates whose authority is still
+ *     a caller "{…}" placeholder are skipped), and
+ *   - the hostname of the connection's `url_placeholders.base_url` (self-hosted
+ *     connectors whose base_url IS the provider host).
+ * De-duplicated, lowercase, trailing dot stripped.
+ *
+ * SECURITY: this is an EXACT-host allowlist — the download host must equal a
+ * member. There is deliberately NO registrable-domain / sibling-subdomain
+ * admission: without a Public Suffix List that heuristic cannot tell a real
+ * registrable domain from a multi-label public suffix or a tenant-per-subdomain
+ * SaaS, so it would admit e.g. attacker.atlassian.net under acme.atlassian.net
+ * and exfiltrate the connection token. If a provider's genuine download host is
+ * not among its own catalog hosts, failing closed (403) is the correct default;
+ * a per-connection operator allowlist is a possible future opt-in, not a hole
+ * opened by default.
  */
-function hostWithinTrusted(downloadHost, trustedHost) {
-  const d = String(downloadHost || '').toLowerCase().replace(/\.$/, '');
-  const t = String(trustedHost || '').toLowerCase().replace(/\.$/, '');
-  if (!d || !t) return false;
-  if (d === t) return true;                 // exact host
-  if (d.endsWith(`.${t}`)) return true;     // subdomain of the trusted host
-  const reg = registrableDomain(t);
-  if (!reg || reg.indexOf('.') === -1) return false; // never treat a bare TLD as the base
-  return d === reg || d.endsWith(`.${reg}`);
-}
-
-/**
- * Collect the TRUSTED provider hostnames for this invoke, from two
- * operator/provider-controlled (never caller-supplied) sources:
- *   - the invoked action's `url_template` authority (after substituting the
- *     connection-owned url_placeholders VERBATIM, exactly like assembleRequest's
- *     pass 1 — so a "{base_url}/…" template resolves to its real host), and
- *   - the connection's `url_placeholders.base_url` host.
- * A template whose authority still contains a CALLER placeholder (e.g.
- * "{tenant}.provider.example") after that yields no literal host from the
- * template (we cannot trust a caller value to define the allowlist). Returns a
- * de-duplicated array of lowercase hostnames.
- */
-function deriveTrustedHosts(actionDef, urlPlaceholders) {
+function deriveTrustedHosts(catalog, actionDef, urlPlaceholders) {
   const uph = (urlPlaceholders && typeof urlPlaceholders === 'object') ? urlPlaceholders : {};
   const hosts = new Set();
-  const addFromUrl = (u) => { try { const h = new URL(u).hostname; if (h) hosts.add(h.toLowerCase()); } catch { /* unparseable → ignore */ } };
-  if (typeof uph.base_url === 'string' && uph.base_url) addFromUrl(uph.base_url);
-  const tmpl = actionDef && typeof actionDef.url_template === 'string' ? actionDef.url_template : '';
-  if (tmpl) {
-    const resolved = tmpl.replace(/\{([^}]+)\}/g, (m, key) => (hasVal(uph[key]) ? String(uph[key]) : m));
-    const schemeM = /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/]*)/.exec(resolved);
-    if (schemeM && schemeM[2] && !schemeM[2].includes('{') && !schemeM[2].includes('}')) {
-      addFromUrl(`${schemeM[1]}${schemeM[2]}`);
-    }
+  const add = (h) => { if (h) hosts.add(h); };
+  if (typeof uph.base_url === 'string' && uph.base_url) {
+    try { add(new URL(uph.base_url).hostname.toLowerCase().replace(/\.$/, '')); } catch { /* unparseable → ignore */ }
+  }
+  add(templateHost(actionDef && actionDef.url_template, uph));
+  if (Array.isArray(catalog)) {
+    for (const entry of catalog) add(templateHost(entry && entry.url_template, uph));
   }
   return [...hosts];
 }
 
 /**
  * Execute a Bug3 download. SSRF-guards the caller URL against this invoke's
- * trusted provider hosts, attaches the connection auth (via the SAME
- * applyAuthToRequest path as normal assembly) ONLY once the host passes, GETs
- * the bytes, and normalizes them through the SAME response path sendDirect uses
- * (streaming cap + content-type branching → base64 for binary, parsed text/JSON
- * otherwise). Throws BEFORE any network call when the target is invalid,
- * non-https, or off the provider allowlist — so a rejected target emits NO
- * request.
+ * EXACT-host provider allowlist (deriveTrustedHosts), attaches the connection
+ * auth (via the SAME applyAuthToRequest path as normal assembly) ONLY once the
+ * host passes, GETs the bytes, and normalizes them through the SAME response
+ * path sendDirect uses (streaming cap + content-type branching → base64 for
+ * binary, parsed text/JSON otherwise). Throws BEFORE any network call when the
+ * target is invalid, non-https, or off the provider allowlist — so a rejected
+ * target emits NO request.
  */
-async function invokeDownload({ actionDef, download, cred, fetchImpl, audit }) {
+async function invokeDownload({ catalog, actionDef, download, cred, fetchImpl, audit }) {
   if (download === null || typeof download !== 'object' || Array.isArray(download)
       || typeof download.url !== 'string' || !download.url) {
     throw Object.assign(new Error('_download must be an object of shape { url: "<https provider uri>" }'), { status: 400 });
@@ -810,16 +801,17 @@ async function invokeDownload({ actionDef, download, cred, fetchImpl, audit }) {
   if (parsed.protocol !== 'https:') {
     throw Object.assign(new Error(`_download.url must be https (refused non-https target "${parsed.protocol}//${parsed.host}")`), { status: 400 });
   }
-  const trusted = deriveTrustedHosts(actionDef, cred && cred.url_placeholders);
+  const trusted = deriveTrustedHosts(catalog, actionDef, cred && cred.url_placeholders);
   if (trusted.length === 0) {
     throw Object.assign(
-      new Error('cannot determine the provider host for this connection/action from a trusted source — a download target cannot be validated, so it is refused'),
+      new Error('cannot determine the provider host(s) for this connection/catalog from a trusted source — a download target cannot be validated, so it is refused'),
       { status: 422 },
     );
   }
-  if (!trusted.some((t) => hostWithinTrusted(parsed.hostname, t))) {
+  const dlHost = parsed.hostname.toLowerCase().replace(/\.$/, '');
+  if (!trusted.includes(dlHost)) {
     throw Object.assign(
-      new Error(`_download.url host "${parsed.hostname}" is not within this connection's provider (allowed: ${trusted.join(', ')}) — refused to prevent SSRF / credential exfiltration`),
+      new Error(`_download.url host "${dlHost}" is not a known host of this connection's provider (allowed: ${trusted.join(', ')}) — refused to prevent SSRF / credential exfiltration`),
       { status: 403 },
     );
   }
@@ -837,7 +829,20 @@ async function invokeDownload({ actionDef, download, cred, fetchImpl, audit }) {
   // Audit the origin+path only (never the query — an auth_injection=query
   // provider would otherwise carry the token there).
   audit(`[conn.direct] ↓ GET ${parsed.origin}${parsed.pathname} (download)`);
-  const res = await fetchImpl(url, { method: 'GET', headers });
+
+  // REDIRECT SAFETY: fetch with redirect:'manual' so the runtime does NOT
+  // auto-follow a 3xx. A followed redirect would carry the connection token to a
+  // Location that has NOT been validated against the allowlist above (an open
+  // redirect on the provider → SSRF + credential exfiltration to an arbitrary
+  // host). On a 3xx we return the redirect response AS-IS (status_code + the
+  // Location header, no body / no body_encoding) without reading or following
+  // it, so the token never rides onward. A caller that trusts the Location can
+  // re-invoke _download with it (re-validated against the allowlist).
+  const res = await fetchImpl(url, { method: 'GET', headers, redirect: 'manual' });
+  if (res.status >= 300 && res.status < 400) {
+    try { if (res.body && typeof res.body.cancel === 'function') await res.body.cancel(); } catch { /* best-effort */ }
+    return { status_code: res.status, headers: headersToObject(res.headers) };
+  }
   return normalizeResponse(res);
 }
 
@@ -884,7 +889,7 @@ export async function invokeDirect(
   // it uses the current cached credential. When `_download` is absent, none of
   // this runs and the normal action-template flow below is entirely unaffected.
   if (params && params._download != null) {
-    return invokeDownload({ actionDef, download: params._download, cred: credential, fetchImpl, audit });
+    return invokeDownload({ catalog, actionDef, download: params._download, cred: credential, fetchImpl, audit });
   }
 
   const v = validateParams(params, actionDef.input_schema);

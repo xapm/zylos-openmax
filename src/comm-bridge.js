@@ -30,7 +30,7 @@ import { WsClient, createDeduper } from './lib/ws.js';
 import { resolveInboundContent } from './lib/inbound-content.js';
 import { formatInboundForC4, formatEndpoint, newClientMsgId } from './lib/message.js';
 import { isSystemSender, systemEventPriority } from './lib/system-message.js';
-import { formatReceiptForModel, resolveReplyTarget } from './lib/interaction-receipt.js';
+import { formatReceiptForModel, receiptFacts, resolveReplyTarget } from './lib/interaction-receipt.js';
 import { isSiblingAgentSender } from './lib/dm-access.js';
 import { recordParticipants } from './lib/mention.js';
 import { getMediaUrl, downloadMedia } from './cli/as.js';
@@ -1222,7 +1222,11 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
         mediaItems,
       },
       recent,
-      { groupName, smartHint, quotedContent, orgId: orgConfig.org_id, orgName: orgConfig.org_name },
+      {
+        groupName, smartHint, quotedContent,
+        orgId: orgConfig.org_id, orgName: orgConfig.org_name,
+        receipt: receiptFacts(msg),
+      },
     );
 
     try {

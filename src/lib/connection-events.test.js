@@ -4,8 +4,19 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { handleConnectionEvent, acquireCredential, isEventForMe, sendOwnerReauthDm, buildConnectionAuthorizedNotice } from './connection-events.js';
+import { handleConnectionEvent, handleConnectionEventSerialized, serializeConnectionEvent, connectionEventKey, acquireCredential, isEventForMe, sendOwnerReauthDm, buildConnectionAuthorizedNotice } from './connection-events.js';
 import { readIndex, indexPathForOrg, upsertConnection } from './connect-store.js';
+
+// A manually-resolvable promise, to park a handler mid-flight (e.g. suspended at
+// Acquire) and interleave a second event deterministically.
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+// Drain all pending microtasks so a dispatched-but-not-awaited handler advances
+// to its next real await (macrotask boundary).
+const flush = () => new Promise((r) => setImmediate(r));
 
 // Regression coverage for the 2026-08-04 security fix: cws-core no longer
 // accepts a client-supplied agent_member_id, and its
@@ -640,4 +651,197 @@ test('connection.authorized notify is best-effort: a throwing notify never break
   } } };
   // Must resolve, not reject, despite the notify throwing.
   await handleConnectionEvent(baseOrgConfig, frame, { get, post, connectDir, credentialsDir, catalogDir, notify });
+});
+
+// -----------------------------------------------------------------------------
+// P1 concurrency: connection.* handlers dispatch fire-and-forget (comm-bridge.js),
+// so two events for the SAME connection could interleave — an in-flight refresh
+// (credential_updated, awaiting Acquire) and a following revoke — and resurrect a
+// torn-down MCP server / index entry. Two mechanisms cover every interleaving:
+//   1) per-(org+connection) serialization (handleConnectionEventSerialized), and
+//   2) a post-Acquire fence in the refresh path (skip if the connection is gone).
+// -----------------------------------------------------------------------------
+
+test('P1 concurrency FENCE: revoke completes while a credential_updated refresh is parked at Acquire → the stale refresh adds NO server; index/cache stay removed (no orphan)', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  const idxPath = indexPathForOrg('org-1', connectDir);
+  // A prior authorize seeded an active MCP connection + its cached credential.
+  upsertConnection({ connection_id: 'conn-race-1', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' }, idxPath);
+  fs.mkdirSync(credentialsDir, { recursive: true });
+  fs.writeFileSync(path.join(credentialsDir, 'conn-race-1.json'), JSON.stringify({ credential_mode: 'direct', access_token: 'old' }));
+
+  // Gate the refresh's Acquire so a revoke can run to completion WHILE the refresh
+  // is suspended at connection-events.js's acquireCredential — the exact reported race.
+  const gate = deferred();
+  const post = async () => {
+    await gate.promise;
+    return { credential_mode: 'direct', connector_kind: 'mcp', access_token: 'mcp-tok-new', token_type: 'bearer',
+      mcp_server: { transport: 'remote_http', server_url: 'https://mcp.linear.app/rpc' } };
+  };
+  const get = async () => { throw new Error('credential_updated must not call GET'); };
+  const mcp = recordingMcpExec(); // shared, so we can inspect the NET add/remove
+
+  // 1) start the refresh (sparse, NO provider) — it upserts the index then parks at Acquire.
+  const refreshP = handleConnectionEvent(baseOrgConfig,
+    { payload: { event: 'connection.credential_updated', data: { connection_id: 'conn-race-1' } } },
+    { get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w' });
+  await flush(); // let the refresh reach its Acquire await
+
+  // 2) a revoke runs to completion while the refresh is parked.
+  await handleConnectionEvent(baseOrgConfig,
+    { payload: { event: 'connection.revoked', data: { connection_id: 'conn-race-1' } } },
+    { get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w' });
+  assert.deepEqual(mcp.removeArgs(), ['mcp', 'remove', '-s', 'local', 'openmax-linear-conn-race-1'], 'revoke removed the server');
+  assert.equal(readIndex(idxPath).connections['conn-race-1'], undefined, 'revoke unindexed the connection');
+  assert.ok(!fs.existsSync(path.join(credentialsDir, 'conn-race-1.json')), 'revoke cleared the cache');
+
+  // 3) let the now-STALE refresh resume — the fence must make it a no-op.
+  gate.resolve();
+  await refreshP;
+  assert.equal(mcp.addArgs(), undefined, 'FENCE: the stale refresh must NOT add-json a server');
+  assert.equal(readIndex(idxPath).connections['conn-race-1'], undefined, 'FENCE: the stale refresh must NOT resurrect the index entry');
+  assert.ok(!fs.existsSync(path.join(credentialsDir, 'conn-race-1.json')), 'FENCE: the stale refresh must NOT re-save the credential cache');
+});
+
+test('P1 concurrency STALE: a credential_updated that arrives AFTER a revoke is a full no-op — no Acquire, no server, no resurrected index', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  const idxPath = indexPathForOrg('org-1', connectDir);
+  upsertConnection({ connection_id: 'conn-race-2', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' }, idxPath);
+  fs.mkdirSync(credentialsDir, { recursive: true });
+  fs.writeFileSync(path.join(credentialsDir, 'conn-race-2.json'), JSON.stringify({ credential_mode: 'direct', access_token: 'old' }));
+
+  let acquireCalls = 0;
+  const post = async () => { acquireCalls++; return { credential_mode: 'direct', connector_kind: 'mcp', access_token: 'x',
+    mcp_server: { transport: 'remote_http', server_url: 'https://mcp.linear.app/rpc' } }; };
+  const get = async () => ({ connections: [] });
+
+  // revoke first — clears index + cache + server.
+  const mcpRevoke = recordingMcpExec();
+  await handleConnectionEvent(baseOrgConfig,
+    { payload: { event: 'connection.revoked', data: { connection_id: 'conn-race-2' } } },
+    { get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcpRevoke.exec, mcpCwd: '/w' });
+  assert.equal(readIndex(idxPath).connections['conn-race-2'], undefined);
+
+  // a LATE/stale credential_updated (sparse) for the already-revoked connection.
+  const mcpLate = recordingMcpExec();
+  await handleConnectionEvent(baseOrgConfig,
+    { payload: { event: 'connection.credential_updated', data: { connection_id: 'conn-race-2' } } },
+    { get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcpLate.exec, mcpCwd: '/w' });
+
+  assert.equal(acquireCalls, 0, 'a stale refresh (cache already cleared by revoke) must not Acquire');
+  assert.equal(mcpLate.calls.length, 0, 'a stale refresh must not touch the MCP sink');
+  assert.equal(readIndex(idxPath).connections['conn-race-2'], undefined, 'a stale refresh must NOT resurrect the index entry');
+});
+
+test('P1 concurrency SERIALIZATION: a revoke dispatched while a refresh is in-flight WAITS its turn — refresh finishes, then revoke removes THAT server → no orphan', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  const idxPath = indexPathForOrg('org-1', connectDir);
+  upsertConnection({ connection_id: 'conn-race-3', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' }, idxPath);
+  fs.mkdirSync(credentialsDir, { recursive: true });
+  fs.writeFileSync(path.join(credentialsDir, 'conn-race-3.json'), JSON.stringify({ credential_mode: 'direct', access_token: 'old' }));
+
+  const gate = deferred();
+  const post = async () => {
+    await gate.promise;
+    return { credential_mode: 'direct', connector_kind: 'mcp', access_token: 'mcp-tok-new', token_type: 'bearer',
+      mcp_server: { transport: 'remote_http', server_url: 'https://mcp.linear.app/rpc' } };
+  };
+  const get = async () => { throw new Error('credential_updated must not call GET'); };
+  const mcp = recordingMcpExec();
+  const deps = { get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w' };
+
+  // Dispatch BOTH through the serialized entry point, fire-and-forget (as comm-bridge does).
+  const refreshP = handleConnectionEventSerialized(baseOrgConfig,
+    { payload: { event: 'connection.credential_updated', data: { connection_id: 'conn-race-3' } } }, deps);
+  const revokeP = handleConnectionEventSerialized(baseOrgConfig,
+    { payload: { event: 'connection.revoked', data: { connection_id: 'conn-race-3' } } }, deps);
+  await flush();
+
+  // Serialization: while the refresh is parked at Acquire, the revoke has NOT started.
+  assert.ok(readIndex(idxPath).connections['conn-race-3'], 'revoke is queued behind the in-flight refresh — connection still indexed');
+  assert.equal(mcp.calls.length, 0, 'neither handler has hit the CLI yet (refresh parked at Acquire, revoke queued behind it)');
+
+  // Release the refresh; both drain in arrival order.
+  gate.resolve();
+  await Promise.all([refreshP, revokeP]);
+
+  const addName = mcp.addArgs()?.[4];
+  assert.equal(addName, 'openmax-linear-conn-race-3', 'the refresh ran to completion FIRST and added the refreshed (index-slug) server');
+  // The revoke ran AFTER and removed that exact server. KEY no-orphan assertion:
+  // the LAST CLI op on the server name is a remove → nothing left registered.
+  const nameOps = mcp.calls.filter((c) => c.args[4] === 'openmax-linear-conn-race-3');
+  assert.equal(nameOps[nameOps.length - 1].args[1], 'remove', 'the LAST op on the server name must be a remove — no orphaned server');
+  assert.equal(readIndex(idxPath).connections['conn-race-3'], undefined, 'the connection ends unindexed');
+  assert.ok(!fs.existsSync(path.join(credentialsDir, 'conn-race-3.json')), 'the credential cache ends removed');
+});
+
+test('P1 concurrency SERIALIZATION (authorize→revoke): a revoke dispatched while an authorize is in-flight WAITS — authorize adds the server, then revoke removes it → no leftover', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  const idxPath = indexPathForOrg('org-1', connectDir);
+
+  const gate = deferred();
+  // Acquire (post → /credential) is gated so the authorize parks mid-flight.
+  const post = async () => {
+    await gate.promise;
+    return { credential_mode: 'direct', connector_kind: 'mcp', access_token: 'mcp-tok', token_type: 'bearer',
+      mcp_server: { transport: 'remote_http', server_url: 'https://mcp.linear.app/rpc' } };
+  };
+  const get = async (orgId, urlPath) => {
+    if (String(urlPath).endsWith('/connections')) {
+      return { connections: [{ id: 'conn-race-4', application_id: 'app-1', application_slug: 'linear', credential_mode: 'direct', status: 'active' }] };
+    }
+    return [];
+  };
+  const mcp = recordingMcpExec();
+  const deps = { get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w' };
+
+  const authP = handleConnectionEventSerialized(baseOrgConfig,
+    { payload: { event: 'connection.authorized', data: { connection_id: 'conn-race-4', provider: 'linear', credential_mode: 'direct', connector_kind: 'mcp' } } }, deps);
+  const revokeP = handleConnectionEventSerialized(baseOrgConfig,
+    { payload: { event: 'connection.revoked', data: { connection_id: 'conn-race-4' } } }, deps);
+  await flush();
+
+  // The authorize is parked at Acquire; the revoke is queued behind it (has not removed anything).
+  assert.equal(mcp.calls.length, 0, 'the revoke must not run while the authorize is in-flight (serialized)');
+
+  gate.resolve();
+  await Promise.all([authP, revokeP]);
+
+  const addName = mcp.addArgs()?.[4];
+  assert.equal(addName, 'openmax-linear-conn-race-4', 'authorize materialized the MCP server first');
+  const nameOps = mcp.calls.filter((c) => c.args[4] === 'openmax-linear-conn-race-4');
+  assert.equal(nameOps[nameOps.length - 1].args[1], 'remove', 'the LAST op on the server name is a remove — no leftover after authorize→revoke');
+  assert.equal(readIndex(idxPath).connections['conn-race-4'], undefined, 'the connection ends unindexed');
+  assert.ok(!fs.existsSync(path.join(credentialsDir, 'conn-race-4.json')), 'the credential cache ends removed');
+});
+
+test('serializeConnectionEvent: keys per org+connection — same key runs serially in arrival order; a DIFFERENT key runs in parallel (not a global lock)', async () => {
+  const order = [];
+  const gateA = deferred();
+  const kA = connectionEventKey({ org_id: 'org-1' }, 'conn-A');
+  // Two tasks on the SAME key: the second must wait for the first even though the first is blocked.
+  const a1 = serializeConnectionEvent(kA, async () => { await gateA.promise; order.push('A1'); });
+  const a2 = serializeConnectionEvent(kA, async () => { order.push('A2'); });
+  // A task on a DIFFERENT key must NOT be blocked by A1 → proves per-key, not global.
+  const b1 = serializeConnectionEvent(connectionEventKey({ org_id: 'org-1' }, 'conn-B'), async () => { order.push('B1'); });
+  await b1;
+  assert.deepEqual(order, ['B1'], 'a different-key task ran while the same-key chain was blocked (not a global lock)');
+  gateA.resolve();
+  await Promise.all([a1, a2]);
+  assert.deepEqual(order, ['B1', 'A1', 'A2'], 'same-key tasks ran one-at-a-time in arrival order');
+});
+
+test('serializeConnectionEvent: a rejecting task never poisons the chain — the next same-key task still runs', async () => {
+  const order = [];
+  const k = connectionEventKey({ org_id: 'org-1' }, 'conn-C');
+  const t1 = serializeConnectionEvent(k, async () => { order.push('C1'); throw new Error('boom'); });
+  const t2 = serializeConnectionEvent(k, async () => { order.push('C2'); });
+  await t1.catch(() => {});
+  await t2;
+  assert.deepEqual(order, ['C1', 'C2'], 'the next same-key task runs even after the previous rejected');
+});
+
+test('connectionEventKey: keys by org_id + connection_id (falls back to slug when no org_id)', () => {
+  assert.equal(connectionEventKey({ org_id: 'org-1', slug: 'acme' }, 'conn-1'), 'org-1:conn-1');
+  assert.equal(connectionEventKey({ slug: 'acme' }, 'conn-1'), 'acme:conn-1');
 });

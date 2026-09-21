@@ -1087,11 +1087,21 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
     // body (see src/lib/interaction-receipt.js). Answering the system DM would
     // be rejected by cws-comm, so the C4 envelope must carry the origin.
     const replyConvId = resolveReplyConversationId(msg);
+    // Everything the model is shown about "which conversation is this" has to
+    // describe the conversation its answer lands in, or it is asked to approve
+    // an irreversible action without being able to see who will read the
+    // approval. Only the reply-facing view moves: the read watermark, local
+    // history and the policy decision stay on the conversation the message
+    // actually arrived in, which is where its seq and membership live.
+    const replyConv = replyConvId === msg.conversation_id
+      ? conv
+      : await fetchConversation(orgConfig.org_id, replyConvId);
+    const replyConvType = (replyConv?.type || '').toLowerCase() || convType;
     if (replyConvId !== msg.conversation_id) {
-      log(`receipt [${orgConfig.slug}] msg=${msg.id} reply target ${msg.conversation_id} -> ${replyConvId}`);
+      log(`receipt [${orgConfig.slug}] msg=${msg.id} reply target ${msg.conversation_id} -> ${replyConvId} (${replyConvType})`);
     }
     const endpoint = formatEndpoint({
-      type: convType,
+      type: replyConvType,
       conversationId: replyConvId,
       threadConversationId: msg.thread_id || undefined,
       parentMessageId: msg.thread_id ? msg.parent_message_id : undefined,
@@ -1100,7 +1110,7 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
     // mode AND the bot was NOT @-mentioned. When the bot was directly @-ed we
     // want a direct reply, not a "should I respond?" deliberation.
     const smartHint = decision.mode === 'smart' && !decision.mentioned;
-    const groupName = decision.groupCfg?.name || conv?.name;
+    const groupName = decision.groupCfg?.name || replyConv?.name;
 
     // Record the display name + member_id seen in this conversation (sender +
     // group context) so an outbound `@name` can both be canonicalized to the
@@ -1179,7 +1189,7 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
     }
 
     const body = formatInboundForC4(
-      { type: convType, id: msg.conversation_id, name: groupName },
+      { type: replyConvType, id: replyConvId, name: groupName },
       { displayName: senderName },
       {
         content: displayContent,
@@ -1193,6 +1203,7 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
 
     try {
       registerConvOrg(msg.conversation_id, orgConfig.org_id);
+      if (replyConvId !== msg.conversation_id) registerConvOrg(replyConvId, orgConfig.org_id);
       await forwardToC4(endpoint, body, systemEventPriority(msg));
       log(`fwd [${orgConfig.slug}] ${convType} ${msg.conversation_id} msg=${msg.id} seq=${msg.seq}`);
       markRead(orgConfig, msg.conversation_id, msg.seq);

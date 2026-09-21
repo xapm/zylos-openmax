@@ -30,7 +30,7 @@ import { WsClient, createDeduper } from './lib/ws.js';
 import { resolveInboundContent } from './lib/inbound-content.js';
 import { formatInboundForC4, formatEndpoint, newClientMsgId } from './lib/message.js';
 import { isSystemSender, systemEventPriority } from './lib/system-message.js';
-import { formatReceiptForModel, resolveReplyConversationId } from './lib/interaction-receipt.js';
+import { formatReceiptForModel, resolveReplyTarget } from './lib/interaction-receipt.js';
 import { isSiblingAgentSender } from './lib/dm-access.js';
 import { recordParticipants } from './lib/mention.js';
 import { getMediaUrl, downloadMedia } from './cli/as.js';
@@ -1092,25 +1092,39 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
     // `interaction_center` system DM and names the card's conversation in its
     // body (see src/lib/interaction-receipt.js). Answering the system DM would
     // be rejected by cws-comm, so the C4 envelope must carry the origin.
-    const replyConvId = resolveReplyConversationId(msg);
+    const replyTarget = resolveReplyTarget(msg);
+    const replyConvId = replyTarget.conversationId;
     // Everything the model is shown about "which conversation is this" has to
     // describe the conversation its answer lands in, or it is asked to approve
     // an irreversible action without being able to see who will read the
     // approval. Only the reply-facing view moves: the read watermark, local
     // history and the policy decision stay on the conversation the message
     // actually arrived in, which is where its seq and membership live.
-    const replyConv = replyConvId === msg.conversation_id
-      ? conv
-      : await fetchConversation(orgConfig.org_id, replyConvId);
+    const replyConv = replyTarget.redirected
+      ? await fetchConversation(orgConfig.org_id, replyConvId)
+      : conv;
     const replyConvType = (replyConv?.type || '').toLowerCase() || convType;
-    if (replyConvId !== msg.conversation_id) {
-      log(`receipt [${orgConfig.slug}] msg=${msg.id} reply target ${msg.conversation_id} -> ${replyConvId} (${replyConvType})`);
+    if (replyTarget.redirected) {
+      // A redirect whose target cannot be fetched still routes correctly — only
+      // the framing degrades, and it degrades to the arrival conversation's type,
+      // which for a receipt is always the system DM. That is a wrong label, not a
+      // harmless one, so say so rather than logging a resolved-looking type.
+      if (replyConv) {
+        log(`receipt [${orgConfig.slug}] msg=${msg.id} reply target ${msg.conversation_id} -> ${replyConvId} (${replyConvType})`);
+      } else {
+        warn(`receipt [${orgConfig.slug}] msg=${msg.id} reply target ${replyConvId} could not be fetched; framing falls back to ${replyConvType}`);
+      }
     }
     const endpoint = formatEndpoint({
       type: replyConvType,
       conversationId: replyConvId,
-      threadConversationId: msg.thread_id || undefined,
-      parentMessageId: msg.thread_id ? msg.parent_message_id : undefined,
+      // Thread and parent belong to the conversation the message ARRIVED in. On
+      // a redirect they name a thread inside the read-only system DM, and the
+      // send path prefers a thread id over the conversation id — so carrying
+      // them would route the answer back to the place the redirect exists to
+      // avoid, while every log and the model's own framing said otherwise.
+      threadConversationId: replyTarget.redirected ? undefined : (msg.thread_id || undefined),
+      parentMessageId: (!replyTarget.redirected && msg.thread_id) ? msg.parent_message_id : undefined,
     });
     // smartHint mirrors zylos-feishu: only emitted when the group is in smart
     // mode AND the bot was NOT @-mentioned. When the bot was directly @-ed we
@@ -1199,7 +1213,11 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
       { displayName: senderName },
       {
         content: displayContent,
-        messageId: msg.id,
+        // <message-context> is the server-issued pair other verbs copy verbatim
+        // (channel.connect, issue origins). Pairing the origin conversation with
+        // the receipt's own id would name a message that does not live in it, so
+        // a redirect carries the card's id — the message that pair is about.
+        messageId: replyTarget.cardMessageId || msg.id,
         type: isImage ? 'image' : (isFile ? 'file' : 'text'),
         mediaItems,
       },

@@ -66,9 +66,9 @@ export function receiptOrigin(msg) {
   const body = msg.content?.body || msg.message?.content?.body;
   const origin = body?.origin;
   if (!origin || typeof origin !== 'object') return null;
-  const conversationId = nonEmptyString(origin.conversation_id);
+  const conversationId = oneLine(origin.conversation_id);
   if (!conversationId) return null;
-  const messageId = nonEmptyString(origin.message_id);
+  const messageId = oneLine(origin.message_id);
   return { conversationId, messageId: messageId || undefined };
 }
 
@@ -82,10 +82,20 @@ export function receiptOrigin(msg) {
  * conversation they picked. The gate costs nothing — a receipt from a
  * non-system sender is not a receipt.
  */
-export function resolveReplyConversationId(msg) {
+export function resolveReplyTarget(msg) {
   const own = msg?.conversation_id;
-  if (!isSystemSender(msg)) return own;
-  return receiptOrigin(msg)?.conversationId || own;
+  const origin = isSystemSender(msg) ? receiptOrigin(msg) : null;
+  if (!origin?.conversationId) return { conversationId: own, redirected: false };
+  return {
+    conversationId: origin.conversationId,
+    cardMessageId: origin.messageId,
+    redirected: origin.conversationId !== own,
+  };
+}
+
+/** The reply conversation alone, for callers that need nothing else. */
+export function resolveReplyConversationId(msg) {
+  return resolveReplyTarget(msg).conversationId;
 }
 
 /**
@@ -111,9 +121,12 @@ export function formatReceiptForModel(msg) {
   const body = msg.content?.body || msg.message?.content?.body;
   if (!body || typeof body !== 'object') return null;
 
-  const selected = Array.isArray(body.selected_action_ids)
-    ? body.selected_action_ids.map((id) => oneLine(id)).filter(Boolean)
-    : [];
+  // Count before filtering. A two-entry list with one blank entry is still a
+  // multi-select answer; letting the filter drop it back to one would print the
+  // survivor as "the answer" — the fraction-of-the-reply case the split exists
+  // to prevent.
+  const rawSelected = Array.isArray(body.selected_action_ids) ? body.selected_action_ids : [];
+  const selected = rawSelected.map((id) => oneLine(id)).filter(Boolean);
   const actionId = oneLine(body.action_id);
   if (!selected.length && !actionId) return null;
 
@@ -125,11 +138,11 @@ export function formatReceiptForModel(msg) {
   // multi-select it is one of several, and printing it as "the answer" would
   // hand the model a third of the reply to act on.
   const label = oneLine(body.label);
-  if (selected.length <= 1) {
+  if (rawSelected.length <= 1) {
     const id = selected[0] || actionId;
     lines.push(label ? `answer: ${id} (${label})` : `answer: ${id}`);
   } else {
-    lines.push(`answer: ${selected.length} options chosen — read them all`);
+    lines.push(`answer: ${rawSelected.length} options chosen — read them all`);
   }
   if (selected.length) lines.push(`selected_action_ids: ${selected.join(', ')}`);
 

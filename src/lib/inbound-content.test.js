@@ -182,6 +182,9 @@ test('a text-less structured message that is not a receipt is still empty', () =
   assert.equal(messageHasUsableContent({
     type: 'AGENT_STRUCTURED',
     sender_type: 'AGENT',
-    content: { content_type: 'json', body: { origin: { conversation_id: 'c1' } } },
+    content: {
+      content_type: 'json',
+      body: { origin: { conversation_id: 'c1' }, selected_action_ids: ['opt_0'] },
+    },
   }), false);
 });

@@ -161,6 +161,39 @@ function encodePathValue(s) {
 }
 
 /**
+ * Validate a caller value that fills a placeholder located in the URL's
+ * SCHEME/AUTHORITY (e.g. a tenant subdomain in
+ * "https://{tenant}.provider.example/..."). Unlike a path value, an authority
+ * value must NEVER be able to end or restructure the authority, or the caller
+ * could move the whole (credentialed) request to a host of their choosing.
+ *
+ * SECURITY: with "/" preserved (as encodePathValue does), `tenant =
+ * "attacker.example/x"` on the template above assembles to
+ * "https://attacker.example/x.provider.example/..." whose host parses as
+ * "attacker.example" — sending the connection's Authorization header to an
+ * attacker-chosen host (SSRF + credential exfiltration). So we ALLOWLIST only
+ * the characters a real authority token needs — host-label chars
+ * (alphanumerics, "-", "."), ":" (port) and "[" "]" (IPv6 literal) — and reject
+ * everything else (400). That refuses the authority-boundary characters "/",
+ * "\" (WHATWG treats it as "/"), "?", "#", "@" (userinfo), and "%" (no
+ * percent-encoding games), which are the ways a value could escape the host.
+ * A value that passes is authority-safe, so it is substituted VERBATIM
+ * (percent-encoding ":" would corrupt a legitimate "host:port"). A legit
+ * tenant/subdomain that merely adds a label (e.g. "acme") stays inside the
+ * template's own registrable domain ("acme.provider.example").
+ */
+function encodeAuthorityValue(s) {
+  const str = String(s);
+  if (!/^[A-Za-z0-9._:[\]-]+$/.test(str)) {
+    throw Object.assign(
+      new Error('illegal character in URL authority value (only host-label / port / IPv6 characters are allowed — it must not be able to change the request host)'),
+      { status: 400 },
+    );
+  }
+  return str;
+}
+
+/**
  * Canonicalize a credential `token_type` into the HTTP Authorization scheme word.
  * Mirrors cws-connect's `canonicalAuthScheme` (connection_service.go) EXACTLY:
  *   - ""  / "bearer" (any case) / "api_key" (any case) → "Bearer".
@@ -248,20 +281,47 @@ export function assembleRequest(actionDef, params = {}, token, urlPlaceholders =
   const pathPart = qIdx >= 0 ? template.slice(0, qIdx) : template;
   const queryPart = qIdx >= 0 ? template.slice(qIdx + 1) : '';
 
-  // Path placeholders — required. Params first (URL-encoded data), then
-  // connection-owned url_placeholders (verbatim structural prefix, e.g.
-  // "{base_url}" → "https://jenkins.example.com").
-  const path = pathPart.replace(/\{([^}]+)\}/g, (_, key) => {
+  // Path placeholders — required. Resolved in TWO passes so a caller value can
+  // never alter the URL authority (host):
+  //   Pass 1 substitutes the connection-owned url_placeholders VERBATIM. These
+  //     are trusted structural parts (scheme/host/base-URL prefix, e.g.
+  //     "{base_url}" → "https://jenkins.example.com") and legitimately contain
+  //     "://" and "/". Caller (params) placeholders are LEFT in place.
+  //   With the trusted parts revealed, we locate the URL authority (between
+  //     "scheme://" and the next "/"). Pass 2 then substitutes each caller
+  //     (params) placeholder, choosing the encoder by WHERE it sits: an
+  //     authority placeholder must not keep "/" (encodeAuthorityValue, rejects
+  //     host-boundary chars); a pathname placeholder keeps "/" for real
+  //     resource names like "people/me" (encodePathValue). Params still win over
+  //     url_placeholders on a name clash (a params placeholder is deferred to
+  //     pass 2, never overwritten by pass 1).
+  const pass1 = pathPart.replace(/\{([^}]+)\}/g, (m, key) => {
+    if (hasVal(params[key])) return m;              // caller value → defer to pass 2
+    if (hasVal(uph[key])) { consumed.add(key); return String(uph[key]); } // trusted, verbatim
+    return m;                                       // unresolved → pass 2 throws
+  });
+  // Authority span = after "scheme://" up to the next "/" (or end). Caller
+  // placeholders whose offset falls inside it fill the host/authority.
+  const schemeM = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.exec(pass1);
+  const authStart = schemeM ? schemeM[0].length : -1;
+  let authEnd = -1;
+  if (authStart >= 0) {
+    const slash = pass1.indexOf('/', authStart);
+    authEnd = slash === -1 ? pass1.length : slash;
+  }
+  const path = pass1.replace(/\{([^}]+)\}/g, (m, key, offset) => {
     consumed.add(key);
-    // Path values are encoded as DATA but keep "/" (RFC-3986 path-safe) so a
-    // resource-name param like "people/me" survives as a real path, not
-    // "people%2Fme". Query encoding (below) is unchanged — it still uses
-    // encodeURIComponent, which correctly escapes "/" in a query value.
-    if (hasVal(params[key])) return encodePathValue(params[key]);
-    if (hasVal(uph[key])) return String(uph[key]);
-    // Neither source has it. A leading "{base_url}"-style placeholder is a
-    // connection-owned URL part the credential should have carried — surface it
-    // as a 422 (connection/credential too old) rather than a missing-param 400.
+    if (hasVal(params[key])) {
+      const inAuthority = authStart >= 0 && offset >= authStart && offset < authEnd;
+      // Authority values NEVER keep "/" (host-safe, rejects boundary chars);
+      // pathname values are DATA that keeps "/" so "people/me" stays a real
+      // path. Query encoding (below) is unchanged (always encodeURIComponent).
+      return inAuthority ? encodeAuthorityValue(params[key]) : encodePathValue(params[key]);
+    }
+    // Neither source has it (uph was already folded in pass 1). A leading
+    // "{base_url}"-style placeholder is a connection-owned URL part the
+    // credential should have carried — surface it as a 422 (connection/
+    // credential too old) rather than a missing-param 400.
     if (pathPart.startsWith(`{${key}}`)) {
       throw Object.assign(
         new Error(`connection is missing URL placeholder "${key}" (e.g. base_url) — reconnect the connection or refresh the credential; url_placeholders did not provide it`),

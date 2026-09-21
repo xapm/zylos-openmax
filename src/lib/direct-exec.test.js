@@ -850,3 +850,102 @@ test('Bug1-SEC WIRE: a legit "/"-path reaches a real server un-escaped; the OLD 
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+// ---------------------------------------------------------------------------
+//  Bug 1 SECURITY R2 — an AUTHORITY (hostname) placeholder must not let a
+//  caller move the credentialed request to a host of their choosing. Path
+//  placeholders before "?" used to ALL get pathname treatment (keep "/"), so a
+//  placeholder inside the authority — "https://{tenant}.provider.example/…" —
+//  let "tenant=attacker.example/x" assemble to
+//  "https://attacker.example/x.provider.example/…", host = "attacker.example",
+//  with the Authorization header attached. Authority placeholders are now
+//  classified separately and strict-validated.
+// ---------------------------------------------------------------------------
+
+const TENANT_HOST = {
+  toolkit: 't', action: 'get', method: 'GET',
+  url_template: 'https://{tenant}.provider.example/v1/items', input_schema: '',
+};
+
+test('Bug1-SEC-R2 assembleRequest: an authority value that could change the host is REJECTED (400), host unchanged', () => {
+  for (const bad of ['attacker.example/x', 'a/../b', 'evil\\x', 'u@evil', 'x?y', 'x#y', 'a%2f b', 'a b']) {
+    assert.throws(
+      () => assembleRequest(TENANT_HOST, { tenant: bad }, 'TOK'),
+      (e) => e.status === 400 && /authority/i.test(e.message),
+      `authority value ${JSON.stringify(bad)} must be rejected with 400`,
+    );
+  }
+});
+
+test('Bug1-SEC-R2 assembleRequest: the reported attack — tenant="attacker.example/x" cannot repoint the host', () => {
+  // Guard: the OLD path encoding would have kept "/" and let the host become attacker.example.
+  const oldEncoded = 'attacker.example/x'; // encodePathValue(old) preserved "/"
+  assert.equal(new URL(`https://${oldEncoded}.provider.example/v1/items`).host, 'attacker.example',
+    'guard: the pre-fix assembly really did repoint the host');
+  // Fix: it is rejected before a URL is ever built.
+  assert.throws(
+    () => assembleRequest(TENANT_HOST, { tenant: 'attacker.example/x' }, 'TOK'),
+    (e) => e.status === 400 && /authority/i.test(e.message),
+  );
+});
+
+test('Bug1-SEC-R2 assembleRequest: a legit authority token passes and stays inside the template domain', () => {
+  for (const [tenant, host] of [['acme', 'acme.provider.example'], ['acme-corp', 'acme-corp.provider.example'], ['a.b', 'a.b.provider.example']]) {
+    const req = assembleRequest(TENANT_HOST, { tenant }, 'TOK');
+    assert.equal(new URL(req.url).host, host, `tenant ${JSON.stringify(tenant)} → host ${host}, got ${req.url}`);
+    assert.equal(req.headers.Authorization, 'Bearer TOK');
+  }
+});
+
+test('Bug1-SEC-R2 assembleRequest: authority + pathname placeholders coexist — path "/" preserved, host from the authority token only', () => {
+  const def = { toolkit: 't', action: 'a', method: 'GET', url_template: 'https://{tenant}.provider.example/v1/{resourceName}', input_schema: '' };
+  const req = assembleRequest(def, { tenant: 'acme', resourceName: 'people/me' }, 'TOK');
+  assert.equal(new URL(req.url).host, 'acme.provider.example');
+  assert.equal(new URL(req.url).pathname, '/v1/people/me', 'pathname "/" must still be preserved');
+  // a "/" smuggled into the AUTHORITY slot is still rejected even when a path placeholder is present
+  assert.throws(() => assembleRequest(def, { tenant: 'attacker.example/x', resourceName: 'people/me' }, 'TOK'),
+    (e) => e.status === 400 && /authority/i.test(e.message));
+});
+
+test('Bug1-SEC-R2 assembleRequest: a connection-owned {base_url} (verbatim) reveals the authority; a caller pathname param after it still keeps "/"', () => {
+  const def = { toolkit: 't', action: 'a', method: 'GET', url_template: '{base_url}/api/{resourceName}', input_schema: '' };
+  const req = assembleRequest(def, { resourceName: 'people/me' }, 'TOK', { base_url: 'https://jenkins.example.com' });
+  assert.equal(new URL(req.url).host, 'jenkins.example.com');
+  assert.equal(new URL(req.url).pathname, '/api/people/me');
+});
+
+test('Bug1-SEC-R2 WIRE: a malicious authority value emits NO request to a real server; a legit host:port authority value reaches it', async () => {
+  const received = [];
+  const server = http.createServer((req, res) => {
+    received.push({ host: req.headers.host, url: req.url });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const hostport = `127.0.0.1:${server.address().port}`;
+  const cred = { credential_mode: 'direct', token_type: 'bearer', access_token: 'T' };
+  // {hostport} is an AUTHORITY placeholder (before the first "/"); a legit host:port must pass verbatim.
+  const DEF = { toolkit: 't', action: 'get', method: 'GET', url_template: 'http://{hostport}/v1/{resourceName}', input_schema: '' };
+  try {
+    // legit host:port authority value + legit "/"-bearing pathname → reaches the real server intact
+    await invokeDirect(
+      { orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 't/get', params: { hostport, resourceName: 'people/me' }, catalog: [DEF], credential: cred },
+      { audit: quietAudit },
+    );
+    assert.equal(received.at(-1).url, '/v1/people/me', `real server must receive the un-escaped path, got ${received.at(-1) && received.at(-1).url}`);
+    assert.equal(received.at(-1).host, hostport, 'the legit host:port authority value must survive verbatim');
+
+    // malicious authority value → rejected before any request; the server is NEVER hit
+    const before = received.length;
+    await assert.rejects(
+      invokeDirect(
+        { orgId: 'o', connection: { id: 'c', applicationId: 'a' }, actionSlug: 't/get', params: { hostport: `evil.example/x`, resourceName: 'people/me' }, catalog: [DEF], credential: cred },
+        { audit: quietAudit },
+      ),
+      (e) => e.status === 400 && /authority/i.test(e.message),
+    );
+    assert.equal(received.length, before, 'a host-changing authority value must produce NO request');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});

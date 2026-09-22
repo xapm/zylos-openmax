@@ -28,6 +28,14 @@ import { getForOrg, postForOrg, delForOrg, apiPath } from '../lib/client.js';
 import { looksLikeMarkdown } from '../lib/message.js';
 import { buildChoiceRequest } from '../lib/interaction-request.js';
 import {
+  clearPendingQuestion,
+  findPendingQuestion,
+  isAnswerAuthorized,
+  isExpired,
+  listPendingQuestions,
+  recordPendingQuestion,
+} from '../lib/pending-question.js';
+import {
   buildMentions,
   needsRosterHydration,
   recordRoster,
@@ -462,6 +470,76 @@ const COMMANDS = {
     buildChoiceRequest(params),
   ),
 
+  //   Ask a question AND remember what it was, in one call.
+  //
+  //   Sending and remembering are one verb on purpose. The answer arrives later
+  //   as a separate receipt naming only the card, so a send whose `action_ids`
+  //   were not written down produces an answer nobody can decode — and that is
+  //   a two-step sequence away from happening every time the second step is
+  //   skipped, forgotten, or lost to a restart between them.
+  //
+  //   `kind` says what the question is for, `askedOf` is the member whose
+  //   answer counts. Extra fields are kept verbatim for the answering side.
+  'comm.ask_card': async () => {
+    if (!params.kind || !params.askedOf) {
+      throw new Error('comm.ask_card: kind and askedOf are required — an answer with neither cannot be acted on');
+    }
+    const res = await post(
+      apiPath(`/conversations/${params.conversationId}/interaction-requests`),
+      buildChoiceRequest(params),
+    );
+    const actionIds = res?.action_ids || res?.data?.action_ids;
+    const messageId = res?.message_id || res?.data?.message_id;
+    if (!Array.isArray(actionIds) || !actionIds.length || !messageId) {
+      // The card is already posted; say so rather than implying nothing happened.
+      throw new Error(`comm.ask_card: card was SENT but the response carried no ${messageId ? 'action_ids' : 'message_id'}, so the answer will not be decodable: ${JSON.stringify(res)}`);
+    }
+    const { conversationId, kind, askedOf, ...rest } = params;
+    recordPendingQuestion({
+      kind,
+      askedOf,
+      conversationId,
+      cardMessageId: messageId,
+      actionIds,
+      askedAt: new Date().toISOString(),
+      title: rest.title,
+      meta: rest.meta,
+    });
+    return { ...res, recorded: true };
+  },
+
+  //   Resolve a receipt against what was asked. Give it the receipt's
+  //   `card-message-id`, the chosen `actionId`, and the `actor-member-id`; it
+  //   answers whether this is a question we asked, whether that member's answer
+  //   counts, whether it arrived in time, and which option was chosen.
+  //
+  //   It decides nothing and executes nothing — the caller still acts.
+  'comm.answered': () => {
+    const record = findPendingQuestion(params.cardMessageId);
+    if (!record) return { known: false, reason: 'no pending question for this card' };
+    const authorized = isAnswerAuthorized(record, params.actorMemberId);
+    const expired = isExpired(record, Date.now());
+    const index = Array.isArray(record.actionIds)
+      ? record.actionIds.indexOf(params.actionId)
+      : -1;
+    return {
+      known: true,
+      authorized,
+      expired,
+      actionable: authorized && !expired && index >= 0,
+      optionIndex: index,
+      reason: !authorized ? 'the answering member is not who the question was asked of'
+        : expired ? 'the question expired before it was answered'
+        : index < 0 ? 'the chosen action id was not one of this card\'s options'
+        : 'ok',
+      question: record,
+    };
+  },
+
+  //   Questions still waiting, and forgetting one that has been dealt with.
+  'comm.pending': () => listPendingQuestions(),
+  'comm.pending_clear': () => ({ cleared: clearPendingQuestion(params.cardMessageId) }),
+
   // ✅ GET /api/v1/conversations/{id}/messages/{msg_id}
   'comm.get_message': () => get(
     apiPath(`/conversations/${params.conversationId}/messages/${params.messageId}`),
@@ -583,6 +661,15 @@ Messages
   comm.send                 {conversationId, content, replyTo?, clientMsgId?, mentions?}
                             # content: string | {text|body, markdown?} | {type,body} | [{type,body}]
                             # mentions auto-resolved from @name in text if omitted (array of member_id or {type,member_id})
+  comm.ask_card             {conversationId, title, summary, options, kind, askedOf, text?|blocks?, meta?}
+                            # send a choice card AND record what was asked, so the later receipt
+                            #   can be decoded. Prefer this over comm.send_card for any question
+                            #   you intend to act on
+  comm.answered             {cardMessageId, actionId, actorMemberId}
+                            # resolve a receipt against what was asked: known / authorized /
+                            #   expired / actionable. Decides nothing, executes nothing
+  comm.pending              {}                                   # questions still awaiting an answer
+  comm.pending_clear        {cardMessageId}                       # forget one that has been dealt with
   comm.send_card            {conversationId, title, summary, text?|blocks?, options, confirm?, clientMsgId?}
                             # client_msg_id is generated when omitted, which only de-dupes a retry
                             #   of the same request. To survive a lost response, KEEP your own

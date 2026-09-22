@@ -240,6 +240,42 @@ CLI deliberately does **not** restate those rules. A second copy drifts, and it
 drifts toward the stricter side — a local cap tighter than the server's makes a
 range the server accepts unreachable, with an error that blames you for it.
 
+### Asking a question you intend to act on
+
+`comm.send_card` posts a card. It does not remember that it did.
+
+A receipt names the card it answers and nothing else — not what the card was
+for, not which member's answer was wanted, not which option each id meant. So a
+card sent without a record produces an answer that is perfectly decodable and
+completely meaningless. `comm.ask_card` does both in one call:
+
+```bash
+node src/cli/comm.js comm.ask_card '{
+  "conversationId": "<uuid>",
+  "kind": "component-upgrade",
+  "askedOf": "<owner member id>",
+  "title": "要升级吗",
+  "summary": "openmax 2.20.0 → 2.21.0",
+  "options": ["升级", "先不升"]
+}'
+```
+
+`kind` says what the question is for; `askedOf` is the member whose answer
+counts. Both are required, because an answer with neither cannot be acted on.
+Anything else you pass is kept verbatim for the answering side.
+
+The record lives in a JSON file under the runtime directory, so it survives a
+session change, a service restart, and — usually — the action being authorized.
+⚠️ That directory sits under the component directory `zylos upgrade` replaces,
+and whether a record survives its own upgrade is **untested**: treat a missing
+record after an upgrade as possible rather than as corruption.
+
+When the answer arrives, `comm.answered {cardMessageId, actionId,
+actorMemberId}` reports `known` / `authorized` / `expired` / `actionable` and
+the chosen option's index. Act only on `actionable`, then
+`comm.pending_clear {cardMessageId}` — delivery is at-least-once, and a cleared
+question turns a redelivered receipt into a no-op instead of a second execution.
+
 ### Reading the answer back
 
 ⏳ **Not live yet.** cws-comm is still implementing the receipt message; until it

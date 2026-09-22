@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `messageHasUsableContent` treats a receipt carrying an answer as usable even with no text: the contract requires the text, but a producer omitting it would leave the sync cursor un-advanced and park the org's entire inbox behind one message.
 
+- **`comm.ask_card` — asking a question the agent intends to act on.** A receipt names the card it answers and nothing else, so a card sent without a record of what it asked produces an answer that is decodable and meaningless. The new verb sends the card and writes that record in one call; `kind` and `askedOf` are required, because an answer with neither cannot be acted on. `comm.answered` then resolves a receipt against what was asked — `known` / `authorized` / `expired` / `actionable` plus the chosen option index — and decides nothing itself. `comm.pending` and `comm.pending_clear` show and retire the outstanding questions.
+
+  Two refusals are the point rather than incidental. An answer from anyone other than the member the question was asked of is **not authorized**: the interaction protocol has no authorization of its own, so anyone in the conversation can press the button. And a late answer is **expired**: a card asking "upgrade to v2?" answered three weeks later names a version no longer on offer. A missing identity or an unparseable timestamp is a refusal, never a pass.
+
+  The store is a JSON file under the runtime directory, the same shape as `connect-result-queue.js` and for the same reason — every way this waiting ends destroys memory: the session turns over, the service restarts, and for an upgrade question the very act being authorized restarts the process. ⚠️ Whether a record survives its own `zylos upgrade` is untested, since the runtime directory sits under the component directory the upgrade replaces.
+
   Not included: machine-enforced idempotency. `card-message-id` lets the model recognize a repeat, which is not the same as preventing one; real dedup must be persistent, because the replay it guards against happens across a restart.
 
 ## [2.20.0] — 2026-09-17

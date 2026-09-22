@@ -388,7 +388,7 @@ test('connection.authorized (MCP): acquires + materializes a local MCP server vi
     connection_id: 'conn-mcp-1', provider: 'linear', credential_mode: 'direct', connector_kind: 'mcp',
   } } };
   await handleConnectionEvent(baseOrgConfig, frame, {
-    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/home/agent/zylos',
+    get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcp.exec, mcpCwd: '/home/agent/zylos',
   });
 
   const add = mcp.addArgs();
@@ -410,7 +410,7 @@ test('connection.authorized (non-MCP direct): must NOT materialize any MCP serve
     connection_id: 'conn-http-1', provider: 'github', credential_mode: 'direct',
   } } };
   await handleConnectionEvent(baseOrgConfig, frame, {
-    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec,
+    get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcp.exec,
   });
   assert.equal(mcp.calls.length, 0, 'a plain HTTP direct connection must never touch the MCP sink');
 });
@@ -438,7 +438,7 @@ test('connection.credential_updated (MCP): re-acquires and refreshes the MCP ser
   // passes it empty) — the fixture must reflect that sparse shape.
   const frame = { payload: { event: 'connection.credential_updated', data: { connection_id: 'conn-mcp-2' } } };
   await handleConnectionEvent(baseOrgConfig, frame, {
-    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w',
+    get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcp.exec, mcpCwd: '/w',
   });
 
   const add = mcp.addArgs();
@@ -464,7 +464,7 @@ test('[Problem ①] connection.authorized (MCP stdio): injects the token into th
     connection_id: 'conn-gh-1', provider: 'github', credential_mode: 'direct', connector_kind: 'mcp',
   } } };
   await handleConnectionEvent(baseOrgConfig, frame, {
-    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w',
+    get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcp.exec, mcpCwd: '/w',
   });
 
   const json = mcp.addJson();
@@ -487,7 +487,7 @@ for (const event of ['connection.revoked', 'connection.disconnected']) {
 
     const frame = { payload: { event, data: { connection_id: 'conn-mcp-3', provider: 'linear' } } };
     await handleConnectionEvent(baseOrgConfig, frame, {
-      get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w',
+      get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcp.exec, mcpCwd: '/w',
     });
 
     assert.deepEqual(mcp.removeArgs(), ['mcp', 'remove', '-s', 'local', 'openmax-linear-conn-mcp-3']);
@@ -505,7 +505,7 @@ test('connection.revoked (non-MCP): must NOT call the MCP sink', async () => {
 
   const frame = { payload: { event: 'connection.revoked', data: { connection_id: 'conn-http-3', provider: 'github' } } };
   await handleConnectionEvent(baseOrgConfig, frame, {
-    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec,
+    get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcp.exec,
   });
   assert.equal(mcp.calls.length, 0, 'a non-MCP revoke must never touch the MCP sink');
 });
@@ -519,7 +519,7 @@ test('connection.reauth_needed (MCP): removes the MCP server but keeps the conne
 
   const frame = { payload: { event: 'connection.reauth_needed', data: { connection_id: 'conn-mcp-4', provider: 'linear', trigger: 'provider_401' } } };
   await handleConnectionEvent(baseOrgConfig, frame, {
-    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w',
+    get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcp.exec, mcpCwd: '/w',
   });
 
   assert.deepEqual(mcp.removeArgs(), ['mcp', 'remove', '-s', 'local', 'openmax-linear-conn-mcp-4']);
@@ -555,7 +555,7 @@ test('P1-2 (regression): sparse authorize + list refresh WITHOUT connector_kind 
     connection_id: 'conn-mcp-6', provider: 'linear', credential_mode: 'direct',
   } } };
   await handleConnectionEvent(baseOrgConfig, frame, {
-    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w',
+    get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcp.exec, mcpCwd: '/w',
   });
 
   // (a) despite neither the event nor the list carrying it, the index entry ends
@@ -569,7 +569,7 @@ test('P1-2 (regression): sparse authorize + list refresh WITHOUT connector_kind 
   const mcp2 = recordingMcpExec();
   const rframe = { payload: { event: 'connection.revoked', data: { connection_id: 'conn-mcp-6', provider: 'linear' } } };
   await handleConnectionEvent(baseOrgConfig, rframe, {
-    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp2.exec, mcpCwd: '/w',
+    get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcp2.exec, mcpCwd: '/w',
   });
   assert.deepEqual(mcp2.removeArgs(), ['mcp', 'remove', '-s', 'local', 'openmax-linear-conn-mcp-6']);
 });
@@ -601,7 +601,7 @@ test('P1 (regression): sparse credential_updated (NO provider) refreshes the SAM
   const mcpRefresh = recordingMcpExec();
   const upd = { payload: { event: 'connection.credential_updated', data: { connection_id: 'conn-mcp-7' } } };
   await handleConnectionEvent(baseOrgConfig, upd, {
-    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcpRefresh.exec, mcpCwd: '/w',
+    get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcpRefresh.exec, mcpCwd: '/w',
   });
   const refreshName = mcpRefresh.addArgs()?.[4];
   // The refreshed server carries the NEW token AND the index-slug name — NOT the
@@ -616,7 +616,7 @@ test('P1 (regression): sparse credential_updated (NO provider) refreshes the SAM
   const mcpRevoke = recordingMcpExec();
   const rev = { payload: { event: 'connection.revoked', data: { connection_id: 'conn-mcp-7' } } };
   await handleConnectionEvent(baseOrgConfig, rev, {
-    get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcpRevoke.exec, mcpCwd: '/w',
+    get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcpRevoke.exec, mcpCwd: '/w',
   });
   const revokedName = mcpRevoke.removeArgs()?.[4];
   // KEY no-orphan assertion: revoke removes the EXACT name refresh registered.
@@ -636,7 +636,7 @@ test('MCP sink is best-effort: a throwing command runner never breaks the handle
     connection_id: 'conn-mcp-5', provider: 'linear', credential_mode: 'direct', connector_kind: 'mcp',
   } } };
   // Must resolve, not reject, despite the runner throwing.
-  await handleConnectionEvent(baseOrgConfig, frame, { get, post, connectDir, credentialsDir, catalogDir, mcpExecFile });
+  await handleConnectionEvent(baseOrgConfig, frame, { get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile });
   // The credential path is unaffected — the direct credential is still cached.
   assert.ok(fs.existsSync(path.join(credentialsDir, 'conn-mcp-5.json')), 'a sink failure must not break credential caching');
 });
@@ -684,13 +684,13 @@ test('P1 concurrency FENCE: revoke completes while a credential_updated refresh 
   // 1) start the refresh (sparse, NO provider) — it upserts the index then parks at Acquire.
   const refreshP = handleConnectionEvent(baseOrgConfig,
     { payload: { event: 'connection.credential_updated', data: { connection_id: 'conn-race-1' } } },
-    { get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w' });
+    { get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcp.exec, mcpCwd: '/w' });
   await flush(); // let the refresh reach its Acquire await
 
   // 2) a revoke runs to completion while the refresh is parked.
   await handleConnectionEvent(baseOrgConfig,
     { payload: { event: 'connection.revoked', data: { connection_id: 'conn-race-1' } } },
-    { get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w' });
+    { get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcp.exec, mcpCwd: '/w' });
   assert.deepEqual(mcp.removeArgs(), ['mcp', 'remove', '-s', 'local', 'openmax-linear-conn-race-1'], 'revoke removed the server');
   assert.equal(readIndex(idxPath).connections['conn-race-1'], undefined, 'revoke unindexed the connection');
   assert.ok(!fs.existsSync(path.join(credentialsDir, 'conn-race-1.json')), 'revoke cleared the cache');
@@ -719,14 +719,14 @@ test('P1 concurrency STALE: a credential_updated that arrives AFTER a revoke is 
   const mcpRevoke = recordingMcpExec();
   await handleConnectionEvent(baseOrgConfig,
     { payload: { event: 'connection.revoked', data: { connection_id: 'conn-race-2' } } },
-    { get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcpRevoke.exec, mcpCwd: '/w' });
+    { get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcpRevoke.exec, mcpCwd: '/w' });
   assert.equal(readIndex(idxPath).connections['conn-race-2'], undefined);
 
   // a LATE/stale credential_updated (sparse) for the already-revoked connection.
   const mcpLate = recordingMcpExec();
   await handleConnectionEvent(baseOrgConfig,
     { payload: { event: 'connection.credential_updated', data: { connection_id: 'conn-race-2' } } },
-    { get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcpLate.exec, mcpCwd: '/w' });
+    { get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcpLate.exec, mcpCwd: '/w' });
 
   assert.equal(acquireCalls, 0, 'a stale refresh (cache already cleared by revoke) must not Acquire');
   assert.equal(mcpLate.calls.length, 0, 'a stale refresh must not touch the MCP sink');
@@ -748,7 +748,7 @@ test('P1 concurrency SERIALIZATION: a revoke dispatched while a refresh is in-fl
   };
   const get = async () => { throw new Error('credential_updated must not call GET'); };
   const mcp = recordingMcpExec();
-  const deps = { get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w' };
+  const deps = { get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcp.exec, mcpCwd: '/w' };
 
   // Dispatch BOTH through the serialized entry point, fire-and-forget (as comm-bridge does).
   const refreshP = handleConnectionEventSerialized(baseOrgConfig,
@@ -793,7 +793,7 @@ test('P1 concurrency SERIALIZATION (authorize→revoke): a revoke dispatched whi
     return [];
   };
   const mcp = recordingMcpExec();
-  const deps = { get, post, connectDir, credentialsDir, catalogDir, mcpExecFile: mcp.exec, mcpCwd: '/w' };
+  const deps = { get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcp.exec, mcpCwd: '/w' };
 
   const authP = handleConnectionEventSerialized(baseOrgConfig,
     { payload: { event: 'connection.authorized', data: { connection_id: 'conn-race-4', provider: 'linear', credential_mode: 'direct', connector_kind: 'mcp' } } }, deps);

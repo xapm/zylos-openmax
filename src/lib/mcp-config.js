@@ -483,13 +483,6 @@ export function buildServerSpec(name, mcpServer, opts = {}) {
   };
 }
 
-/** Derive a deterministic, shell-safe env-var name for a codex bearer token from
- * the server name (e.g. openmax-linear-conn-1 → OPENMAX_LINEAR_CONN_1_TOKEN). */
-function codexBearerEnvName(serverName) {
-  const base = String(serverName || '').replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '').toUpperCase();
-  return `${base || 'MCP'}_TOKEN`;
-}
-
 /**
  * Adapter: render a neutral spec to the CLAUDE Code CLI. This is the CURRENT
  * behavior moved verbatim — the mount argv (`claude mcp add-json -s local <name>
@@ -514,15 +507,20 @@ const claudeAdapter = {
  * 0.128.0 for the stdio path). Lands in `~/.codex/config.toml`.
  *
  *   - stdio: `codex mcp add <name> --env K=V ... -- <command> <args...>`
- *     → `[mcp_servers.<name>]` with command/args/env.
- *   - http:  `codex mcp add <name> --url <URL>` and, when the neutral spec carries
- *     an inline bearer/Authorization credential, `--bearer-token-env-var <ENV>`
- *     (codex CANNOT take an inline auth header — it reads the token from a named
- *     env var instead). We derive a deterministic ENV name from the server name,
- *     pass it to codex, and hand codex the token value via that env var on the exec.
- *     NOTE: the http/bearer path is NOT YET REAL-MACHINE-VERIFIED (stdio is the
- *     guaranteed v1 path, per the approved scope); the emitted command is unit-
- *     tested but the end-to-end codex http auth flow has not been run on a box.
+ *     → `[mcp_servers.<name>]` with command/args/env. The credential (an
+ *     env-located token) is merged into spec.env by buildMcpServerJson and
+ *     persisted by codex in config.toml — fully supported.
+ *   - http + query-located token: `codex mcp add <name> --url <URL>` where the
+ *     token already rides inside <URL> as a query param — codex persists the URL,
+ *     so the credential survives to call time — fully supported.
+ *   - http + header/bearer-located auth: INTENTIONALLY UNSUPPORTED (deferred).
+ *     `codex mcp add --url ... --bearer-token-env-var <ENV>` only persists the env
+ *     var NAME; codex reads the value from its OWN runtime env at MCP-call time,
+ *     which we cannot populate for later codex sessions from here. Writing such a
+ *     config would silently register a server that fails auth at call time. So the
+ *     caller FAILS LOUD in its pre-CLI validation phase (registers nothing, zero
+ *     CLI calls) rather than ship a broken config — real runtime-env injection is
+ *     a follow-up. This adapter therefore never sees a header-auth http spec.
  *   - remove: `codex mcp remove <name>`.
  */
 const codexAdapter = {
@@ -540,23 +538,12 @@ const codexAdapter = {
       args.push('--', spec.command, ...spec.args);
       return { args };
     }
-    // http (also covers sse/ws-over-http): a URL, plus optional bearer env var.
+    // http (also covers sse/ws-over-http): just the URL. A query-located token
+    // already rides inside spec.url (built by buildMcpServerJson) and codex
+    // persists the URL verbatim. A header/bearer-located credential never reaches
+    // this adapter — upsertMcpServer rejects it up front (see the doc above).
     args.push('--url', spec.url);
-    let env;
-    // A query-located token already rides inside spec.url (nothing more to do).
-    // A header-located credential (Authorization: <scheme> <token>, or any custom
-    // auth header) can't be sent inline to codex — translate it into a named env
-    // var. NOT YET REAL-MACHINE-VERIFIED (see adapter doc).
-    if (spec.auth && spec.auth.location === 'header') {
-      const envName = codexBearerEnvName(spec.name);
-      // The token is the value minus any leading scheme word (e.g. "Bearer ").
-      const v = String(spec.auth.value || '');
-      const sp = v.indexOf(' ');
-      const token = sp >= 0 ? v.slice(sp + 1) : v;
-      args.push('--bearer-token-env-var', envName);
-      env = { [envName]: token };
-    }
-    return { args, env };
+    return { args };
   },
   buildRemovePlan(name) {
     return { args: ['mcp', 'remove', name] };
@@ -632,12 +619,19 @@ export async function upsertMcpServer(conn, acquireResponse, deps = {}) {
       return { ok: false, reason: 'no-mcp-server' };
     }
 
+    // FAIL LOUD (deferred capability): codex + remote http + a header/bearer-located
+    // credential cannot be persisted for codex to use at MCP-call time (codex only
+    // stores the bearer-token ENV VAR NAME and reads its value from codex's own
+    // runtime env, which we can't populate for later sessions from here). Rather
+    // than register a silently-broken server, refuse here in the PRE-CLI phase —
+    // BEFORE the remove-then-add — so we run ZERO CLI calls and never tear down an
+    // existing working server. (codex stdio and codex http+query-token still work.)
+    if (clientType === 'codex' && spec.transport === 'http' && spec.auth && spec.auth.location === 'header') {
+      warn(`[mcp-config] upsert skipped conn=${connId}: codex remote http header/bearer auth is unsupported (deferred) — refusing to register a broken server`);
+      return { ok: false, reason: 'codex-http-header-auth-unsupported' };
+    }
+
     const mount = adapter.buildMountPlan(spec);
-    // Merge any adapter-supplied env (e.g. codex bearer-token env var) onto the
-    // inherited process env so the child keeps PATH etc.
-    const mountOpts = mount.env
-      ? { cwd, timeout: timeoutMs, env: { ...process.env, ...mount.env } }
-      : { cwd, timeout: timeoutMs };
 
     // Remove-then-add so a refresh replaces the prior credential cleanly (a bare
     // add of an existing name can be rejected). The remove is best-effort — a
@@ -646,7 +640,7 @@ export async function upsertMcpServer(conn, acquireResponse, deps = {}) {
       await execFile(adapter.file, adapter.buildRemovePlan(name).args, { cwd, timeout: timeoutMs });
     } catch { /* no prior server registered — fine */ }
 
-    await execFile(adapter.file, mount.args, mountOpts);
+    await execFile(adapter.file, mount.args, { cwd, timeout: timeoutMs });
     // NEVER log the payload — it carries the injected credential (env value / header /
     // URL query). Name + type + command-or-host + cwd only (host = url with any
     // query stripped).

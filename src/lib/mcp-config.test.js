@@ -3,6 +3,7 @@ import { test } from 'node:test';
 
 import {
   agentLaunchCwd,
+  detectClientType,
   isMcpConnection,
   mcpServerName,
   transportFlag,
@@ -12,6 +13,7 @@ import {
   resolveInjection,
   buildAuthHeader,
   buildMcpServerJson,
+  buildServerSpec,
   unwrapMcpServersWrapper,
   WRAPPER_REJECTED,
   upsertMcpServer,
@@ -358,7 +360,7 @@ test('upsertMcpServer (http): 走 claude mcp add-json -s local <name> <json>，�
       token_type: 'bearer',
       mcp_server: { transport: 'remote_http', server_url: 'https://mcp.linear.app/rpc' },
     },
-    { execFile, cwd: '/home/agent/zylos' },
+    { execFile, cwd: '/home/agent/zylos', clientType: 'claude' },
   );
   assert.deepEqual(res, { ok: true, name: 'openmax-linear-conn-1' });
 
@@ -387,7 +389,7 @@ test('upsertMcpServer (http): 含密钥自定义头走 auth_injection（绝不�
       auth_injection: { location: 'header', name: 'X-Shopify-Access-Token', value_template: '{token}' },
       mcp_server: { transport: 'remote_http', server_url: 'https://x.myshopify.com/mcp' },
     },
-    { execFile, cwd: '/w' },
+    { execFile, cwd: '/w', clientType: 'claude' },
   );
   const json = addJson(calls);
   assert.equal(json.headers['X-Shopify-Access-Token'], 'shpat_secret');
@@ -404,7 +406,7 @@ test('upsertMcpServer (http): query 型 auth 拼进 URL（头不表达）', asyn
       auth_injection: { location: 'query', name: 'access_token', value_template: '{token}' },
       mcp_server: { transport: 'remote_http', server_url: 'https://demo.example/mcp' },
     },
-    { execFile, cwd: '/w' },
+    { execFile, cwd: '/w', clientType: 'claude' },
   );
   const json = addJson(calls);
   assert.equal(json.url, 'https://demo.example/mcp?access_token=qtok');
@@ -421,7 +423,7 @@ test('[Problem ①] upsertMcpServer (stdio): token 注入 env 后再 add-json（
       auth_injection: 'env:GITHUB_PERSONAL_ACCESS_TOKEN',
       mcp_server: { transport: 'stdio', command: 'docker', args: ['run', '-i', '--rm', 'ghcr.io/github/github-mcp-server'], env: {} },
     },
-    { execFile, cwd: '/home/agent/zylos' },
+    { execFile, cwd: '/home/agent/zylos', clientType: 'claude' },
   );
   assert.deepEqual(res, { ok: true, name: 'openmax-github-conn-gh' });
   assert.equal(calls[0].args[1], 'remove'); // remove precedes add-json
@@ -441,7 +443,7 @@ test('upsertMcpServer (stdio): 无 token 时 env 只含 raw_config 的非密字�
       connector_kind: 'mcp',
       raw_config: { type: 'stdio', command: 'npx', args: ['xhs-mcp-server'], env: { phone: '13800000000' } },
     },
-    { execFile, cwd: '/w' },
+    { execFile, cwd: '/w', clientType: 'claude' },
   );
   const json = addJson(calls);
   assert.deepEqual(json.env, { phone: '13800000000' });
@@ -452,14 +454,14 @@ test('upsertMcpServer (stdio): args 为 JSON 字符串也能解析成数组', as
   await upsertMcpServer(
     { id: 'conn-s2', slug: 'demo' },
     { connector_kind: 'mcp', mcp_server: { transport: 'stdio', command: 'my-server', args: '["--flag","v"]' } },
-    { execFile, cwd: '/w' },
+    { execFile, cwd: '/w', clientType: 'claude' },
   );
   assert.deepEqual(addJson(calls).args, ['--flag', 'v']);
 });
 
 test('upsertMcpServer: 无 mcp_server 且无 raw_config → {ok:false}，不调用 CLI', async () => {
   const { calls, execFile } = recordingExec();
-  const res = await upsertMcpServer({ id: 'c1', slug: 'x' }, { connector_kind: 'mcp' }, { execFile, cwd: '/w' });
+  const res = await upsertMcpServer({ id: 'c1', slug: 'x' }, { connector_kind: 'mcp' }, { execFile, cwd: '/w', clientType: 'claude' });
   assert.equal(res.ok, false);
   assert.equal(res.reason, 'no-mcp-server');
   assert.equal(calls.length, 0, 'no CLI invocation when there is no server config');
@@ -482,7 +484,7 @@ test('upsertMcpServer: 歧义 mcpServers wrapper（sink 探针）→ {ok:false} 
         },
       },
     },
-    { execFile, cwd: '/w' },
+    { execFile, cwd: '/w', clientType: 'claude' },
   );
   assert.equal(res.ok, false);
   assert.equal(res.reason, 'ambiguous-wrapper');
@@ -494,7 +496,7 @@ test('upsertMcpServer (stdio): 缺 command → 跳过并给出 reason，不调�
   const res = await upsertMcpServer(
     { id: 'conn-s3', slug: 'demo' },
     { connector_kind: 'mcp', mcp_server: { transport: 'stdio', args: ['x'] } },
-    { execFile, cwd: '/w' },
+    { execFile, cwd: '/w', clientType: 'claude' },
   );
   assert.equal(res.ok, false);
   assert.equal(res.reason, 'no-command');
@@ -506,7 +508,7 @@ test('upsertMcpServer (http): 缺 server_url → {ok:false} no-mcp-server，不�
   const res = await upsertMcpServer(
     { id: 'c1', slug: 'x' },
     { connector_kind: 'mcp', mcp_server: { transport: 'remote_http' } },
-    { execFile, cwd: '/w' },
+    { execFile, cwd: '/w', clientType: 'claude' },
   );
   assert.equal(res.ok, false);
   assert.equal(res.reason, 'no-mcp-server');
@@ -521,7 +523,7 @@ test('upsertMcpServer: best-effort — add-json 抛错不外抛，返回 {ok:fal
   const res = await upsertMcpServer(
     { id: 'c1', slug: 'x' },
     { connector_kind: 'mcp', access_token: 'T', mcp_server: { transport: 'remote_http', server_url: 'https://x/mcp' } },
-    { execFile, cwd: '/w' },
+    { execFile, cwd: '/w', clientType: 'claude' },
   );
   assert.equal(res.ok, false);
   assert.match(res.reason, /add-json failed/);
@@ -531,7 +533,7 @@ test('upsertMcpServer: best-effort — add-json 抛错不外抛，返回 {ok:fal
 
 test('removeMcpServer: 组装 claude mcp remove -s local <name>，注入 execFile+cwd', async () => {
   const { calls, execFile } = recordingExec();
-  const res = await removeMcpServer({ id: 'conn-7', slug: 'linear' }, { execFile, cwd: '/home/agent/zylos' });
+  const res = await removeMcpServer({ id: 'conn-7', slug: 'linear' }, { execFile, cwd: '/home/agent/zylos', clientType: 'claude' });
   assert.deepEqual(res, { ok: true, name: 'openmax-linear-conn-7' });
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].args, ['mcp', 'remove', '-s', 'local', 'openmax-linear-conn-7']);
@@ -540,14 +542,14 @@ test('removeMcpServer: 组装 claude mcp remove -s local <name>，注入 execFil
 
 test('removeMcpServer: best-effort — 抛错（如 server 不存在）不外抛', async () => {
   const execFile = async () => { throw new Error('No such server'); };
-  const res = await removeMcpServer({ id: 'c1', slug: 'x' }, { execFile, cwd: '/w' });
+  const res = await removeMcpServer({ id: 'c1', slug: 'x' }, { execFile, cwd: '/w', clientType: 'claude' });
   assert.equal(res.ok, false);
   assert.match(res.reason, /No such server/);
 });
 
 test('removeMcpServer: 同样适用于 stdio 命名的 server（基于 name，与传输无关）', async () => {
   const { calls, execFile } = recordingExec();
-  const res = await removeMcpServer({ id: 'conn-s1', slug: 'filesystem' }, { execFile, cwd: '/w' });
+  const res = await removeMcpServer({ id: 'conn-s1', slug: 'filesystem' }, { execFile, cwd: '/w', clientType: 'claude' });
   assert.deepEqual(res, { ok: true, name: 'openmax-filesystem-conn-s1' });
   assert.deepEqual(calls[0].args, ['mcp', 'remove', '-s', 'local', 'openmax-filesystem-conn-s1']);
 });
@@ -592,7 +594,7 @@ test('P1-1 upsertMcpServer: 失败(带 exit code)绝不把 token 漏进 reason/�
     { id: 'c1', slug: 'linear' },
     { connector_kind: 'mcp', access_token: TOKEN, token_type: 'bearer',
       mcp_server: { transport: 'remote_http', server_url: 'https://mcp/rpc' } },
-    { execFile, cwd: '/w', warn: (m) => warns.push(m) },
+    { execFile, cwd: '/w', clientType: 'claude', warn: (m) => warns.push(m) },
   );
   assert.equal(res.ok, false);
   assert.equal(res.reason, 'claude mcp add-json failed (exit 1)', 'reason must be exit-code-only');
@@ -610,7 +612,7 @@ test('P1-1 upsertMcpServer: 失败(无 exit code)回退到脱敏消息，token �
     { id: 'c1', slug: 'linear' },
     { connector_kind: 'mcp', access_token: TOKEN,
       mcp_server: { transport: 'remote_http', server_url: 'https://mcp/rpc' } },
-    { execFile, cwd: '/w' },
+    { execFile, cwd: '/w', clientType: 'claude' },
   );
   assert.equal(res.ok, false);
   assert.ok(!res.reason.includes(TOKEN), `reason leaked the token: ${res.reason}`);
@@ -627,7 +629,7 @@ test('[Problem ①] P1-1 upsertMcpServer (stdio): 失败(无 exit code)回退时
     { id: 'c-gh', slug: 'github' },
     { connector_kind: 'mcp', access_token: TOKEN, auth_injection: 'env:GITHUB_TOKEN',
       mcp_server: { transport: 'stdio', command: 'docker', args: ['run'] } },
-    { execFile, cwd: '/w' },
+    { execFile, cwd: '/w', clientType: 'claude' },
   );
   assert.equal(res.ok, false);
   assert.ok(!res.reason.includes(TOKEN), `reason leaked the stdio env token: ${res.reason}`);
@@ -646,11 +648,314 @@ test('P1-R2 upsertMcpServer: query 型 auth 无 exit code 回退时，raw 与 UR
     { connector_kind: 'mcp', access_token: TOKEN,
       auth_injection: { location: 'query', name: 'access_token', value_template: '{token}' },
       mcp_server: { transport: 'remote_http', server_url: 'https://demo/mcp' } },
-    { execFile, cwd: '/w', warn: (m) => warns.push(m) },
+    { execFile, cwd: '/w', clientType: 'claude', warn: (m) => warns.push(m) },
   );
   assert.equal(res.ok, false);
   assert.ok(!res.reason.includes(TOKEN), `reason leaked the raw token: ${res.reason}`);
   assert.ok(!res.reason.includes(ENCODED), `reason leaked the URL-encoded token: ${res.reason}`);
   assert.ok(warns.length > 0, 'expected a warn log');
   assert.ok(warns.every((l) => !l.includes(TOKEN) && !l.includes(ENCODED)), `warn log leaked the token: ${warns.join(' | ')}`);
+});
+
+// --- #112: client-type detection + adapter dispatch (claude / codex) ---------
+
+// Find a codex `mcp add` call (codex uses `add`, not `add-json`).
+function codexAddCall(calls) {
+  return calls.find((c) => c.file === 'codex' && c.args[0] === 'mcp' && c.args[1] === 'add');
+}
+
+// --- detectClientType precedence: env > config.json > default claude ---------
+
+test('detectClientType: ZYLOS_RUNTIME env 优先级最高（压过 config.json）', () => {
+  const readFileSync = () => JSON.stringify({ runtime: 'claude' }); // config says claude
+  assert.equal(detectClientType({ env: { ZYLOS_RUNTIME: 'codex' }, readFileSync, zylosDir: '/z' }), 'codex');
+  // 大小写/空白规范化
+  assert.equal(detectClientType({ env: { ZYLOS_RUNTIME: '  CODEX ' }, readFileSync, zylosDir: '/z' }), 'codex');
+});
+
+test('detectClientType: 无 env 时读取 config.json 的 .runtime', () => {
+  const readFileSync = (p) => {
+    assert.match(String(p), /\/z\/\.zylos\/config\.json$/, 'reads <zylosDir>/.zylos/config.json');
+    return JSON.stringify({ runtime: 'codex' });
+  };
+  assert.equal(detectClientType({ env: {}, readFileSync, zylosDir: '/z' }), 'codex');
+});
+
+test('detectClientType: config.json 缺失/不可读 → 回退 claude', () => {
+  const readFileSync = () => { throw new Error('ENOENT'); };
+  assert.equal(detectClientType({ env: {}, readFileSync, zylosDir: '/z' }), 'claude');
+});
+
+test('detectClientType: 未知 runtime（env 或 config）→ 回退 claude', () => {
+  // unknown env value falls through to config, which is also unknown → default claude
+  assert.equal(
+    detectClientType({ env: { ZYLOS_RUNTIME: 'gemini' }, readFileSync: () => JSON.stringify({ runtime: 'weird' }), zylosDir: '/z' }),
+    'claude',
+  );
+  // empty/missing everywhere → claude
+  assert.equal(detectClientType({ env: {}, readFileSync: () => JSON.stringify({}), zylosDir: '/z' }), 'claude');
+});
+
+// --- neutral-spec extraction equivalence: claude adapter output unchanged ----
+
+test('buildServerSpec: claudeJson 与 buildMcpServerJson 逐字节一致（重构不改 claude 输出）', () => {
+  const mcp = { transport: 'remote_http', server_url: 'https://mcp.linear.app/rpc' };
+  const opts = { accessToken: 'tok-123', tokenType: 'bearer' };
+  const spec = buildServerSpec('openmax-linear-conn-1', mcp, opts);
+  assert.deepEqual(spec.claudeJson, buildMcpServerJson(mcp, opts));
+  // neutral view populated for the http case
+  assert.equal(spec.transport, 'http');
+  assert.equal(spec.url, 'https://mcp.linear.app/rpc');
+  assert.deepEqual(spec.auth, { location: 'header', name: 'Authorization', value: 'Bearer tok-123' });
+});
+
+test('buildServerSpec: 歧义 wrapper → null（沿用 buildMcpServerJson 的 fail-closed）', () => {
+  const res = buildServerSpec('n', null, {
+    rawConfig: { mcpServers: { zeta: { type: 'http', url: 'https://a' }, alpha: { type: 'http', url: 'https://b' } } },
+  });
+  assert.equal(res, null);
+});
+
+// --- runtime=claude (default): regression guard against current behavior ------
+
+test('upsertMcpServer (claude 显式): 命令与既有 claude 行为逐字节一致', async () => {
+  const { calls, execFile } = recordingExec();
+  const res = await upsertMcpServer(
+    { id: 'conn-1', slug: 'linear' },
+    { connector_kind: 'mcp', access_token: 'tok-123', token_type: 'bearer',
+      mcp_server: { transport: 'remote_http', server_url: 'https://mcp.linear.app/rpc' } },
+    { execFile, cwd: '/home/agent/zylos', clientType: 'claude' },
+  );
+  assert.deepEqual(res, { ok: true, name: 'openmax-linear-conn-1' });
+  assert.equal(calls[0].file, 'claude');
+  assert.deepEqual(calls[0].args, ['mcp', 'remove', '-s', 'local', 'openmax-linear-conn-1']);
+  assert.equal(calls[1].file, 'claude');
+  assert.deepEqual(calls[1].args.slice(0, 5), ['mcp', 'add-json', '-s', 'local', 'openmax-linear-conn-1']);
+  assert.deepEqual(JSON.parse(calls[1].args[5]), { type: 'http', url: 'https://mcp.linear.app/rpc', headers: { Authorization: 'Bearer tok-123' } });
+});
+
+// --- runtime=codex + stdio ---------------------------------------------------
+
+test('upsertMcpServer (codex, stdio): 生成 codex mcp add <name> --env K=V ... -- cmd args...', async () => {
+  const { calls, execFile } = recordingExec();
+  const res = await upsertMcpServer(
+    { id: 'conn-gh', slug: 'github' },
+    { connector_kind: 'mcp', access_token: 'ghp_secret', auth_injection: 'env:GITHUB_PERSONAL_ACCESS_TOKEN',
+      mcp_server: { transport: 'stdio', command: 'docker', args: ['run', '-i', '--rm', 'ghcr.io/github/github-mcp-server'], env: {} } },
+    { execFile, cwd: '/home/agent/zylos', clientType: 'codex' },
+  );
+  assert.deepEqual(res, { ok: true, name: 'openmax-github-conn-gh' });
+  // remove precedes add (clean refresh), both go to the codex CLI
+  assert.equal(calls[0].file, 'codex');
+  assert.deepEqual(calls[0].args, ['mcp', 'remove', 'openmax-github-conn-gh']);
+  const add = codexAddCall(calls);
+  assert.ok(add, 'expected a codex mcp add call');
+  assert.deepEqual(add.args, [
+    'mcp', 'add', 'openmax-github-conn-gh',
+    '--env', 'GITHUB_PERSONAL_ACCESS_TOKEN=ghp_secret',
+    '--', 'docker', 'run', '-i', '--rm', 'ghcr.io/github/github-mcp-server',
+  ]);
+  // never uses claude's add-json flags
+  assert.ok(!add.args.includes('add-json') && !add.args.includes('-s'));
+});
+
+test('upsertMcpServer (codex, stdio): 无 token 时非密 env 仍以 --env 传（小红书 phone）', async () => {
+  const { calls, execFile } = recordingExec();
+  await upsertMcpServer(
+    { id: 'conn-xhs', slug: 'xiaohongshu' },
+    { connector_kind: 'mcp', raw_config: { type: 'stdio', command: 'npx', args: ['xhs-mcp-server'], env: { phone: '13800000000' } } },
+    { execFile, cwd: '/w', clientType: 'codex' },
+  );
+  const add = codexAddCall(calls);
+  assert.deepEqual(add.args, ['mcp', 'add', 'openmax-xiaohongshu-conn-xhs', '--env', 'phone=13800000000', '--', 'npx', 'xhs-mcp-server']);
+});
+
+// --- runtime=codex + http ----------------------------------------------------
+
+test('upsertMcpServer (codex, http+header/bearer): FAIL-LOUD — {ok:false} 且零 CLI 调用（不写坏配置、不拆已有 server）', async () => {
+  const { calls, execFile } = recordingExec();
+  const warns = [];
+  const res = await upsertMcpServer(
+    { id: 'conn-1', slug: 'linear' },
+    { connector_kind: 'mcp', access_token: 'tok-123', token_type: 'bearer',
+      mcp_server: { transport: 'remote_http', server_url: 'https://mcp.linear.app/rpc' } },
+    { execFile, cwd: '/w', clientType: 'codex', warn: (m) => warns.push(m) },
+  );
+  // codex cannot persist a header/bearer credential for call-time use → refuse,
+  // registering nothing, BEFORE any CLI call (crucially: no `codex mcp remove`
+  // that would tear down an existing working server).
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, 'codex-http-header-auth-unsupported');
+  assert.equal(calls.length, 0, 'ZERO CLI calls — no remove, no add');
+  assert.ok(warns.length > 0, 'must warn about the unsupported path');
+  assert.ok(warns.every((l) => !l.includes('tok-123')), 'warn log leaked the token');
+});
+
+test('upsertMcpServer (codex, http): query 型 token 随 URL，不产生 --bearer-token-env-var', async () => {
+  const { calls, execFile } = recordingExec();
+  await upsertMcpServer(
+    { id: 'cq', slug: 'demo' },
+    { connector_kind: 'mcp', access_token: 'qtok',
+      auth_injection: { location: 'query', name: 'access_token', value_template: '{token}' },
+      mcp_server: { transport: 'remote_http', server_url: 'https://demo.example/mcp' } },
+    { execFile, cwd: '/w', clientType: 'codex' },
+  );
+  const add = codexAddCall(calls);
+  assert.deepEqual(add.args, ['mcp', 'add', 'openmax-demo-cq', '--url', 'https://demo.example/mcp?access_token=qtok']);
+  assert.ok(!add.args.includes('--bearer-token-env-var'));
+});
+
+// P1' — codex http FAIL-LOUD also covers headers arriving via raw_config /
+// headers_template (spec.headers), not only auth-derived headers.
+
+test('upsertMcpServer (codex, http): raw_config wrapper 携带 Authorization 头 → FAIL-LOUD，零 CLI', async () => {
+  const { calls, execFile } = recordingExec();
+  const warns = [];
+  const res = await upsertMcpServer(
+    { id: 'c-lin', slug: 'linear' },
+    {
+      connector_kind: 'mcp',
+      // wrapper form (mcp-config.test.js:320-330): headers inline in raw_config, no access_token
+      raw_config: { mcpServers: { linear: { type: 'http', url: 'https://mcp.linear.app/sse', headers: { Authorization: 'Bearer sk-INLINE' } } } },
+    },
+    { execFile, cwd: '/w', clientType: 'codex', warn: (m) => warns.push(m) },
+  );
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, 'codex-http-header-auth-unsupported');
+  assert.equal(calls.length, 0, 'header-bearing raw_config must trigger ZERO codex CLI calls (no remove, no add)');
+  assert.ok(warns.length > 0 && warns.every((l) => !l.includes('sk-INLINE')), 'warn must fire and not leak the inline header');
+});
+
+test('upsertMcpServer (codex, http): raw_config bare 形态携带 Authorization 头 → FAIL-LOUD，零 CLI', async () => {
+  const { calls, execFile } = recordingExec();
+  const res = await upsertMcpServer(
+    { id: 'c-x', slug: 'x' },
+    {
+      connector_kind: 'mcp',
+      raw_config: { type: 'http', url: 'https://mcp.example/rpc', headers: { Authorization: 'Bearer sk-BARE' } },
+    },
+    { execFile, cwd: '/w', clientType: 'codex' },
+  );
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, 'codex-http-header-auth-unsupported');
+  assert.equal(calls.length, 0);
+});
+
+test('upsertMcpServer (codex, http): headers_template 携带 X-Api-Key（非密自定义头）→ FAIL-LOUD，零 CLI', async () => {
+  const { calls, execFile } = recordingExec();
+  const res = await upsertMcpServer(
+    { id: 'c-k', slug: 'keyed' },
+    {
+      connector_kind: 'mcp',
+      mcp_server: { transport: 'remote_http', server_url: 'https://k.example/mcp', headers_template: { 'X-Api-Key': 'abc' } },
+    },
+    { execFile, cwd: '/w', clientType: 'codex' },
+  );
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, 'codex-http-header-auth-unsupported');
+  assert.equal(calls.length, 0, 'a custom header codex cannot express must also fail loud');
+});
+
+test('upsertMcpServer (codex, http): 完全无头无 auth → 仍走 codex mcp add --url（不误伤）', async () => {
+  const { calls, execFile } = recordingExec();
+  const res = await upsertMcpServer(
+    { id: 'c-plain', slug: 'plain' },
+    { connector_kind: 'mcp', mcp_server: { transport: 'remote_http', server_url: 'https://plain.example/mcp' } },
+    { execFile, cwd: '/w', clientType: 'codex' },
+  );
+  assert.deepEqual(res, { ok: true, name: 'openmax-plain-c-plain' });
+  const add = codexAddCall(calls);
+  assert.deepEqual(add.args, ['mcp', 'add', 'openmax-plain-c-plain', '--url', 'https://plain.example/mcp']);
+});
+
+// P1'' — a query token living in raw_config.url (NO separate access_token) must
+// not leak into the failure reason/warn when a no-exit-code exec error echoes argv.
+
+test('upsertMcpServer (codex, http): URL 内 query token（无 access_token）失败(无 exit code)时不泄露（raw 与 encoded 皆脱敏）', async () => {
+  const RAW = 'fake/token';
+  const ENCODED = encodeURIComponent(RAW); // "fake%2Ftoken"
+  const warns = [];
+  // The final URL carries the token as a query param; a no-.code rejection echoes argv.
+  const execFile = async (file, args) => {
+    if (args[1] === 'add') throw new Error(`spawn error: codex ${args.join(' ')}`); // no .code → redaction fallback
+    return { stdout: '' }; // remove succeeds
+  };
+  const res = await upsertMcpServer(
+    { id: 'c-url', slug: 'demo' },
+    {
+      connector_kind: 'mcp',
+      // token lives inside raw_config.url itself; NO access_token on the response
+      raw_config: { type: 'http', url: `https://demo.example/mcp?key=${ENCODED}` },
+    },
+    { execFile, cwd: '/w', clientType: 'codex', warn: (m) => warns.push(m) },
+  );
+  assert.equal(res.ok, false);
+  assert.ok(!res.reason.includes(RAW), `reason leaked the raw token: ${res.reason}`);
+  assert.ok(!res.reason.includes(ENCODED), `reason leaked the URL-encoded token: ${res.reason}`);
+  assert.ok(warns.length > 0, 'expected a warn log');
+  assert.ok(warns.every((l) => !l.includes(RAW) && !l.includes(ENCODED)), `warn log leaked the token: ${warns.join(' | ')}`);
+});
+
+// --- runtime=codex remove ----------------------------------------------------
+
+test('removeMcpServer (codex): 生成 codex mcp remove <name>', async () => {
+  const { calls, execFile } = recordingExec();
+  const res = await removeMcpServer({ id: 'conn-7', slug: 'linear' }, { execFile, cwd: '/w', clientType: 'codex' });
+  assert.deepEqual(res, { ok: true, name: 'openmax-linear-conn-7' });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, 'codex');
+  assert.deepEqual(calls[0].args, ['mcp', 'remove', 'openmax-linear-conn-7']);
+});
+
+test('upsertMcpServer (codex): best-effort — add 抛错(exit code)返回 codex 前缀 reason，token 不泄露', async () => {
+  const TOKEN = 'ghp_codex_secret';
+  const warns = [];
+  const execFile = async (file, args) => {
+    if (args[1] === 'add') { const e = new Error(`Command failed: codex ${args.join(' ')}`); e.code = 2; throw e; }
+    return { stdout: '' };
+  };
+  const res = await upsertMcpServer(
+    { id: 'c1', slug: 'github' },
+    { connector_kind: 'mcp', access_token: TOKEN, auth_injection: 'env:GITHUB_TOKEN',
+      mcp_server: { transport: 'stdio', command: 'docker', args: ['run'] } },
+    { execFile, cwd: '/w', clientType: 'codex', warn: (m) => warns.push(m) },
+  );
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, 'codex mcp add failed (exit 2)');
+  assert.ok(warns.every((l) => !l.includes(TOKEN)), 'warn log leaked the token');
+});
+
+// --- idempotency: repeat upsert doesn't duplicate ----------------------------
+
+test('upsertMcpServer: 重复 upsert 每次都先 remove 再 add（幂等，不产生重复 server）', async () => {
+  const { calls, execFile } = recordingExec();
+  const args = [
+    { id: 'conn-1', slug: 'linear' },
+    { connector_kind: 'mcp', access_token: 'tok', token_type: 'bearer',
+      mcp_server: { transport: 'remote_http', server_url: 'https://mcp.linear.app/rpc' } },
+    { execFile, cwd: '/w', clientType: 'claude' },
+  ];
+  await upsertMcpServer(...args);
+  await upsertMcpServer(...args);
+  // each upsert = exactly one remove + one add-json, same name → no duplicate entry
+  const removes = calls.filter((c) => c.args[1] === 'remove');
+  const adds = calls.filter((c) => c.args[1] === 'add-json');
+  assert.equal(removes.length, 2);
+  assert.equal(adds.length, 2);
+  assert.ok(removes.every((c) => c.args.includes('openmax-linear-conn-1')));
+  assert.ok(adds.every((c) => c.args.includes('openmax-linear-conn-1')));
+});
+
+test('upsertMcpServer (codex): 幂等 — 每次 upsert 先 codex remove 再 codex add', async () => {
+  const { calls, execFile } = recordingExec();
+  const args = [
+    { id: 'conn-gh', slug: 'github' },
+    { connector_kind: 'mcp', access_token: 'ghp', auth_injection: 'env:GH',
+      mcp_server: { transport: 'stdio', command: 'docker', args: ['run'] } },
+    { execFile, cwd: '/w', clientType: 'codex' },
+  ];
+  await upsertMcpServer(...args);
+  await upsertMcpServer(...args);
+  assert.equal(calls.filter((c) => c.file === 'codex' && c.args[1] === 'remove').length, 2);
+  assert.equal(calls.filter((c) => c.file === 'codex' && c.args[1] === 'add').length, 2);
 });

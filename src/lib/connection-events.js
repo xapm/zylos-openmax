@@ -142,12 +142,14 @@ export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
   const {
     log = () => {}, warn = () => {}, post = postForOrg, get = getForOrg,
     connectDir, credentialsDir, catalogDir, notify = () => {}, notifyReauth = () => {},
-    mcpExecFile, mcpCwd,
+    mcpExecFile, mcpCwd, mcpClientType,
   } = deps;
   // Deps forwarded to the Route-A MCP sink. execFile/cwd are undefined in
   // production (mcp-config.js supplies its real defaults) and injected in tests;
   // log/warn always flow through so sink output shares this handler's channel.
-  const mcpDeps = { execFile: mcpExecFile, cwd: mcpCwd, log, warn };
+  // clientType is undefined in production so the sink auto-detects the active
+  // runtime client (env → config.json → claude); tests pin it for hermeticity.
+  const mcpDeps = { execFile: mcpExecFile, cwd: mcpCwd, log, warn, clientType: mcpClientType };
   const { event, data } = frame.payload || {};
   if (!event || !data) return;
 

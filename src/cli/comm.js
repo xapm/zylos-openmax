@@ -484,9 +484,15 @@ const COMMANDS = {
     if (!params.kind || !params.askedOf) {
       throw new Error('comm.ask_card: kind and askedOf are required — an answer with neither cannot be acted on');
     }
+    // Strip this verb's own arguments before building the request. `kind`,
+    // `askedOf` and `meta` describe the QUESTION, not the card, and the card
+    // builder refuses every field the endpoint has no place for — including a
+    // `kind`, which the old card API used for something else entirely. Passing
+    // them through made this verb throw on its own required argument.
+    const { kind, askedOf, meta, ...cardParams } = params;
     const res = await post(
       apiPath(`/conversations/${params.conversationId}/interaction-requests`),
-      buildChoiceRequest(params),
+      buildChoiceRequest(cardParams),
     );
     const actionIds = res?.action_ids || res?.data?.action_ids;
     const messageId = res?.message_id || res?.data?.message_id;
@@ -494,16 +500,15 @@ const COMMANDS = {
       // The card is already posted; say so rather than implying nothing happened.
       throw new Error(`comm.ask_card: card was SENT but the response carried no ${messageId ? 'action_ids' : 'message_id'}, so the answer will not be decodable: ${JSON.stringify(res)}`);
     }
-    const { conversationId, kind, askedOf, ...rest } = params;
     recordPendingQuestion({
       kind,
       askedOf,
-      conversationId,
+      conversationId: params.conversationId,
       cardMessageId: messageId,
       actionIds,
       askedAt: new Date().toISOString(),
-      title: rest.title,
-      meta: rest.meta,
+      title: params.title,
+      meta,
     });
     return { ...res, recorded: true };
   },

@@ -116,3 +116,22 @@ test('🔴 kind and fallbackText are refused, not ignored', () => {
     );
   }
 });
+
+test('🔴 a question-level argument named like a card field must not reach the builder', () => {
+  // `comm.ask_card` takes its own `kind` (what the question is for) while the
+  // old card API used `kind` for something else, and the builder refuses it.
+  // Passing the verb's arguments straight through made that verb throw on its
+  // own required argument — every call, before any request went out.
+  assert.throws(
+    () => buildChoiceRequest({ ...base, options: ['Y'], kind: 'component-upgrade' }),
+    (e) => e instanceof InteractionRequestError && e.field === 'kind',
+  );
+  const { kind, askedOf, meta, ...cardParams } = {
+    ...base, options: ['Y'], kind: 'component-upgrade', askedOf: 'm1', meta: { v: 1 },
+  };
+  const body = buildChoiceRequest(cardParams);
+  assert.equal(body.interaction_type, 'choice');
+  assert.equal('kind' in body.choice, false);
+  assert.equal('askedOf' in body.choice, false);
+  assert.equal('meta' in body.choice, false);
+});

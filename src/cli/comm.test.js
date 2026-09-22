@@ -138,6 +138,7 @@ test('send_card → POST .../interaction-requests with an interaction_type=choic
     conversationId: 'cv-card-1',
     title: 'Confirm',
     summary: 'Continue the deploy?',
+    text: 'The deploy is staged and waiting.',
     options: ['Yes', 'No'],
   });
 
@@ -159,6 +160,7 @@ test('send_card refuses an option id rather than dropping it', async () => {
     conversationId: 'cv-card-3',
     title: 't',
     summary: 's',
+    text: 'body',
     options: [{ label: 'Yes', id: 'yes' }],
   });
   assert.match(failure.error, /^options\[0\]\.id: /);
@@ -168,7 +170,7 @@ test('send_card refuses an option id rather than dropping it', async () => {
 test('send_card refuses replyTo and mentions — the endpoint has no field for them', async () => {
   for (const extra of [{ replyTo: 'msg-parent' }, { mentions: ['member-9'] }]) {
     const failure = await captureFailure('comm.send_card', {
-      conversationId: 'cv-card-2', title: 't', summary: 's', options: ['Yes'], ...extra,
+      conversationId: 'cv-card-2', title: 't', summary: 's', text: 'body', options: ['Yes'], ...extra,
     });
     assert.match(failure.error, /is not supported by interaction-requests/);
     assert.equal(failure.status, undefined, 'no HTTP round trip happened');
@@ -177,7 +179,7 @@ test('send_card refuses replyTo and mentions — the endpoint has no field for t
 
 test('send_card refuses a card with no options', async () => {
   const failure = await captureFailure('comm.send_card', {
-    conversationId: 'cv-card-4', title: 't', summary: 's',
+    conversationId: 'cv-card-4', title: 't', summary: 's', text: 'body',
   });
   assert.match(failure.error, /^options: /);
   assert.equal(failure.status, undefined, 'no HTTP round trip happened');

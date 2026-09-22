@@ -3,7 +3,12 @@ import test from 'node:test';
 
 import { buildChoiceRequest, InteractionRequestError } from './interaction-request.js';
 
-const base = { conversationId: 'c1', title: 'Upgrade?', summary: '3 components can be upgraded' };
+const base = {
+  conversationId: 'c1',
+  title: 'Upgrade?',
+  summary: '3 components can be upgraded',
+  text: 'dashboard 0.5.4 and lark 0.3.11 both have newer releases.',
+};
 
 test('builds the choice shape the endpoint declares', () => {
   const body = buildChoiceRequest({ ...base, text: 'Upgrade all three?', options: ['Yes', 'No'] });
@@ -14,9 +19,20 @@ test('builds the choice shape the endpoint declares', () => {
   assert.deepEqual(body.choice.options, [{ label: 'Yes' }, { label: 'No' }]);
 });
 
-test('text defaults to summary, and explicit blocks win over it', () => {
-  const derived = buildChoiceRequest({ ...base, options: ['Yes'] });
-  assert.deepEqual(derived.choice.blocks, [{ type: 'text', text: base.summary }]);
+test('🔴 the body is never derived from summary, because the client shows both', () => {
+  // Defaulting the body to the summary rendered the same sentence twice in the
+  // card — once beside the title, once as the body.
+  const { text, ...noBody } = base;
+  assert.throws(
+    () => buildChoiceRequest({ ...noBody, options: ['Yes'] }),
+    (e) => e instanceof InteractionRequestError && e.field === 'text',
+  );
+  const withText = buildChoiceRequest({ ...base, text: 'body says something else', options: ['Yes'] });
+  assert.deepEqual(withText.choice.blocks, [{ type: 'text', text: 'body says something else' }]);
+  assert.notEqual(withText.choice.blocks[0].text, withText.choice.summary);
+});
+
+test('explicit blocks win over text', () => {
   const explicit = buildChoiceRequest({
     ...base,
     text: 'ignored when blocks are given',

@@ -66,18 +66,26 @@ function textBlock(text) {
 
 export function buildChoiceRequest(params = {}) {
   const title = requireText(params.title, 'title');
-  // summary is also the plain-text projection clients that cannot render a
-  // card fall back to, so it is required rather than derived from the body.
+  // summary is the one-line projection shown beside the title, and the text a
+  // client that cannot render the card falls back to. It is required, and it is
+  // NOT the card body — see the blocks check below.
   const summary = requireText(params.summary, 'summary');
 
+  // 🔴 The body is not defaulted from `summary`. It used to be, and the card
+  // then rendered the same sentence twice — once in the header beside the
+  // title, once as the body — because both fields reach the client and neither
+  // knows the other repeated it. A convenience default that produces a visibly
+  // wrong card is worse than asking the caller for one more field.
   let blocks;
   if (params.blocks !== undefined) {
     if (!Array.isArray(params.blocks) || params.blocks.length === 0) {
       throw new InteractionRequestError('blocks', 'must be a non-empty array');
     }
     blocks = params.blocks;
+  } else if (params.text !== undefined) {
+    blocks = [textBlock(requireText(params.text, 'text'))];
   } else {
-    blocks = [textBlock(params.text === undefined ? summary : requireText(params.text, 'text'))];
+    throw new InteractionRequestError('text', 'is required (or pass `blocks`): the card body is not derived from `summary`, which the client already shows beside the title');
   }
 
   // Options are required now. A zero-button card is not something this path can

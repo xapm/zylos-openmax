@@ -11,7 +11,7 @@ import {
   buildNeedsSelection, buildCandidateLabels, resolveInvokeEntry,
   planAppCreate, planAppUpdate,
   planActionDefList, planActionDefCreate, planActionDefUpdate, planActionDefDelete,
-  runAppImport,
+  runAppImport, classifyPanelFetchFailure,
 } from './conn.js';
 
 // buildNeedsSelection / buildCandidateLabels / resolveInvokeEntry are pure (no
@@ -1653,4 +1653,149 @@ test('conn.invoke conversation-scoped: authorized-but-not-enabled → 403 not_en
   } finally {
     await new Promise((r) => server.close(r));
   }
+});
+
+// ---------------------------------------------------------------------------
+// F4 readiness capability probe (design §5.1): the per-conversation connectors
+// endpoint doubles as the panel readiness signal. When it is unreachable (404 /
+// network = half-upgrade) or errors (5xx = enabled set unavailable), conn.list
+// must degrade to an EMPTY list — never the unfiltered authorized set — and
+// conn.invoke must REJECT with the matching named code. Both fail closed.
+// ---------------------------------------------------------------------------
+
+test('conn.list F4: connectors endpoint 404 (panel not ready) → empty list, never the unfiltered set', async () => {
+  const home = setupHome({ connections: {} });
+  const server = createServer((req, res) => {
+    if (req.url.includes('/conversations/conv-x/connectors')) {
+      // Endpoint not deployed on this instance (half-upgrade).
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end('{"error":{"detail":"not found"},"request_id":"r1"}');
+      return;
+    }
+    if (req.url.includes('/connect/agents/me/connections')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [
+        { id: 'c1', application_slug: 'gmail', application_name: 'Gmail', status: 'active' },
+        { id: 'c2', application_slug: 'slack', application_name: 'Slack', status: 'active' },
+      ], request_id: 'r0' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r9"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    const { code, stdout } = await runConn(
+      home, 'conn.list', { conversationId: 'conv-x' }, `http://127.0.0.1:${port}`,
+    );
+    assert.equal(code, 0, `expected graceful empty list, stdout=${stdout}`);
+    assert.deepEqual(JSON.parse(stdout), [], 'panel-not-ready → empty list (fail-closed), NOT the full authorized set');
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('conn.list F4: connectors endpoint 503 (enabled set unavailable) → empty list', async () => {
+  const home = setupHome({ connections: {} });
+  const server = createServer((req, res) => {
+    if (req.url.includes('/conversations/conv-x/connectors')) {
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end('{"error":{"detail":"upstream unavailable"},"request_id":"r1"}');
+      return;
+    }
+    if (req.url.includes('/connect/agents/me/connections')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [
+        { id: 'c1', application_slug: 'gmail', application_name: 'Gmail', status: 'active' },
+      ], request_id: 'r0' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r9"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    const { code, stdout } = await runConn(
+      home, 'conn.list', { conversationId: 'conv-x' }, `http://127.0.0.1:${port}`,
+    );
+    assert.equal(code, 0, `expected graceful empty list, stdout=${stdout}`);
+    assert.deepEqual(JSON.parse(stdout), [], 'enabled-set-unavailable → empty list (fail-closed)');
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('conn.invoke F4: connectors endpoint 404 → reject connector_panel_not_ready (no execute)', async () => {
+  const home = setupHome({ connections: {
+    c1: { id: 'c1', applicationId: 'app-1', slug: 'gmail', name: 'Gmail', status: 'active', credentialMode: 'proxy', credentialSource: 'composio', ownerScope: 'org' },
+  } });
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url);
+    if (req.url.includes('/conversations/conv-y/connectors')) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end('{"error":{"detail":"not found"},"request_id":"r1"}');
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r9"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    const { code, stderr } = await runConn(
+      home, 'conn.invoke',
+      { connectionId: 'c1', action: 'gmail/send', params: {}, conversationId: 'conv-y' },
+      `http://127.0.0.1:${port}`,
+    );
+    assert.equal(code, 1);
+    const err = JSON.parse(stderr);
+    assert.equal(err.status, 503);
+    assert.equal(err.code, 'connector_panel_not_ready');
+    assert.ok(!seen.some((u) => u.includes('/actions/execute')), 'no execute when the panel is not ready');
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('conn.invoke F4: connectors endpoint 503 → reject connector_enabled_set_unavailable (no execute)', async () => {
+  const home = setupHome({ connections: {
+    c1: { id: 'c1', applicationId: 'app-1', slug: 'gmail', name: 'Gmail', status: 'active', credentialMode: 'proxy', credentialSource: 'composio', ownerScope: 'org' },
+  } });
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url);
+    if (req.url.includes('/conversations/conv-y/connectors')) {
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end('{"error":{"detail":"upstream unavailable"},"request_id":"r1"}');
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r9"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    const { code, stderr } = await runConn(
+      home, 'conn.invoke',
+      { connectionId: 'c1', action: 'gmail/send', params: {}, conversationId: 'conv-y' },
+      `http://127.0.0.1:${port}`,
+    );
+    assert.equal(code, 1);
+    const err = JSON.parse(stderr);
+    assert.equal(err.status, 503);
+    assert.equal(err.code, 'connector_enabled_set_unavailable');
+    assert.ok(!seen.some((u) => u.includes('/actions/execute')), 'no execute when the enabled set is unavailable');
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('classifyPanelFetchFailure: 404/network → panel_not_ready; 5xx → enabled_set_unavailable', () => {
+  assert.equal(classifyPanelFetchFailure({ status: 404 }), 'connector_panel_not_ready');
+  assert.equal(classifyPanelFetchFailure(new Error('ECONNREFUSED')), 'connector_panel_not_ready', 'no HTTP status (network) → panel_not_ready');
+  assert.equal(classifyPanelFetchFailure({ status: 503 }), 'connector_enabled_set_unavailable');
+  assert.equal(classifyPanelFetchFailure({ status: 500 }), 'connector_enabled_set_unavailable');
 });

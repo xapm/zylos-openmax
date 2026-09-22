@@ -556,15 +556,53 @@ function looksLikeActionOrSchemaError(err) {
   return false;
 }
 
+// F4 readiness classification (fail-closed, design §5.1). A failed panel fetch is
+// mapped to one of two named codes so operators can tell the failure faces apart:
+//   - 404 / no HTTP status (network-level failure) ⇒ the per-conversation
+//     connectors endpoint is not deployed on this instance yet (half-upgrade)
+//     ⇒ `connector_panel_not_ready`.
+//   - any other failure (5xx / transient) ⇒ the endpoint is reachable but the
+//     enabled set could not be read ⇒ `connector_enabled_set_unavailable`.
+// Either way the caller must fail closed — never fall back to the unfiltered list.
+export function classifyPanelFetchFailure(err) {
+  const status = err && err.status;
+  return status == null || status === 404
+    ? 'connector_panel_not_ready'
+    : 'connector_enabled_set_unavailable';
+}
+
 // Fetch the set of connector (connection) ids ENABLED for a conversation, from
 // cws-core's per-conversation enabled set (GET /conversations/{id}/connectors,
 // which returns only enabled, non-deleted rows). Keyed on connection id — the
 // same identifier the panel toggles and conn.list/conn.invoke resolve against.
 // Returns a Set; an empty/absent list yields an empty Set (opt-in default = off).
+//
+// F4 capability probe: this GET is also the readiness signal for the connector
+// panel. If it fails we do NOT swallow it into an empty Set (that would be
+// indistinguishable from "nothing enabled" and let conn.invoke run unfiltered) —
+// we throw a classified, fail-closed readiness error (status 503 + `.code`).
+// Callers decide the shape: conn.list degrades to an empty list, conn.invoke
+// rejects. Neither ever falls back to the full, unfiltered connector set.
 async function fetchEnabledConnectorIds(orgId, conversationId) {
-  const resp = await getForOrg(orgId, apiPath(`/conversations/${conversationId}/connectors`));
+  let resp;
+  try {
+    resp = await getForOrg(orgId, apiPath(`/conversations/${conversationId}/connectors`));
+  } catch (err) {
+    const code = classifyPanelFetchFailure(err);
+    throw Object.assign(
+      new Error(code === 'connector_panel_not_ready'
+        ? 'connector panel is not ready (the per-conversation connectors endpoint is unavailable) — cannot resolve the enabled set'
+        : 'the enabled-connector set for this conversation could not be read — please try again shortly'),
+      { status: 503, code },
+    );
+  }
   const rows = resp && Array.isArray(resp.connectors) ? resp.connectors : [];
   return new Set(rows.filter((r) => r && r.enabled !== false).map((r) => r.connector_id).filter(Boolean));
+}
+
+// True for the two F4 readiness codes thrown by fetchEnabledConnectorIds.
+function isPanelReadinessCode(code) {
+  return code === 'connector_panel_not_ready' || code === 'connector_enabled_set_unavailable';
 }
 
 const COMMANDS = {
@@ -583,7 +621,17 @@ const COMMANDS = {
     // conversationId this is the full agent-authorized list (unchanged behavior).
     const convId = params.conversationId || params.conversation_id || null;
     if (!convId || !Array.isArray(all)) return all;
-    const enabledIds = await fetchEnabledConnectorIds(orgId, convId);
+    let enabledIds;
+    try {
+      enabledIds = await fetchEnabledConnectorIds(orgId, convId);
+    } catch (err) {
+      // F4 fail-closed: if the panel/enabled set can't be resolved (endpoint not
+      // ready or enabled set unavailable) return an EMPTY list — never the
+      // unfiltered `all` (listing every connector while the gate is down is
+      // over-authorization = the "looks-like-success failure" F4 exists to stop).
+      if (isPanelReadinessCode(err && err.code)) return [];
+      throw err;
+    }
     return all.filter((c) => enabledIds.has(c.id || c.connection_id));
   },
 

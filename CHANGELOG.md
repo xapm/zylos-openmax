@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Personal connectors are blocked in group conversations.** A personal-scope connector is the individual's own credential and must never be executed in a group/thread conversation (where other members could trigger it). `conn.invoke` now accepts a `conversation_id` and reads that conversation's type from the server (the source of truth — never an agent-supplied "is this a group" flag), refusing a personal connector anywhere that is not a confirmed direct message (fail-closed on an unknown/unfetchable type) with a 403. `org`-scope connectors and direct messages are unaffected. The connections index now persists an `ownerScope` field (`owner_scope`) additively alongside `credentialMode` / `connectorKind`.
+
 ## [2.20.0] — 2026-09-17
 
 ### Added

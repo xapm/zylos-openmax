@@ -117,6 +117,13 @@ function toEntry(conn) {
     // may not carry connector_kind, can still recognize an MCP connection and tear
     // down its local MCP server.
     connectorKind: conn.connector_kind || conn.connectorKind || null,
+    // Ownership scope (cws-connect): "org" (admin-authorized, shared across the
+    // org) | "personal" (the individual's own credential). Kept so conn.invoke
+    // can enforce the rule that a personal connector must never execute in a group
+    // conversation (a private credential triggered by other group members). Like
+    // credentialMode, a sparse WS event may omit it, so it defaults to null and
+    // is filled additively by a later conn.list refresh.
+    ownerScope: conn.owner_scope || conn.ownerScope || null,
     status,
   };
 }
@@ -148,10 +155,32 @@ export function upsertConnection(conn, indexPath = INDEX_PATH) {
     // not carry connector_kind) must never null a value a richer authorize event /
     // conn.list record already captured — the MCP teardown path depends on it.
     connectorKind: entry.connectorKind ?? prev.connectorKind ?? null,
+    // Additive like the rest: a sparse event without owner_scope must not null
+    // an ownerScope a richer conn.list record already captured.
+    ownerScope: entry.ownerScope ?? prev.ownerScope ?? null,
     status: entry.status ?? prev.status ?? 'active',
   };
   writeIndex(index, indexPath);
   return index.connections[entry.id];
+}
+
+/**
+ * Access decision (pure, so it can be unit-tested without any IO): may a connector
+ * with this ownerScope execute in a conversation of this type?
+ *
+ * A **personal**-scope connector is the individual's own credential; it may run
+ * ONLY in a confirmed direct message. Anything not confirmed `"dm"` — a group, a
+ * thread, or an unknown/failed type — blocks it, so a private credential can
+ * never be triggered by other members of a shared conversation. **org**-scope
+ * (shared, admin-authorized) and unknown-scope connectors are not blocked here.
+ *
+ * Fail-closed on purpose: the caller passes the type it read from the server for
+ * this conversation_id, and if that could not be confirmed to be a DM we refuse
+ * rather than leak. Returns true when the connector must be REJECTED.
+ */
+export function personalConnectorBlockedInConversation(ownerScope, convType) {
+  if (ownerScope !== 'personal') return false;
+  return (convType || '').toLowerCase() !== 'dm';
 }
 
 /** Remove one connection from the index (idempotent). */

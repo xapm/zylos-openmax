@@ -9,6 +9,7 @@ import {
   findActiveConnectionsByApp,
   readCatalog, writeCatalog, invalidateCatalog, catalogPath, indexPathForOrg,
   listIndexPaths, countConnectionsForApp,
+  personalConnectorBlockedInConversation,
 } from './connect-store.js';
 
 function tmpIndex() {
@@ -457,4 +458,55 @@ test('countConnectionsForApp 跨所有 org 索引按 applicationId 引用计数�
   assert.equal(countConnectionsForApp('app-X', { dir, excludeConnectionId: 'b1' }), 0, 'orgA 撤销后再排除 orgB 的 b1 → 最后一条');
   // 空 applicationId → 0，不抛
   assert.equal(countConnectionsForApp(null, { dir }), 0);
+});
+
+// --- ownership scope: ownerScope (block personal connectors in group chats) ---
+
+test('toEntry 捕获 ownerScope（owner_scope 与 camelCase 别名都认），缺省为 null', () => {
+  const idx = tmpIndex();
+  upsertConnection(
+    { connection_id: 'c1', application_slug: 'gmail', credential_mode: 'direct', owner_scope: 'personal', status: 'active' },
+    idx,
+  );
+  upsertConnection(
+    { connection_id: 'c2', application_slug: 'slack', credential_mode: 'direct', ownerScope: 'org', status: 'active' },
+    idx,
+  );
+  upsertConnection({ connection_id: 'c3', application_slug: 'jira', status: 'active' }, idx);
+  assert.equal(readIndex(idx).connections.c1.ownerScope, 'personal');
+  assert.equal(readIndex(idx).connections.c2.ownerScope, 'org'); // camelCase 别名也认
+  assert.equal(readIndex(idx).connections.c3.ownerScope, null);  // 缺省不臆造
+});
+
+test('upsert 叠加：稀疏事件（无 owner_scope）不清空已知的 personal', () => {
+  const idx = tmpIndex();
+  upsertConnection(
+    { connection_id: 'c1', application_id: 'app-1', application_slug: 'gmail', owner_scope: 'personal', credential_mode: 'direct', status: 'active' },
+    idx,
+  );
+  upsertConnection({ connection_id: 'c1', provider: 'gmail', status: 'active' }, idx);
+  assert.equal(readIndex(idx).connections.c1.ownerScope, 'personal');
+});
+
+test('replaceIndexFromList 整体重建也捕获 ownerScope（走 toEntry）', () => {
+  const idx = tmpIndex();
+  replaceIndexFromList([
+    { connection_id: 'c1', application_slug: 'jira', credential_mode: 'proxy', owner_scope: 'org' },
+    { connection_id: 'c2', application_slug: 'notion', credential_mode: 'direct', owner_scope: 'personal' },
+  ], idx);
+  assert.equal(readIndex(idx).connections.c1.ownerScope, 'org');
+  assert.equal(readIndex(idx).connections.c2.ownerScope, 'personal');
+});
+
+test('personalConnectorBlockedInConversation：个人连接器仅在确认的 DM 放行，其余一律拒（fail-closed）', () => {
+  // personal → 只有 dm 放行
+  assert.equal(personalConnectorBlockedInConversation('personal', 'group'), true);
+  assert.equal(personalConnectorBlockedInConversation('personal', 'thread'), true);
+  assert.equal(personalConnectorBlockedInConversation('personal', null), true);   // 未知 → fail-closed
+  assert.equal(personalConnectorBlockedInConversation('personal', ''), true);
+  assert.equal(personalConnectorBlockedInConversation('personal', 'dm'), false);
+  assert.equal(personalConnectorBlockedInConversation('personal', 'DM'), false);  // 大小写不敏感
+  // org / 未知 scope → 本闸不拦
+  assert.equal(personalConnectorBlockedInConversation('org', 'group'), false);
+  assert.equal(personalConnectorBlockedInConversation(null, 'group'), false);
 });

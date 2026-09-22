@@ -1457,3 +1457,85 @@ test('conn.actiondef_create (subprocess): 调用方 Authorization 头本地拒�
     await new Promise((r) => server.close(r));
   }
 });
+
+// --- conn.invoke: personal connector must not execute in a group --------------
+//
+// A personal-scope connector is the caller's private credential. When a
+// conversation_id is supplied, conn.invoke reads that conversation's TYPE from
+// the server (source of truth — never an agent-supplied "is group" flag) and
+// refuses a personal connector anywhere that is not a confirmed DM. org-scope
+// connectors and DMs are unaffected. Exercised via subprocess with a local
+// server answering GET /conversations/<id>.
+
+test('conn.invoke: personal connector + group conversation → 403 (blocked before execute)', async () => {
+  const home = setupHome({ connections: {
+    c1: { id: 'c1', applicationId: 'app-1', slug: 'gmail', name: 'Gmail', status: 'active', credentialMode: 'direct', ownerScope: 'personal' },
+  } });
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url);
+    if (req.url.includes('/conversations/conv-group')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: { id: 'conv-group', type: 'group' }, request_id: 'r1' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r0"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    const { code, stderr } = await runConn(
+      home, 'conn.invoke',
+      { connectionId: 'c1', action: 'gmail/send', params: {}, conversationId: 'conv-group' },
+      `http://127.0.0.1:${port}`,
+    );
+    assert.equal(code, 1);
+    const err = JSON.parse(stderr);
+    assert.equal(err.status, 403);
+    assert.match(err.error, /personal connector|group conversation/);
+    // The gate reads the conversation type from the server and rejects BEFORE any
+    // execute/credential work: only the conversation GET should have been hit.
+    assert.ok(seen.some((u) => u.includes('/conversations/conv-group')), 'conversation type was fetched from the server');
+    assert.ok(!seen.some((u) => u.includes('/actions/execute')), 'no execute request should be made when blocked');
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('conn.invoke: personal connector + DM conversation → allowed (proceeds to execute)', async () => {
+  const home = setupHome({ connections: {
+    // proxy so the allowed path goes server-side execute (no local catalog/credential).
+    c1: { id: 'c1', applicationId: 'app-1', slug: 'notion', name: 'Notion', status: 'active', credentialMode: 'proxy', credentialSource: 'composio', ownerScope: 'personal' },
+  } });
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url);
+    if (req.url.includes('/conversations/conv-dm')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: { id: 'conv-dm', type: 'dm' }, request_id: 'r1' }));
+      return;
+    }
+    if (req.url.includes('/connect/connections/c1/actions/execute')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: { status_code: 200, body: { ok: true } }, request_id: 'r2' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r0"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    const { code, stdout } = await runConn(
+      home, 'conn.invoke',
+      { connectionId: 'c1', action: 'notion/search', params: {}, conversationId: 'conv-dm' },
+      `http://127.0.0.1:${port}`,
+    );
+    assert.equal(code, 0, `expected success, stdout=${stdout}`);
+    // DM → not blocked → proceeded to server-side execute.
+    assert.ok(seen.some((u) => u.includes('/actions/execute')), 'a DM must let a personal connector through to execute');
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});

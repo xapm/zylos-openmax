@@ -17,6 +17,7 @@ import { listCachedCredentials, clearCachedCredentials, readCredentialCache, sav
 import {
   readIndex, replaceIndexFromList, findConnectionByApp, findActiveConnectionsByApp, indexPathForOrg,
   readCatalog, writeCatalog, invalidateCatalog, CATALOG_TTL_MS,
+  personalConnectorBlockedInConversation,
 } from '../lib/connect-store.js';
 import { acquireCredential } from '../lib/connection-events.js';
 import { invokeDirect, resolveCredential } from '../lib/direct-exec.js';
@@ -846,6 +847,41 @@ const COMMANDS = {
         new Error(`connection for app "${appLabel}" is not usable (status: ${entry.status}) — it may be expired, revoked, or in an error state. Re-authorize it on the connection page, then retry.`),
         { status: 409 },
       );
+    }
+
+    // A personal-scope connector is the caller's PRIVATE credential and
+    // must never execute in a group/thread conversation — only in a direct
+    // message. The conversation TYPE is read from the server (the source of
+    // truth) for the caller-supplied conversation_id; we deliberately do NOT
+    // trust an agent-supplied "is this a group" flag. org-scope connectors are
+    // shared/admin-authorized and are unaffected by this gate.
+    const invokeConvId = params.conversationId || params.conversation_id || null;
+    if (invokeConvId && entry.ownerScope !== 'org') {
+      // A sparse WS event may have left ownerScope null; refresh once so a stale
+      // index cannot mask a personal connector (mirrors the credential_mode
+      // self-heal below). org entries short-circuit above and never reach here.
+      if (entry.ownerScope == null) {
+        await refreshIndex(orgId, agentId);
+        const refreshed = readIndex(idxPath).connections[entry.id];
+        if (refreshed) entry = refreshed;
+      }
+      if (entry.ownerScope === 'personal') {
+        let convType = null;
+        try {
+          const conv = await getForOrg(orgId, apiPath(`/conversations/${invokeConvId}`));
+          convType = conv?.type || null;
+        } catch {
+          // Fail closed: if the conversation type cannot be confirmed as a DM we
+          // treat it as non-DM and refuse — this gate guards a real cross-user boundary.
+          convType = null;
+        }
+        if (personalConnectorBlockedInConversation(entry.ownerScope, convType)) {
+          throw Object.assign(
+            new Error(`connector for app "${appLabel}" is a personal connector and cannot be used in a group conversation — personal connectors only work in your direct messages.`),
+            { status: 403 },
+          );
+        }
+      }
     }
 
     // Route by the connector taxonomy recorded in the index (credential_mode).

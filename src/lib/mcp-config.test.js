@@ -805,6 +805,97 @@ test('upsertMcpServer (codex, http): query 型 token 随 URL，不产生 --beare
   assert.ok(!add.args.includes('--bearer-token-env-var'));
 });
 
+// P1' — codex http FAIL-LOUD also covers headers arriving via raw_config /
+// headers_template (spec.headers), not only auth-derived headers.
+
+test('upsertMcpServer (codex, http): raw_config wrapper 携带 Authorization 头 → FAIL-LOUD，零 CLI', async () => {
+  const { calls, execFile } = recordingExec();
+  const warns = [];
+  const res = await upsertMcpServer(
+    { id: 'c-lin', slug: 'linear' },
+    {
+      connector_kind: 'mcp',
+      // wrapper form (mcp-config.test.js:320-330): headers inline in raw_config, no access_token
+      raw_config: { mcpServers: { linear: { type: 'http', url: 'https://mcp.linear.app/sse', headers: { Authorization: 'Bearer sk-INLINE' } } } },
+    },
+    { execFile, cwd: '/w', clientType: 'codex', warn: (m) => warns.push(m) },
+  );
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, 'codex-http-header-auth-unsupported');
+  assert.equal(calls.length, 0, 'header-bearing raw_config must trigger ZERO codex CLI calls (no remove, no add)');
+  assert.ok(warns.length > 0 && warns.every((l) => !l.includes('sk-INLINE')), 'warn must fire and not leak the inline header');
+});
+
+test('upsertMcpServer (codex, http): raw_config bare 形态携带 Authorization 头 → FAIL-LOUD，零 CLI', async () => {
+  const { calls, execFile } = recordingExec();
+  const res = await upsertMcpServer(
+    { id: 'c-x', slug: 'x' },
+    {
+      connector_kind: 'mcp',
+      raw_config: { type: 'http', url: 'https://mcp.example/rpc', headers: { Authorization: 'Bearer sk-BARE' } },
+    },
+    { execFile, cwd: '/w', clientType: 'codex' },
+  );
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, 'codex-http-header-auth-unsupported');
+  assert.equal(calls.length, 0);
+});
+
+test('upsertMcpServer (codex, http): headers_template 携带 X-Api-Key（非密自定义头）→ FAIL-LOUD，零 CLI', async () => {
+  const { calls, execFile } = recordingExec();
+  const res = await upsertMcpServer(
+    { id: 'c-k', slug: 'keyed' },
+    {
+      connector_kind: 'mcp',
+      mcp_server: { transport: 'remote_http', server_url: 'https://k.example/mcp', headers_template: { 'X-Api-Key': 'abc' } },
+    },
+    { execFile, cwd: '/w', clientType: 'codex' },
+  );
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, 'codex-http-header-auth-unsupported');
+  assert.equal(calls.length, 0, 'a custom header codex cannot express must also fail loud');
+});
+
+test('upsertMcpServer (codex, http): 完全无头无 auth → 仍走 codex mcp add --url（不误伤）', async () => {
+  const { calls, execFile } = recordingExec();
+  const res = await upsertMcpServer(
+    { id: 'c-plain', slug: 'plain' },
+    { connector_kind: 'mcp', mcp_server: { transport: 'remote_http', server_url: 'https://plain.example/mcp' } },
+    { execFile, cwd: '/w', clientType: 'codex' },
+  );
+  assert.deepEqual(res, { ok: true, name: 'openmax-plain-c-plain' });
+  const add = codexAddCall(calls);
+  assert.deepEqual(add.args, ['mcp', 'add', 'openmax-plain-c-plain', '--url', 'https://plain.example/mcp']);
+});
+
+// P1'' — a query token living in raw_config.url (NO separate access_token) must
+// not leak into the failure reason/warn when a no-exit-code exec error echoes argv.
+
+test('upsertMcpServer (codex, http): URL 内 query token（无 access_token）失败(无 exit code)时不泄露（raw 与 encoded 皆脱敏）', async () => {
+  const RAW = 'fake/token';
+  const ENCODED = encodeURIComponent(RAW); // "fake%2Ftoken"
+  const warns = [];
+  // The final URL carries the token as a query param; a no-.code rejection echoes argv.
+  const execFile = async (file, args) => {
+    if (args[1] === 'add') throw new Error(`spawn error: codex ${args.join(' ')}`); // no .code → redaction fallback
+    return { stdout: '' }; // remove succeeds
+  };
+  const res = await upsertMcpServer(
+    { id: 'c-url', slug: 'demo' },
+    {
+      connector_kind: 'mcp',
+      // token lives inside raw_config.url itself; NO access_token on the response
+      raw_config: { type: 'http', url: `https://demo.example/mcp?key=${ENCODED}` },
+    },
+    { execFile, cwd: '/w', clientType: 'codex', warn: (m) => warns.push(m) },
+  );
+  assert.equal(res.ok, false);
+  assert.ok(!res.reason.includes(RAW), `reason leaked the raw token: ${res.reason}`);
+  assert.ok(!res.reason.includes(ENCODED), `reason leaked the URL-encoded token: ${res.reason}`);
+  assert.ok(warns.length > 0, 'expected a warn log');
+  assert.ok(warns.every((l) => !l.includes(RAW) && !l.includes(ENCODED)), `warn log leaked the token: ${warns.join(' | ')}`);
+});
+
 // --- runtime=codex remove ----------------------------------------------------
 
 test('removeMcpServer (codex): 生成 codex mcp remove <name>', async () => {

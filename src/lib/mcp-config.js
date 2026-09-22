@@ -217,6 +217,35 @@ function safeExecFailure(client, op, e, secrets = []) {
   return `${client} mcp ${op} failed: ${redactSecrets(e && e.message, secrets)}`;
 }
 
+/**
+ * Extract the query-string parameter VALUES from a URL as secrets to scrub.
+ *
+ * SECURITY: a query-located token can ride inside the FINAL assembled URL even
+ * when there is no separate `access_token` on the Acquire response — e.g. a
+ * raw_config whose `url` already carries `?key=<token>`. That URL goes verbatim
+ * into the mount argv (`--url ...` / the add-json JSON), so a no-exit-code exec
+ * rejection whose message echoes the argv would leak it. The value in the URL is
+ * percent-encoded; we return BOTH that encoded form (as it appears in the argv)
+ * AND its decoded form so exact-substring redaction catches either. Best-effort,
+ * never throws.
+ */
+function urlQuerySecrets(url) {
+  const out = [];
+  const s = String(url == null ? '' : url);
+  const q = s.indexOf('?');
+  if (q < 0) return out;
+  for (const pair of s.slice(q + 1).split('&')) {
+    const eq = pair.indexOf('=');
+    const val = eq < 0 ? '' : pair.slice(eq + 1);
+    if (!val) continue;
+    out.push(val);
+    let dec;
+    try { dec = decodeURIComponent(val); } catch { dec = val; }
+    if (dec && dec !== val) out.push(dec);
+  }
+  return out;
+}
+
 /** Parse a headers/env template into a plain string→string object. */
 function parseStringMap(tmpl) {
   if (!tmpl) return {};
@@ -513,14 +542,17 @@ const claudeAdapter = {
  *   - http + query-located token: `codex mcp add <name> --url <URL>` where the
  *     token already rides inside <URL> as a query param — codex persists the URL,
  *     so the credential survives to call time — fully supported.
- *   - http + header/bearer-located auth: INTENTIONALLY UNSUPPORTED (deferred).
- *     `codex mcp add --url ... --bearer-token-env-var <ENV>` only persists the env
- *     var NAME; codex reads the value from its OWN runtime env at MCP-call time,
- *     which we cannot populate for later codex sessions from here. Writing such a
- *     config would silently register a server that fails auth at call time. So the
- *     caller FAILS LOUD in its pre-CLI validation phase (registers nothing, zero
- *     CLI calls) rather than ship a broken config — real runtime-env injection is
- *     a follow-up. This adapter therefore never sees a header-auth http spec.
+ *   - http carrying ANY header: INTENTIONALLY UNSUPPORTED (deferred). This covers
+ *     both a header/bearer-located credential AND a non-secret custom header (e.g.
+ *     X-Api-Key) arriving via raw_config / headers_template. codex http has no flag
+ *     for arbitrary headers, and its only auth flag (`--bearer-token-env-var <ENV>`)
+ *     persists just the env var NAME, read from codex's OWN runtime env at MCP-call
+ *     time — which we cannot populate for later codex sessions from here. Emitting a
+ *     bare `--url` would SILENTLY DROP the header and register an unauthenticatable
+ *     server. So the caller FAILS LOUD in its pre-CLI validation phase (registers
+ *     nothing, zero CLI calls) rather than ship a broken config — real runtime-env
+ *     injection is a follow-up. This adapter therefore never sees a header-bearing
+ *     http spec (spec.headers is always empty by the time it reaches here).
  *   - remove: `codex mcp remove <name>`.
  */
 const codexAdapter = {
@@ -582,6 +614,9 @@ export async function upsertMcpServer(conn, acquireResponse, deps = {}) {
   } = deps;
   const connId = conn && conn.id;
   const adapter = adapterFor(clientType);
+  // The FINAL assembled mount URL, captured before the exec so the catch block can
+  // scrub a query-located token that lives in the URL itself (see urlQuerySecrets).
+  let mountUrl;
   try {
     const mcp = acquireResponse && acquireResponse.mcp_server;
     // raw_config may ride on mcp_server (preferred) or at the response root.
@@ -619,19 +654,28 @@ export async function upsertMcpServer(conn, acquireResponse, deps = {}) {
       return { ok: false, reason: 'no-mcp-server' };
     }
 
-    // FAIL LOUD (deferred capability): codex + remote http + a header/bearer-located
-    // credential cannot be persisted for codex to use at MCP-call time (codex only
-    // stores the bearer-token ENV VAR NAME and reads its value from codex's own
-    // runtime env, which we can't populate for later sessions from here). Rather
-    // than register a silently-broken server, refuse here in the PRE-CLI phase —
-    // BEFORE the remove-then-add — so we run ZERO CLI calls and never tear down an
-    // existing working server. (codex stdio and codex http+query-token still work.)
-    if (clientType === 'codex' && spec.transport === 'http' && spec.auth && spec.auth.location === 'header') {
-      warn(`[mcp-config] upsert skipped conn=${connId}: codex remote http header/bearer auth is unsupported (deferred) — refusing to register a broken server`);
+    // FAIL LOUD (deferred capability): the codex http adapter can only express a
+    // bare `--url` — it CANNOT carry ANY HTTP header (an Authorization/bearer
+    // credential OR a non-secret custom header like X-Api-Key). codex only stores
+    // the bearer-token ENV VAR NAME and reads its value from its own runtime env,
+    // which we can't populate for later sessions from here, and it has no flag for
+    // arbitrary headers at all. So a remote-http config that carries headers —
+    // whether the header comes from the injected credential (spec.auth.location
+    // === 'header') OR from raw_config / headers_template (already assembled into
+    // spec.headers by buildMcpServerJson) — would be SILENTLY DROPPED, registering
+    // an unauthenticatable server. Refuse here in the PRE-CLI phase — BEFORE the
+    // remove-then-add — so we run ZERO CLI calls and never tear down an existing
+    // working server. (codex stdio and codex http+query-token — token rides in the
+    // URL, spec.headers empty — still work.)
+    const hasHeaders = spec.headers && typeof spec.headers === 'object' && Object.keys(spec.headers).length > 0;
+    if (clientType === 'codex' && spec.transport === 'http'
+        && ((spec.auth && spec.auth.location === 'header') || hasHeaders)) {
+      warn(`[mcp-config] upsert skipped conn=${connId}: codex remote http cannot carry headers (auth or custom) — unsupported (deferred), refusing to register a broken server`);
       return { ok: false, reason: 'codex-http-header-auth-unsupported' };
     }
 
     const mount = adapter.buildMountPlan(spec);
+    mountUrl = spec.url; // capture for failure-path redaction (query token in URL)
 
     // Remove-then-add so a refresh replaces the prior credential cleanly (a bare
     // add of an existing name can be rejected). The remove is best-effort — a
@@ -654,10 +698,14 @@ export async function upsertMcpServer(conn, acquireResponse, deps = {}) {
     // scrub BOTH the raw token and its URL-encoded form (exact-substring redaction
     // won't catch the encoded value otherwise). encodeURIComponent is per-char, so
     // encodeURIComponent(token) is always a substring of the encoded URL value.
+    // Secrets to scrub: the access_token (raw + URL-encoded) AND any query-string
+    // value in the FINAL assembled URL — a query token can live in the URL even
+    // when access_token is empty (e.g. a raw_config url already carrying ?key=…).
     const tok = acquireResponse && acquireResponse.access_token;
-    const secrets = tok
-      ? [...new Set([String(tok), encodeURIComponent(String(tok))])] // dedupe (equal when no special chars)
-      : [];
+    const secrets = [...new Set([
+      ...(tok ? [String(tok), encodeURIComponent(String(tok))] : []),
+      ...urlQuerySecrets(mountUrl),
+    ])];
     const reason = safeExecFailure(adapter.clientType, adapter.mountOp, e, secrets);
     warn(`[mcp-config] upsertMcpServer failed conn=${connId}: ${reason}`);
     return { ok: false, reason };

@@ -13,11 +13,10 @@
  * `conversation_uri` / `message_uri` — the implementation carries bare ids with
  * no scheme prefix.
  *
- * ⚠️ No real receipt has reached this code. cws-comm ships the type as of
- * `61f5ed2`, and the field names here were checked against that emitter — but
- * checking an emitter is not the same as having handled what it sends. That is
- * why resolution stays defensive throughout: anything unrecognized falls back
- * to the message's own conversation instead of dropping the message.
+ * Field names follow cws-comm's emitter (`61f5ed2`). Resolution is defensive
+ * throughout regardless: a receipt whose shape this code does not recognize
+ * falls back to the message's own conversation rather than being dropped,
+ * because a dropped message is silent and a misrouted reply is not.
  */
 
 import { isSystemSender } from './system-message.js';

@@ -13,9 +13,10 @@
  * restarts the process. In-memory state would die at exactly the moment it is
  * needed. Same reasoning, and the same shape, as connect-result-queue.js.
  *
- * ⚠️ `RUNTIME_DIR` sits under the component directory that `zylos upgrade`
- * replaces. Whether a record survives its own upgrade is UNVERIFIED — treat a
- * missing record after an upgrade as possible, not as corruption.
+ * `RUNTIME_DIR` sits under the component directory that `zylos upgrade`
+ * replaces, so a question asked before an upgrade may be gone after it. Callers
+ * read a missing record as absence, not corruption — `findPendingQuestion`
+ * returns null and the answer is simply not actionable.
  */
 
 import fs from 'fs';

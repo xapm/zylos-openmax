@@ -265,10 +265,10 @@ counts. Both are required, because an answer with neither cannot be acted on.
 Anything else you pass is kept verbatim for the answering side.
 
 The record lives in a JSON file under the runtime directory, so it survives a
-session change, a service restart, and — usually — the action being authorized.
-⚠️ That directory sits under the component directory `zylos upgrade` replaces,
-and whether a record survives its own upgrade is **untested**: treat a missing
-record after an upgrade as possible rather than as corruption.
+session change and a service restart. That directory sits under the component
+directory `zylos upgrade` replaces, so a question asked before an upgrade may
+not be there afterwards — read a missing record as absence, not corruption, and
+re-ask if the answer still matters.
 
 When the answer arrives, `comm.answered {cardMessageId, actionId,
 actorMemberId}` reports `known` / `authorized` / `expired` / `actionable` and
@@ -277,13 +277,6 @@ the chosen option's index. Act only on `actionable`, then
 question turns a redelivered receipt into a no-op instead of a second execution.
 
 ### Reading the answer back
-
-⚠️ **Shipped, but not yet seen here.** cws-comm writes receipts as of
-`61f5ed2`, on `main` and deployed to int. Nothing in this repo has handled a
-real one: every shape below comes from the contract
-(cws-docs `interaction-receipt-contract.md`) and from reading the emitter, not
-from a message observed on the wire. Treat "matches the contract" and "has been
-exercised" as the different claims they are.
 
 When someone answers, cws-comm posts an `INTERACTION_RECEIPT` message — and it
 posts it into the read-only `interaction_center` system DM, **not** into the

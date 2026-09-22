@@ -62,6 +62,7 @@
 
 import { execFile as execFileCb } from 'child_process';
 import { promisify } from 'util';
+import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { canonicalAuthScheme } from './direct-exec.js';
@@ -80,6 +81,55 @@ export const DEFAULT_MCP_CLI_TIMEOUT_MS = 15000;
  */
 export function agentLaunchCwd() {
   return process.env.ZYLOS_DIR || path.join(process.env.HOME || os.homedir(), 'zylos');
+}
+
+/**
+ * The set of runtime clients this sink knows how to render for. Anything outside
+ * it (an unknown/typo'd runtime, an empty value) is treated as "no selection" and
+ * falls through to the safe default (claude). Keep in sync with the adapter table.
+ */
+const KNOWN_CLIENT_TYPES = new Set(['claude', 'codex']);
+
+/** Coerce a raw runtime string to a known client type, or null if unrecognized. */
+function normalizeClientType(v) {
+  const t = String(v == null ? '' : v).trim().toLowerCase();
+  return KNOWN_CLIENT_TYPES.has(t) ? t : null;
+}
+
+/**
+ * Resolve the ACTIVE runtime client — the same source of truth zylos-core uses,
+ * in the same precedence order, so the MCP sink writes to the config file the
+ * live agent actually reads (claude → ~/.claude.json, codex → ~/.codex/config.toml):
+ *
+ *   1. `process.env.ZYLOS_RUNTIME` (highest precedence — set by `zylos runtime`)
+ *   2. `<zylosDir>/.zylos/config.json` → `.runtime`  (zylosDir = ZYLOS_DIR or ~/zylos)
+ *   3. default `"claude"`
+ *
+ * Unknown / missing / unreadable at any step → safe fallback to `"claude"` (never
+ * throws, never invents a new source of truth). Deps are injectable for tests.
+ *
+ * @param {object} [deps] { env, readFileSync, zylosDir } — production defaults read
+ *   the real process env + `~/zylos/.zylos/config.json`.
+ * @returns {'claude'|'codex'} the active client type.
+ */
+export function detectClientType(deps = {}) {
+  const {
+    env = process.env,
+    readFileSync = fs.readFileSync,
+    zylosDir = env.ZYLOS_DIR || path.join(env.HOME || os.homedir(), 'zylos'),
+  } = deps;
+  // 1. env var wins (this is what `zylos runtime <target>` exports).
+  const fromEnv = normalizeClientType(env.ZYLOS_RUNTIME);
+  if (fromEnv) return fromEnv;
+  // 2. the persisted config.json `.runtime` field.
+  try {
+    const cfgPath = path.join(zylosDir, '.zylos', 'config.json');
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+    const fromCfg = normalizeClientType(cfg && cfg.runtime);
+    if (fromCfg) return fromCfg;
+  } catch { /* absent / unreadable / malformed → fall through to the default */ }
+  // 3. safe default.
+  return 'claude';
 }
 
 /** Whether a record (Acquire response OR index entry) is an MCP connector. */
@@ -161,10 +211,10 @@ function redactSecrets(str, secrets = []) {
  * and only when there is no exit code (a non-exec error) fall back to a
  * secret-redacted message.
  */
-function safeExecFailure(op, e, secrets = []) {
+function safeExecFailure(client, op, e, secrets = []) {
   const code = e && (e.code != null ? e.code : e.signal);
-  if (code != null && code !== '') return `claude mcp ${op} failed (exit ${code})`;
-  return `claude mcp ${op} failed: ${redactSecrets(e && e.message, secrets)}`;
+  if (code != null && code !== '') return `${client} mcp ${op} failed (exit ${code})`;
+  return `${client} mcp ${op} failed: ${redactSecrets(e && e.message, secrets)}`;
 }
 
 /** Parse a headers/env template into a plain string→string object. */
@@ -393,6 +443,134 @@ export function buildMcpServerJson(mcpServer, { accessToken, tokenType, authInje
 }
 
 /**
+ * Build a CLIENT-NEUTRAL server spec — the single intermediate representation an
+ * adapter renders to a concrete CLI. It is produced ONCE per mount and carries
+ * both the transport-neutral fields (used by the codex adapter) AND the exact
+ * Claude add-json payload (`claudeJson`), so the claude path stays byte-for-byte
+ * what it was before this refactor (the rich raw_config passthrough lives in
+ * buildMcpServerJson, unchanged).
+ *
+ *   { name, transport:'stdio'|'http', command, args, env, url, headers, auth,
+ *     claudeJson }
+ *
+ * `transport` collapses claude's stdio/http/sse/ws `type` into the two shapes a
+ * generic client understands: 'stdio' (local subprocess) vs 'http' (a URL, incl.
+ * SSE/WS-over-http). `auth` is the resolved injection ({location,name,value}|null)
+ * so an adapter that can't take an inline header (codex) can re-express it.
+ *
+ * Returns null when the underlying JSON build fails closed (ambiguous/unsafe
+ * mcpServers wrapper) — the caller must then install nothing.
+ *
+ * @param {string} name      the CLI/filesystem-safe server name
+ * @param {object} mcpServer the Acquire mcp_server
+ * @param {object} [opts]    { accessToken, tokenType, authInjection, rawConfig }
+ */
+export function buildServerSpec(name, mcpServer, opts = {}) {
+  const claudeJson = buildMcpServerJson(mcpServer, opts);
+  if (!claudeJson) return null; // fail-closed (propagated from buildMcpServerJson)
+  const type = String(claudeJson.type || '').toLowerCase();
+  const transport = type === 'stdio' ? 'stdio' : 'http';
+  return {
+    name,
+    transport,
+    command: claudeJson.command,
+    args: Array.isArray(claudeJson.args) ? claudeJson.args : [],
+    env: claudeJson.env && typeof claudeJson.env === 'object' ? claudeJson.env : {},
+    url: claudeJson.url,
+    headers: claudeJson.headers && typeof claudeJson.headers === 'object' ? claudeJson.headers : {},
+    auth: resolveInjection(opts),
+    claudeJson,
+  };
+}
+
+/** Derive a deterministic, shell-safe env-var name for a codex bearer token from
+ * the server name (e.g. openmax-linear-conn-1 → OPENMAX_LINEAR_CONN_1_TOKEN). */
+function codexBearerEnvName(serverName) {
+  const base = String(serverName || '').replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '').toUpperCase();
+  return `${base || 'MCP'}_TOKEN`;
+}
+
+/**
+ * Adapter: render a neutral spec to the CLAUDE Code CLI. This is the CURRENT
+ * behavior moved verbatim — the mount argv (`claude mcp add-json -s local <name>
+ * <json>`) and remove argv (`claude mcp remove -s local <name>`) are byte-for-byte
+ * unchanged, and the JSON is exactly buildMcpServerJson's output.
+ */
+const claudeAdapter = {
+  clientType: 'claude',
+  file: 'claude',
+  mountOp: 'add-json',
+  removeOp: 'remove',
+  buildMountPlan(spec) {
+    return { args: ['mcp', 'add-json', '-s', 'local', spec.name, JSON.stringify(spec.claudeJson)] };
+  },
+  buildRemovePlan(name) {
+    return { args: ['mcp', 'remove', '-s', 'local', name] };
+  },
+};
+
+/**
+ * Adapter: render a neutral spec to the CODEX CLI (verified against codex-cli
+ * 0.128.0 for the stdio path). Lands in `~/.codex/config.toml`.
+ *
+ *   - stdio: `codex mcp add <name> --env K=V ... -- <command> <args...>`
+ *     → `[mcp_servers.<name>]` with command/args/env.
+ *   - http:  `codex mcp add <name> --url <URL>` and, when the neutral spec carries
+ *     an inline bearer/Authorization credential, `--bearer-token-env-var <ENV>`
+ *     (codex CANNOT take an inline auth header — it reads the token from a named
+ *     env var instead). We derive a deterministic ENV name from the server name,
+ *     pass it to codex, and hand codex the token value via that env var on the exec.
+ *     NOTE: the http/bearer path is NOT YET REAL-MACHINE-VERIFIED (stdio is the
+ *     guaranteed v1 path, per the approved scope); the emitted command is unit-
+ *     tested but the end-to-end codex http auth flow has not been run on a box.
+ *   - remove: `codex mcp remove <name>`.
+ */
+const codexAdapter = {
+  clientType: 'codex',
+  file: 'codex',
+  mountOp: 'add',
+  removeOp: 'remove',
+  buildMountPlan(spec) {
+    const args = ['mcp', 'add', spec.name];
+    if (spec.transport === 'stdio') {
+      // Non-secret env AND the injected credential (already merged into spec.env by
+      // buildMcpServerJson for an env-located token) ride as repeated --env K=V.
+      for (const [k, v] of Object.entries(spec.env)) args.push('--env', `${k}=${v}`);
+      // `--` terminates codex's own flags; everything after is the server argv.
+      args.push('--', spec.command, ...spec.args);
+      return { args };
+    }
+    // http (also covers sse/ws-over-http): a URL, plus optional bearer env var.
+    args.push('--url', spec.url);
+    let env;
+    // A query-located token already rides inside spec.url (nothing more to do).
+    // A header-located credential (Authorization: <scheme> <token>, or any custom
+    // auth header) can't be sent inline to codex — translate it into a named env
+    // var. NOT YET REAL-MACHINE-VERIFIED (see adapter doc).
+    if (spec.auth && spec.auth.location === 'header') {
+      const envName = codexBearerEnvName(spec.name);
+      // The token is the value minus any leading scheme word (e.g. "Bearer ").
+      const v = String(spec.auth.value || '');
+      const sp = v.indexOf(' ');
+      const token = sp >= 0 ? v.slice(sp + 1) : v;
+      args.push('--bearer-token-env-var', envName);
+      env = { [envName]: token };
+    }
+    return { args, env };
+  },
+  buildRemovePlan(name) {
+    return { args: ['mcp', 'remove', name] };
+  },
+};
+
+const ADAPTERS = { claude: claudeAdapter, codex: codexAdapter };
+
+/** Pick the adapter for a client type, defaulting to claude (backward compat). */
+function adapterFor(clientType) {
+  return ADAPTERS[clientType] || claudeAdapter;
+}
+
+/**
  * Register/refresh a connection's MCP server in the agent's local Claude Code
  * config via the UNIFIED `claude mcp add-json` path. Idempotent: removes any
  * same-named server first (so a token refresh cleanly replaces the old one),
@@ -411,8 +589,12 @@ export async function upsertMcpServer(conn, acquireResponse, deps = {}) {
     log = () => {},
     warn = () => {},
     timeoutMs = DEFAULT_MCP_CLI_TIMEOUT_MS,
+    // The active runtime client decides which adapter renders the mount. Default
+    // is auto-detected (env → config.json → claude); injectable for tests.
+    clientType = detectClientType(),
   } = deps;
   const connId = conn && conn.id;
+  const adapter = adapterFor(clientType);
   try {
     const mcp = acquireResponse && acquireResponse.mcp_server;
     // raw_config may ride on mcp_server (preferred) or at the response root.
@@ -424,44 +606,52 @@ export async function upsertMcpServer(conn, acquireResponse, deps = {}) {
     }
     const name = mcpServerName(conn && conn.slug, connId);
 
-    const json = buildMcpServerJson(mcp, {
+    // Produce the client-neutral spec ONCE; the adapter renders it below.
+    const spec = buildServerSpec(name, mcp, {
       accessToken: acquireResponse.access_token,
       tokenType: acquireResponse.token_type,
       authInjection: acquireResponse.auth_injection,
       rawConfig,
     });
     // Fail closed on an ambiguous/unsafe mcpServers wrapper BEFORE touching the
-    // CLI, so a sink probe triggers ZERO `claude mcp` calls (no remove, no add).
-    if (!json) {
+    // CLI, so a sink probe triggers ZERO CLI calls (no remove, no add).
+    if (!spec) {
       warn(`[mcp-config] upsert skipped conn=${connId}: ambiguous/unsafe mcpServers wrapper — refusing to install`);
       return { ok: false, reason: 'ambiguous-wrapper' };
     }
-    const isStdio = String(json.type || '').toLowerCase() === 'stdio';
+    const isStdio = spec.transport === 'stdio';
 
     // Validate BEFORE touching the CLI so a malformed config makes zero calls.
     if (isStdio) {
-      if (!json.command) {
+      if (!spec.command) {
         warn(`[mcp-config] upsert skipped conn=${connId}: stdio config carries no command`);
         return { ok: false, reason: 'no-command' };
       }
-    } else if (!json.url) {
+    } else if (!spec.url) {
       warn(`[mcp-config] upsert skipped conn=${connId}: remote config carries no server_url`);
       return { ok: false, reason: 'no-mcp-server' };
     }
+
+    const mount = adapter.buildMountPlan(spec);
+    // Merge any adapter-supplied env (e.g. codex bearer-token env var) onto the
+    // inherited process env so the child keeps PATH etc.
+    const mountOpts = mount.env
+      ? { cwd, timeout: timeoutMs, env: { ...process.env, ...mount.env } }
+      : { cwd, timeout: timeoutMs };
 
     // Remove-then-add so a refresh replaces the prior credential cleanly (a bare
     // add of an existing name can be rejected). The remove is best-effort — a
     // first-time add has nothing to remove.
     try {
-      await execFile('claude', ['mcp', 'remove', '-s', 'local', name], { cwd, timeout: timeoutMs });
+      await execFile(adapter.file, adapter.buildRemovePlan(name).args, { cwd, timeout: timeoutMs });
     } catch { /* no prior server registered — fine */ }
 
-    const args = ['mcp', 'add-json', '-s', 'local', name, JSON.stringify(json)];
-    await execFile('claude', args, { cwd, timeout: timeoutMs });
-    // NEVER log the JSON — it carries the injected credential (env value / header).
-    // Name + type + command-or-host + cwd only (host = url with any query stripped).
-    const where = isStdio ? `command=${json.command}` : `url=${String(json.url).split('?')[0]}`;
-    log(`[mcp-config] MCP server upserted (add-json) name=${name} type=${json.type} ${where} cwd=${cwd}`);
+    await execFile(adapter.file, mount.args, mountOpts);
+    // NEVER log the payload — it carries the injected credential (env value / header /
+    // URL query). Name + type + command-or-host + cwd only (host = url with any
+    // query stripped).
+    const where = isStdio ? `command=${spec.command}` : `url=${String(spec.url).split('?')[0]}`;
+    log(`[mcp-config] MCP server upserted (${adapter.clientType}) name=${name} transport=${spec.transport} ${where} cwd=${cwd}`);
     return { ok: true, name };
   } catch (e) {
     // Redact the token: on a failed add-json, e.message/.cmd carry the full argv
@@ -474,7 +664,7 @@ export async function upsertMcpServer(conn, acquireResponse, deps = {}) {
     const secrets = tok
       ? [...new Set([String(tok), encodeURIComponent(String(tok))])] // dedupe (equal when no special chars)
       : [];
-    const reason = safeExecFailure('add-json', e, secrets);
+    const reason = safeExecFailure(adapter.clientType, adapter.mountOp, e, secrets);
     warn(`[mcp-config] upsertMcpServer failed conn=${connId}: ${reason}`);
     return { ok: false, reason };
   }
@@ -495,17 +685,21 @@ export async function removeMcpServer(conn, deps = {}) {
     log = () => {},
     warn = () => {},
     timeoutMs = DEFAULT_MCP_CLI_TIMEOUT_MS,
+    // Only ever touch the CURRENTLY-active client (v1 scope: no cross-runtime
+    // cleanup). Auto-detected by default; injectable for tests.
+    clientType = detectClientType(),
   } = deps;
   const connId = conn && conn.id;
+  const adapter = adapterFor(clientType);
   try {
     const name = mcpServerName(conn && conn.slug, connId);
-    await execFile('claude', ['mcp', 'remove', '-s', 'local', name], { cwd, timeout: timeoutMs });
-    log(`[mcp-config] MCP server removed name=${name} cwd=${cwd}`);
+    await execFile(adapter.file, adapter.buildRemovePlan(name).args, { cwd, timeout: timeoutMs });
+    log(`[mcp-config] MCP server removed (${adapter.clientType}) name=${name} cwd=${cwd}`);
     return { ok: true, name };
   } catch (e) {
     // `remove` argv holds no token, but stay consistent (exit-code-only) so no
     // exec message/argv is ever surfaced raw from this module.
-    const reason = safeExecFailure('remove', e);
+    const reason = safeExecFailure(adapter.clientType, adapter.removeOp, e);
     warn(`[mcp-config] removeMcpServer failed conn=${connId}: ${reason}`);
     return { ok: false, reason };
   }

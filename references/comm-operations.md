@@ -205,11 +205,27 @@ node src/cli/comm.js comm.send_card '{
 }'
 ```
 
-`summary` doubles as the plain-text projection for clients that cannot render a
-card, so it is required rather than derived. The card body defaults to a single
-text block holding `summary`; pass `text` for different wording, or `blocks` for
-anything richer. `options` accepts a bare string (shorthand for the button
-label) or `{label, style?}`.
+`options` accepts a bare string (shorthand for the button label) or
+`{label, style?}`.
+
+**The three text regions are different things, and the client renders all of
+them** (cws-fe `SPEC-chat-card-message` AC-2: a card renders its title, its
+summary, and every recognized block). Putting the same sentence in two of them
+shows it twice — which is what a summary-derived body used to do, and why the
+body is no longer derived.
+
+| Region | What belongs there | From the signed-off prototype fixtures |
+|---|---|---|
+| `title` | the subject of the decision | `执行计划确认` |
+| `summary` | one line of context — which thing, which version, which issue | `Issue #OpenMax-142 · 实现「事件创建表单」` |
+| `blocks` | the substance the reader needs to decide | a `text` paragraph, then `fields` / `markdown` for detail |
+
+`summary` is also the plain-text projection for clients that cannot render a
+card, which is the other reason it stays a single line.
+
+Structured detail belongs in a `fields` block rather than a prose blob — for an
+upgrade, one row per component (`{label: "dashboard", value: "0.5.4 → 0.5.5"}`)
+reads as a table instead of a sentence someone has to parse.
 
 The response is `{message_id, seq, created_at, action_ids}`.
 

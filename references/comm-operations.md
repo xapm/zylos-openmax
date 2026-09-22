@@ -278,10 +278,12 @@ question turns a redelivered receipt into a no-op instead of a second execution.
 
 ### Reading the answer back
 
-⏳ **Not live yet.** cws-comm is still implementing the receipt message; until it
-ships, a click produces no receipt. What follows is the contract that shape will
-honour (cws-docs `interaction-receipt-contract.md`), not something observed on
-the wire.
+⚠️ **Shipped, but not yet seen here.** cws-comm writes receipts as of
+`61f5ed2`, on `main` and deployed to int. Nothing in this repo has handled a
+real one: every shape below comes from the contract
+(cws-docs `interaction-receipt-contract.md`) and from reading the emitter, not
+from a message observed on the wire. Treat "matches the contract" and "has been
+exercised" as the different claims they are.
 
 When someone answers, cws-comm posts an `INTERACTION_RECEIPT` message — and it
 posts it into the read-only `interaction_center` system DM, **not** into the

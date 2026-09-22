@@ -556,15 +556,35 @@ function looksLikeActionOrSchemaError(err) {
   return false;
 }
 
+// Fetch the set of connector (connection) ids ENABLED for a conversation, from
+// cws-core's per-conversation enabled set (GET /conversations/{id}/connectors,
+// which returns only enabled, non-deleted rows). Keyed on connection id — the
+// same identifier the panel toggles and conn.list/conn.invoke resolve against.
+// Returns a Set; an empty/absent list yields an empty Set (opt-in default = off).
+async function fetchEnabledConnectorIds(orgId, conversationId) {
+  const resp = await getForOrg(orgId, apiPath(`/conversations/${conversationId}/connectors`));
+  const rows = resp && Array.isArray(resp.connectors) ? resp.connectors : [];
+  return new Set(rows.filter((r) => r && r.enabled !== false).map((r) => r.connector_id).filter(Boolean));
+}
+
 const COMMANDS = {
   // List connections available to this agent.
   // Always uses the agent's own member_id (resolveSelfMemberId) — no
   // client-supplied override; see the security note above resolveSelfMemberId.
-  'conn.list': () => {
+  'conn.list': async () => {
     const orgId = requireOrgId();
     const agentId = resolveSelfMemberId(orgId);
     if (!agentId) throw Object.assign(new Error('cannot resolve agent member_id'), { status: 400 });
-    return getForOrg(orgId, apiPath('/connect/agents/me/connections'));
+    const all = await getForOrg(orgId, apiPath('/connect/agents/me/connections'));
+    // Conversation-scoped view (opt-in per conversation): when a conversationId is
+    // supplied, return only the connectors ENABLED for that conversation. The
+    // enabled set is the source of truth held by cws-core (never an agent-supplied
+    // list); a conversation with no enabled connectors returns []. Without a
+    // conversationId this is the full agent-authorized list (unchanged behavior).
+    const convId = params.conversationId || params.conversation_id || null;
+    if (!convId || !Array.isArray(all)) return all;
+    const enabledIds = await fetchEnabledConnectorIds(orgId, convId);
+    return all.filter((c) => enabledIds.has(c.id || c.connection_id));
   },
 
   // Acquire a credential for a connection. This verb is DIRECT-only: it returns
@@ -884,6 +904,24 @@ const COMMANDS = {
       }
     }
 
+    // Per-conversation enablement gate (opt-in per conversation): when invoked
+    // with a conversationId, a connector may run only if it is ENABLED for that
+    // conversation. This backstops the conn.list filter — the agent's filtered
+    // list already hides non-enabled connectors, but an explicitly named one can
+    // still reach here. Reject with a distinct code (`not_enabled_in_conversation`)
+    // so the agent can offer to enable it (authorized-but-off) rather than treat it
+    // as unauthorized. org and personal connectors alike are gated; the enabled set
+    // is cws-core's source of truth, never an agent-supplied flag.
+    if (invokeConvId) {
+      const enabledIds = await fetchEnabledConnectorIds(orgId, invokeConvId);
+      if (!enabledIds.has(entry.id)) {
+        throw Object.assign(
+          new Error(`connector for app "${appLabel}" is authorized but not enabled in this conversation — ask the user to enable it from the input-area connector panel, then retry.`),
+          { status: 403, code: 'not_enabled_in_conversation' },
+        );
+      }
+    }
+
     // Route by the connector taxonomy recorded in the index (credential_mode).
     let mode = entry.credentialMode;
     if (!mode) {
@@ -1055,6 +1093,7 @@ async function main() {
   } catch (err) {
     const payload = { error: err.message };
     if (err.status) payload.status = err.status;
+    if (err.code) payload.code = err.code;
     const fieldErrors = err.body?.error?.errors;
     if (Array.isArray(fieldErrors) && fieldErrors.length > 0) payload.errors = fieldErrors;
     console.error(JSON.stringify(payload));

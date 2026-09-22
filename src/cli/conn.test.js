@@ -1511,6 +1511,14 @@ test('conn.invoke: personal connector + DM conversation → allowed (proceeds to
   const seen = [];
   const server = createServer((req, res) => {
     seen.push(req.url);
+    // Per-conversation enablement: c1 IS enabled in this DM, so the invoke gate
+    // passes. Ordered before the conversation-type branch since both share the
+    // /conversations/conv-dm prefix.
+    if (req.url.includes('/conversations/conv-dm/connectors')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: { connectors: [{ conversation_id: 'conv-dm', connector_id: 'c1', enabled: true }] }, request_id: 'r3' }));
+      return;
+    }
     if (req.url.includes('/conversations/conv-dm')) {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ data: { id: 'conv-dm', type: 'dm' }, request_id: 'r1' }));
@@ -1535,6 +1543,113 @@ test('conn.invoke: personal connector + DM conversation → allowed (proceeds to
     assert.equal(code, 0, `expected success, stdout=${stdout}`);
     // DM → not blocked → proceeded to server-side execute.
     assert.ok(seen.some((u) => u.includes('/actions/execute')), 'a DM must let a personal connector through to execute');
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+// --- conversation-scoped enablement (opt-in per conversation) ------------------
+//
+// conn.list with a conversationId returns only the connectors ENABLED for that
+// conversation (source of truth = cws-core GET /conversations/{id}/connectors).
+// conn.invoke with a conversationId rejects a connector that is authorized but
+// not enabled there, with a distinct not_enabled_in_conversation code so the
+// agent can offer to enable it rather than treat it as unauthorized.
+
+test('conn.list conversation-scoped: returns only connectors enabled for the conversation', async () => {
+  const home = setupHome({ connections: {} });
+  const server = createServer((req, res) => {
+    if (req.url.includes('/conversations/conv-x/connectors')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: { connectors: [
+        { conversation_id: 'conv-x', connector_id: 'c1', enabled: true },
+        { conversation_id: 'conv-x', connector_id: 'c3', enabled: true },
+      ] }, request_id: 'r1' }));
+      return;
+    }
+    if (req.url.includes('/connect/agents/me/connections')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [
+        { id: 'c1', application_slug: 'gmail', application_name: 'Gmail', status: 'active' },
+        { id: 'c2', application_slug: 'slack', application_name: 'Slack', status: 'active' },
+        { id: 'c3', application_slug: 'notion', application_name: 'Notion', status: 'active' },
+      ], request_id: 'r0' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r9"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    const { code, stdout } = await runConn(
+      home, 'conn.list', { conversationId: 'conv-x' }, `http://127.0.0.1:${port}`,
+    );
+    assert.equal(code, 0, `expected success, stdout=${stdout}`);
+    const list = JSON.parse(stdout);
+    const ids = list.map((c) => c.id).sort();
+    assert.deepEqual(ids, ['c1', 'c3'], 'only enabled connectors c1,c3 are returned; c2 (off) is filtered out');
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('conn.list without conversationId: returns the full authorized list (unchanged)', async () => {
+  const home = setupHome({ connections: {} });
+  const server = createServer((req, res) => {
+    if (req.url.includes('/connect/agents/me/connections')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [
+        { id: 'c1', application_slug: 'gmail', application_name: 'Gmail', status: 'active' },
+        { id: 'c2', application_slug: 'slack', application_name: 'Slack', status: 'active' },
+      ], request_id: 'r0' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r9"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    const { code, stdout } = await runConn(home, 'conn.list', {}, `http://127.0.0.1:${port}`);
+    assert.equal(code, 0, `expected success, stdout=${stdout}`);
+    const ids = JSON.parse(stdout).map((c) => c.id).sort();
+    assert.deepEqual(ids, ['c1', 'c2'], 'no conversationId → unfiltered full list');
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('conn.invoke conversation-scoped: authorized-but-not-enabled → 403 not_enabled_in_conversation (no execute)', async () => {
+  const home = setupHome({ connections: {
+    c1: { id: 'c1', applicationId: 'app-1', slug: 'gmail', name: 'Gmail', status: 'active', credentialMode: 'proxy', credentialSource: 'composio', ownerScope: 'org' },
+  } });
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url);
+    if (req.url.includes('/conversations/conv-y/connectors')) {
+      // c1 is authorized but NOT enabled in this conversation (empty enabled set).
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: { connectors: [] }, request_id: 'r1' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r9"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    const { code, stderr } = await runConn(
+      home, 'conn.invoke',
+      { connectionId: 'c1', action: 'gmail/send', params: {}, conversationId: 'conv-y' },
+      `http://127.0.0.1:${port}`,
+    );
+    assert.equal(code, 1);
+    const err = JSON.parse(stderr);
+    assert.equal(err.status, 403);
+    assert.equal(err.code, 'not_enabled_in_conversation');
+    assert.match(err.error, /not enabled in this conversation/);
+    assert.ok(!seen.some((u) => u.includes('/actions/execute')), 'no execute when the connector is not enabled for the conversation');
   } finally {
     await new Promise((r) => server.close(r));
   }

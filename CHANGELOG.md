@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Connectors are scoped per conversation (opt-in per conversation).** `conn.list` and `conn.invoke` now accept a `conversation_id`. With one supplied, `conn.list` returns only the connectors **enabled for that conversation** — the enabled set is read from cws-core (`GET /api/v1/conversations/{id}/connectors`, the source of truth), never an agent-supplied list — and a conversation with nothing enabled returns `[]`. `conn.invoke` gates on the same set: an authorized-but-not-enabled connector is rejected with a `403` and a distinct `not_enabled_in_conversation` code (surfaced in the CLI error payload) so the agent can offer to enable it rather than treat it as unauthorized. Without a `conversation_id`, both verbs behave exactly as before. `SKILL.md` documents the resulting agent behavior (enabled-here / authorized-but-off / unauthorized / needs-reauth).
+
 ### Security
 
 - **Personal connectors are blocked in group conversations.** A personal-scope connector is the individual's own credential and must never be executed in a group/thread conversation (where other members could trigger it). `conn.invoke` now accepts a `conversation_id` and reads that conversation's type from the server (the source of truth — never an agent-supplied "is this a group" flag), refusing a personal connector anywhere that is not a confirmed direct message (fail-closed on an unknown/unfetchable type) with a 403. `org`-scope connectors and direct messages are unaffected. The connections index now persists an `ownerScope` field (`owner_scope`) additively alongside `credentialMode` / `connectorKind`.

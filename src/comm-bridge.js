@@ -25,6 +25,7 @@ import { execFile } from 'child_process';
 
 import { loadConfig, watchConfig, enabledOrgs, bindOwner, setOwner, updateOwnerName, setSelfDisplayName, updateConfig } from './lib/config.js';
 import { registerConvOrg } from './lib/conv-org.js';
+import { createComposeConsumer } from './lib/automation-compose.js';
 import { createSelfNameHydrator } from './lib/self-name-hydration.js';
 import { WsClient, createDeduper } from './lib/ws.js';
 import { resolveInboundContent } from './lib/inbound-content.js';
@@ -2179,6 +2180,7 @@ const CHANNEL_LIVENESS_INITIAL_DELAY_MS = 20_000;
 // =============================================================================
 
 const wsClients = [];
+const composeConsumers = [];
 const inboxLedgers = [];
 let liveOrgCount = 0;
 
@@ -2226,6 +2228,23 @@ async function bootstrapOrgToken(orgConfig) {
 }
 
 function startOrgWs(orgConfig, wsBaseUrl) {
+  const compose = createComposeConsumer({
+    orgId: orgConfig.org_id,
+    agentId: orgConfig.self?.member_id,
+    config: () => loadConfig().automation_compose,
+    authorize: async request => {
+      const userId = request.session.user_id;
+      const access = orgConfig.access || {};
+      return Boolean(userId && (userId === orgConfig.owner?.member_id
+        || access.dmPolicy === 'open'
+        || (access.dmPolicy === 'allowlist' && access.dmAllowFrom?.includes(userId))));
+    },
+    get: route => getForOrg(orgConfig.org_id, apiPath(route), undefined, { timeoutMs: 15000 }),
+    post: (route, body) => postForOrg(orgConfig.org_id, apiPath(route), body, { timeoutMs: 15000 }),
+    warn: message => warn(`[${orgConfig.slug}] ${message}`),
+  });
+  composeConsumers.push(compose);
+  compose.start();
   const session = loadOrgSession(orgConfig.slug) || {};
   // Backward compat: migrate last_seq → sync_seq on first boot after upgrade.
   const syncSeq = session.sync_seq ?? session.last_seq ?? 0;
@@ -2403,6 +2422,7 @@ function startOrgWs(orgConfig, wsBaseUrl) {
     },
 
     onFatal: (code, reason) => {
+      compose.stop();
       console.error(LOG_PREFIX, `[${orgConfig.slug}] FATAL close code=${code} reason="${reason || ''}" — stopping this org`);
       if (code === 4002) console.error(LOG_PREFIX, `[${orgConfig.slug}] → auth failed; check api_key / org_id`);
       if (code === 4005) console.error(LOG_PREFIX, `[${orgConfig.slug}] → workspace suspended`);
@@ -2513,6 +2533,7 @@ watchConfig((next) => {
 
 let _isShuttingDown = false;
 function shutdown(signal) {
+  for (const consumer of composeConsumers) consumer.stop();
   if (_isShuttingDown) return;
   _isShuttingDown = true;
   log(`${signal}, shutting down...`);

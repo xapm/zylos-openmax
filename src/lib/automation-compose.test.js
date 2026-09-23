@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { composeWorkerEnvironment, createComposeConsumer, runComposeWorker, validateComposeRequest, validateComposeResult } from './automation-compose.js';
+import { composeWorkerEnvironment, createComposeConsumer as createConsumer, runComposeWorker, validateComposeRequest, validateComposeResult } from './automation-compose.js';
+
+const createComposeConsumer = options => createConsumer({ authorize: async () => true, ...options });
 
 const config = () => ({ enabled: true, command: process.execPath, args: [] });
 const request = () => ({
@@ -216,4 +218,27 @@ test('request inference failure does not reclassify a ready worker or charge ano
   });
   await consumer.tick(); await consumer.tick();
   assert.equal(probes, 1); assert.equal(calls, 2);
+});
+
+test('missing authorization and every non-boolean approval deny inference', async () => {
+  for (const authorize of [undefined, async () => ({}), async () => [], async () => 'false', async () => 1]) {
+    const r = request(); let runs = 0; const results = [];
+    const consumer = createConsumer({ orgId: 'o1', agentId: 'a1', config, probe: async () => {}, authorize,
+      get: async route => route.includes('/pending') ? [r] : r,
+      post: async (route, body) => { if (route.endsWith('/result')) results.push(body.result); },
+      run: async () => { runs++; return { kind: 'proposal', draft: {} }; },
+    });
+    await consumer.tick(); assert.equal(runs, 0); assert.equal(results.length, 1); assert.equal(results[0].kind, 'error');
+  }
+});
+
+test('late identity hydration resumes polling and identity change during inference blocks submission', async () => {
+  let identity, runs = 0, submissions = 0, reads = 0; const r = request();
+  const consumer = createComposeConsumer({ orgId: 'o1', agentId: () => identity, config, probe: async () => {},
+    get: async route => { reads++; return route.includes('/pending') ? [r] : r; },
+    post: async route => { if (route.endsWith('/result')) submissions++; },
+    run: async () => { runs++; identity = 'a2'; return { kind: 'proposal', draft: {} }; },
+  });
+  await consumer.tick(); assert.equal(reads, 0);
+  identity = 'a1'; await consumer.tick(); assert.equal(runs, 1); assert.equal(submissions, 0);
 });

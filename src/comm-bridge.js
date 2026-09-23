@@ -2230,7 +2230,7 @@ async function bootstrapOrgToken(orgConfig) {
 function startOrgWs(orgConfig, wsBaseUrl) {
   const compose = createComposeConsumer({
     orgId: orgConfig.org_id,
-    agentId: orgConfig.self?.member_id,
+    agentId: () => orgConfig.self?.member_id,
     config: () => loadConfig().automation_compose,
     authorize: async request => {
       const userId = request.session.user_id;
@@ -2533,9 +2533,9 @@ watchConfig((next) => {
 
 let _isShuttingDown = false;
 function shutdown(signal) {
-  for (const consumer of composeConsumers) consumer.stop();
   if (_isShuttingDown) return;
   _isShuttingDown = true;
+  for (const consumer of composeConsumers) consumer.stop();
   log(`${signal}, shutting down...`);
   tasks.stopAll();
   // Remove all active processing-indicator reactions before exit.

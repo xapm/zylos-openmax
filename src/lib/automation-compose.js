@@ -107,7 +107,8 @@ export async function runComposeWorker(config, content, { signal } = {}) {
   }
 }
 
-export function createComposeConsumer({ orgId, agentId, get, post, config, authorize = async () => true, run = runComposeWorker, probe, warn = () => {}, now = Date.now }) {
+export function createComposeConsumer({ orgId, agentId: agentIdentity, get, post, config, authorize = async () => false, run = runComposeWorker, probe, warn = () => {}, now = Date.now }) {
+  const currentAgentId = () => typeof agentIdentity === 'function' ? agentIdentity() : agentIdentity;
   let stopped = false, polling = false, registeredAt = 0, timer, readyConfig = '', probeFailedAt = 0;
   const controller = new AbortController();
   // Retain a completed result until the server acknowledges it; transport retry
@@ -116,6 +117,7 @@ export function createComposeConsumer({ orgId, agentId, get, post, config, autho
   const base = '/automation-compose';
   const unwrap = response => response?.data ?? response;
   async function tick() {
+    const agentId = currentAgentId();
     if (stopped || polling || !orgId || !agentId || !validComposeWorker(config())) return;
     polling = true;
     try {
@@ -149,7 +151,7 @@ export function createComposeConsumer({ orgId, agentId, get, post, config, autho
           let result = completed.get(key);
           if (!result) {
             try {
-              result = await authorize(request)
+              result = (await authorize(request)) === true
                 ? await run(config(), request.content, { signal: controller.signal })
                 : { kind: 'error', message: 'You do not have permission to draft with this agent.' };
             }
@@ -167,7 +169,8 @@ export function createComposeConsumer({ orgId, agentId, get, post, config, autho
           if (latest.status !== 'pending') { completed.delete(key); continue; }
           validateComposeRequest(latest, orgId, agentId, now());
           if (requestBinding(latest) !== key) throw new Error('compose binding changed');
-          if (!(await authorize(latest))) {
+          if (currentAgentId() !== agentId) throw new Error('compose agent changed');
+          if ((await authorize(latest)) !== true) {
             result = { kind: 'error', message: 'You do not have permission to draft with this agent.' };
             completed.set(key, result);
           }

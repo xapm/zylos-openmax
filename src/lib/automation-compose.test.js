@@ -318,6 +318,54 @@ test('retry cache expires after ten minutes even if the session remains active',
   clock = 600001; await consumer.tick(); assert.equal(runs, 2);
 });
 
+function retryCacheHarness() {
+  const requests = new Map(), runs = new Map();
+  let page = [];
+  const consumer = createComposeConsumer({ orgId: 'o1', agentId: 'a1', config, now: () => 1, probe: async () => {},
+    get: async route => route.includes('/pending') ? page : requests.get(route.split('/').at(-1)),
+    post: async route => { if (route.endsWith('/result')) throw new Error('acknowledgement unavailable'); },
+    run: async (_config, content) => {
+      runs.set(content, (runs.get(content) || 0) + 1);
+      return { kind: 'proposal', draft: {} };
+    },
+  });
+  const add = id => {
+    const item = { ...request(), request_id: id, content: id };
+    requests.set(id, item);
+    return item;
+  };
+  const poll = async items => { page = items; await consumer.tick(); };
+  return { add, poll, runs };
+}
+
+test('retry cache retains 256 entries and evicts the oldest on entry 257', async () => {
+  const { add, poll, runs } = retryCacheHarness();
+  const pending = Array.from({ length: 256 }, (_, i) => add(`r${i + 1}`));
+  for (let i = 0; i < pending.length; i += 20) await poll(pending.slice(i, i + 20));
+  await poll([pending[0], pending[255]]);
+  assert.equal(runs.get('r1'), 1); assert.equal(runs.get('r256'), 1);
+  await poll([add('r257')]);
+  await poll([pending[1]]); assert.equal(runs.get('r2'), 1);
+  await poll([pending[0]]); assert.equal(runs.get('r1'), 2);
+});
+
+test('terminal request releases its cache slot before the next insertion', async () => {
+  for (const status of ['completed', 'cancelled']) {
+    const { add, poll, runs } = retryCacheHarness();
+    const pending = Array.from({ length: 256 }, (_, i) => add(`r${i + 1}`));
+    for (let i = 0; i < pending.length; i += 20) await poll(pending.slice(i, i + 20));
+    // The queue can lag behind the detail read. No terminal-to-pending transition
+    // is needed: freed capacity is observable through a different live request.
+    const queued = structuredClone(pending[255]);
+    pending[255].status = status;
+    await poll([queued]);
+    assert.equal(runs.get('r256'), 1);
+    await poll([add('r257')]);
+    await poll([pending[0]]);
+    assert.equal(runs.get('r1'), 1, `${status} must free capacity without evicting the oldest live result`);
+  }
+});
+
 test('late identity hydration resumes polling and identity change during inference blocks submission', async () => {
   let identity, runs = 0, submissions = 0, reads = 0; const r = request();
   const consumer = createComposeConsumer({ orgId: 'o1', agentId: () => identity, config, probe: async () => {},

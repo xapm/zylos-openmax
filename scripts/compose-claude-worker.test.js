@@ -53,16 +53,15 @@ process.stdout.write = (...args) => { setTimeout(() => write(...args), 200); ret
   return result;
 }
 
-for (const kib of [160, 192, 224, 512]) {
-  test(`compose worker drains ${kib} KiB JSON under stdout backpressure`, { timeout: 10000 }, async t => {
-    const size = kib * 1024;
-    const result = await runWorker(t, `process.stdin.resume(); process.stdout.write(JSON.stringify({kind:'clarification',message:'x'.repeat(${size})}));`, { pauseOutput: true });
-    assert.equal(result.code, 0);
-    assert.equal(result.signal, null);
-    assert.deepEqual(JSON.parse(result.stdout), { kind: 'clarification', message: 'x'.repeat(size) });
-    assert.equal(result.stderr, '');
-  });
-}
+// Transfer coverage only; the delayed-write test below guards premature exit.
+test('compose worker transfers 512 KiB JSON under stdout backpressure', { timeout: 10000 }, async t => {
+  const size = 512 * 1024;
+  const result = await runWorker(t, `process.stdin.resume(); process.stdout.write(JSON.stringify({kind:'clarification',message:'x'.repeat(${size})}));`, { pauseOutput: true });
+  assert.equal(result.code, 0);
+  assert.equal(result.signal, null);
+  assert.deepEqual(JSON.parse(result.stdout), { kind: 'clarification', message: 'x'.repeat(size) });
+  assert.equal(result.stderr, '');
+});
 
 test('compose worker waits for pending stdout writes after child closes', { timeout: 10000 }, async t => {
   const expected = { kind: 'clarification', message: 'Pending output must survive child close' };

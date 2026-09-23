@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createComposeConsumer, runComposeWorker, validateComposeRequest, validateComposeResult } from './automation-compose.js';
+import { composeWorkerEnvironment, createComposeConsumer, runComposeWorker, validateComposeRequest, validateComposeResult } from './automation-compose.js';
 
 const config = () => ({ enabled: true, command: process.execPath, args: [] });
 const request = () => ({
@@ -117,4 +117,103 @@ test('server rejected proposal becomes retryable isolated error', async () => {
     run: async () => ({ kind: 'proposal', draft: { invalid: true } }),
   });
   await consumer.tick(); assert.deepEqual(results, ['proposal', 'error']);
+});
+
+test('worker environment excludes parent sessions, messaging credentials and injected node options', () => {
+  assert.deepEqual(composeWorkerEnvironment({ PATH: '/bin', HOME: '/test', ANTHROPIC_API_KEY: 'model-auth',
+    CLAUDE_CODE_SESSION_ID: 'parent', CLAUDE_CODE_MESSAGING_TOKEN: 'secret', COCO_API_KEY: 'secret',
+    NODE_OPTIONS: '--require arbitrary.js', OPENMAX_ORG_ID: 'org' }),
+  { PATH: '/bin', HOME: '/test', ANTHROPIC_API_KEY: 'model-auth', OPENMAX_COMPOSE_ISOLATED: '1' });
+});
+
+test('cached result never crosses a changed request binding on retry', async () => {
+  for (const mutate of [r => { r.form_revision = 'v2'; }, r => { r.content = 'New goal'; },
+    r => { r.session.user_id = 'u2'; }, r => { r.session.conversation_id = 'c2'; }]) {
+    let r = request(), runs = 0, submits = 0, submitted;
+    const consumer = createComposeConsumer({ orgId: 'o1', agentId: 'a1', config, probe: async () => {},
+      get: async route => route.includes('/pending') ? [r] : r,
+      post: async (route, body) => {
+        if (!route.endsWith('/result')) return;
+        if (++submits === 1) throw new Error('network');
+        submitted = body.result;
+      },
+      run: async () => ({ kind: 'proposal', draft: { generation: ++runs } }),
+    });
+    await consumer.tick(); r = structuredClone(r); mutate(r); await consumer.tick();
+    assert.equal(runs, 2); assert.equal(submits, 2);
+    assert.equal(submitted.draft.generation, 2);
+  }
+});
+
+test('request cancellation and completed requests never receive a submission', async () => {
+  for (const status of ['cancelled', 'completed']) {
+    const r = request(); let runs = 0, submits = 0;
+    const consumer = createComposeConsumer({ orgId: 'o1', agentId: 'a1', config, probe: async () => {},
+      get: async route => route.includes('/pending') ? [r] : { ...r, status },
+      post: async route => { if (route.endsWith('/result')) submits++; },
+      run: async () => { runs++; return { kind: 'clarification', message: 'When?' }; },
+    });
+    await consumer.tick(); assert.equal(runs, 1); assert.equal(submits, 0);
+  }
+});
+
+test('every immutable binding is rechecked after inference', async () => {
+  for (const mutate of [r => { r.form_revision = 'v2'; }, r => { r.content = 'Changed'; },
+    r => { r.session.user_id = 'u2'; }, r => { r.session.conversation_id = 'c2'; },
+    r => { r.request_id = 'r2'; }, r => { r.session.session_id = 's2'; }]) {
+    const r = request(), latest = structuredClone(r); mutate(latest); let submits = 0;
+    const consumer = createComposeConsumer({ orgId: 'o1', agentId: 'a1', config, probe: async () => {},
+      get: async route => route.includes('/pending') ? [r] : latest,
+      post: async route => { if (route.endsWith('/result')) submits++; },
+      run: async () => ({ kind: 'clarification', message: 'When?' }),
+    });
+    await consumer.tick(); assert.equal(submits, 0);
+  }
+});
+
+test('cached proposal is replaced by an isolated error after policy revocation', async () => {
+  const r = request(); let allowed = true, runs = 0, submits = 0, submitted;
+  const consumer = createComposeConsumer({ orgId: 'o1', agentId: 'a1', config, probe: async () => {},
+    authorize: async () => allowed, get: async route => route.includes('/pending') ? [r] : r,
+    post: async (route, body) => {
+      if (!route.endsWith('/result')) return;
+      if (++submits === 1) throw new Error('network');
+      submitted = body.result;
+    },
+    run: async () => { runs++; return { kind: 'proposal', draft: { title: 'Draft' } }; },
+  });
+  await consumer.tick(); allowed = false; await consumer.tick();
+  assert.equal(runs, 1); assert.equal(submits, 2);
+  assert.equal(submitted.kind, 'error');
+});
+
+test('default readiness branch runs a real isolated child before advertisement', async () => {
+  const worker = { ...config(), args: ['-e', `let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{if(!JSON.parse(s).content.startsWith('Readiness check only'))process.exit(2);else console.log(JSON.stringify({kind:'clarification',message:'Ready'}))})`] };
+  let registered = 0, reads = 0, probes = 0;
+  const consumer = createComposeConsumer({ orgId: 'o1', agentId: 'a1', config: () => worker,
+    get: async () => { reads++; return []; }, post: async () => { registered++; },
+    run: async (...args) => { probes++; return runComposeWorker(...args); },
+  });
+  await consumer.tick(); await consumer.tick();
+  assert.equal(registered, 1); assert.equal(reads, 2); assert.equal(probes, 1);
+});
+
+test('worker preserves UTF-8 characters split across stdout chunks', async () => {
+  const expected = '\u4e2d\u6587';
+  const script = `const b=Buffer.from(JSON.stringify({kind:'clarification',message:'\\u4e2d\\u6587'}));const i=b.indexOf(Buffer.from('\\u4e2d'))+1;process.stdout.write(b.subarray(0,i));setTimeout(()=>process.stdout.write(b.subarray(i)),30);`;
+  const result = await runComposeWorker({ ...config(), args: ['-e', script] }, 'Draft');
+  assert.equal(result.message, expected);
+});
+
+test('request inference failure does not reclassify a ready worker or charge another probe', async () => {
+  const r = request(); let probes = 0, calls = 0;
+  const consumer = createComposeConsumer({ orgId: 'o1', agentId: 'a1', config,
+    get: async route => route.includes('/pending') ? [r] : r, post: async () => {},
+    run: async (_config, content) => {
+      if (content.startsWith('Readiness check only')) { probes++; return { kind: 'clarification', message: 'Ready' }; }
+      calls++; throw new Error('request-specific malformed output');
+    },
+  });
+  await consumer.tick(); await consumer.tick();
+  assert.equal(probes, 1); assert.equal(calls, 2);
 });

@@ -57,6 +57,26 @@ After inference the adapter rechecks cancellation/expiry and immutable binding.
 Shutdown aborts the inference process group. No raw credentials are put into the
 worker input. Normal chat paths are unchanged.
 
+The subprocess environment is allowlisted: basic runtime paths/locale, proxy and
+CA settings, model configuration paths, and explicit Anthropic/OpenAI model
+authentication settings. Model credentials are intentionally available to the
+reviewed worker for inference. Parent messaging/session credentials, OpenMax
+credentials and Node injection options are not inherited. This is input
+minimization, not filesystem isolation from the same OS user's credentials.
+
+Retry cache entries bind the complete immutable request, including requester,
+conversation, revision and content. A changed binding cannot reuse an old result;
+the binding and current local DM policy are rechecked before every submission.
+Comm additionally rejects changed content/revision for an existing request ID.
+Request inference failures return isolated errors without resetting successful
+worker readiness or causing another readiness probe.
+
+Cancellation observed after inference suppresses submission. It does not yet
+interrupt inference immediately; sequential polling can delay the next request
+for up to the configured inference timeout. Shutdown does interrupt the process.
+The local default-probe test uses a real child process with deterministic output;
+it does not establish live model authentication or successful real inference.
+
 The backend must enforce schema and resource authorization on proposal results;
 adapter JSON validation does not substitute for those checks. A `proposal` draft
 never saves or executes an automation.

@@ -2,9 +2,30 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 const MAX_BYTES = 1024 * 1024;
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
+const WORKER_ENV_KEYS = [
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ',
+  'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
+  'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS',
+  'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'OPENAI_API_KEY', 'OPENAI_BASE_URL',
+];
+
+export function composeWorkerEnvironment(source = process.env) {
+  return { ...Object.fromEntries(WORKER_ENV_KEYS.filter(key => typeof source[key] === 'string')
+    .map(key => [key, source[key]])), OPENMAX_COMPOSE_ISOLATED: '1' };
+}
+
+function requestBinding(request) {
+  const s = request?.session || {};
+  return createHash('sha256').update(JSON.stringify([
+    s.session_id, s.conversation_id, s.org_id, s.user_id, s.agent_id, s.schema_version,
+    request?.request_id, request?.form_revision, request?.schema_version, request?.content,
+  ])).digest('hex');
+}
 
 export function validateComposeResult(value) {
   if (!object(value)) throw new Error('invalid compose result');
@@ -23,7 +44,7 @@ export function validateComposeRequest(request, orgId, agentId, now = Date.now()
       || !Number.isFinite(session.expires_at_ms) || session.expires_at_ms <= now
       || !['active', 'open'].includes(session.status)
       || request.status !== 'pending'
-      || ![session.session_id, session.conversation_id, request.request_id].every(
+      || ![session.session_id, session.conversation_id, session.user_id, request.request_id].every(
         value => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(value))
       || typeof request.content !== 'string' || !request.content.trim()
       || Buffer.byteLength(request.content) > MAX_BYTES
@@ -47,7 +68,7 @@ export async function runComposeWorker(config, content, { signal } = {}) {
     return await new Promise((resolve, reject) => {
       const child = spawn(config.command, config.args, {
         cwd, shell: false, stdio: ['pipe', 'pipe', 'pipe'], detached: process.platform !== 'win32',
-        env: { ...process.env, OPENMAX_COMPOSE_ISOLATED: '1' },
+        env: composeWorkerEnvironment(),
       });
       const timeoutMs = Math.min(Math.max(config.timeout_ms || 120000, 1000), 300000);
       let output = '', bytes = 0, failure;
@@ -62,8 +83,9 @@ export async function runComposeWorker(config, content, { signal } = {}) {
       signal?.addEventListener('abort', abort, { once: true });
       if (signal?.aborted) abort();
       const timer = setTimeout(() => fail(new Error('compose worker timed out')), timeoutMs);
+      child.stdout.setEncoding('utf8');
       child.stdout.on('data', chunk => {
-        bytes += chunk.length;
+        bytes += Buffer.byteLength(chunk);
         if (bytes > MAX_BYTES) fail(new Error('compose worker output too large'));
         else output += chunk.toString();
       });
@@ -113,7 +135,7 @@ export function createComposeConsumer({ orgId, agentId, get, post, config, autho
       }
       const pending = unwrap(await get(`${base}/requests/pending?limit=20`));
       if (!Array.isArray(pending)) throw new Error('invalid compose queue');
-      const liveKeys = new Set(pending.map(r => `${r.session?.session_id}/${r.request_id}`));
+      const liveKeys = new Set(pending.map(requestBinding));
       for (const key of completed.keys()) if (!liveKeys.has(key)) completed.delete(key);
       for (const item of pending) {
         if (stopped) break;
@@ -122,8 +144,8 @@ export function createComposeConsumer({ orgId, agentId, get, post, config, autho
             await post(`${base}/capabilities/register`, { schema_version: 1 });
             registeredAt = now();
           }
-          const request = validateComposeRequest(item, orgId, agentId, now());
-          const key = `${request.session.session_id}/${request.request_id}`;
+          const request = structuredClone(validateComposeRequest(item, orgId, agentId, now()));
+          const key = requestBinding(request);
           let result = completed.get(key);
           if (!result) {
             try {
@@ -133,8 +155,6 @@ export function createComposeConsumer({ orgId, agentId, get, post, config, autho
             }
             catch {
               if (stopped) break;
-              readyConfig = '';
-              probeFailedAt = now();
               result = { kind: 'error', message: 'The agent could not generate a draft. Please try again.' };
             }
             result = validateComposeResult(result);
@@ -146,8 +166,11 @@ export function createComposeConsumer({ orgId, agentId, get, post, config, autho
           const latest = unwrap(await get(`${base}/sessions/${request.session.session_id}/requests/${request.request_id}`));
           if (latest.status !== 'pending') { completed.delete(key); continue; }
           validateComposeRequest(latest, orgId, agentId, now());
-          if (latest.session.conversation_id !== request.session.conversation_id
-              || latest.form_revision !== request.form_revision) throw new Error('compose binding changed');
+          if (requestBinding(latest) !== key) throw new Error('compose binding changed');
+          if (!(await authorize(latest))) {
+            result = { kind: 'error', message: 'You do not have permission to draft with this agent.' };
+            completed.set(key, result);
+          }
           const resultRoute = `${base}/sessions/${request.session.session_id}/requests/${request.request_id}/result`;
           const envelope = {
             conversation_id: request.session.conversation_id,

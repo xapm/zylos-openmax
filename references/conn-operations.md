@@ -61,6 +61,26 @@ to enable it in the input-box connector panel), `not_authorized` (guide them to
 enabled set fails closed with a 503 readiness code, never `enabled`. Reply to
 the user in plain language — never surface the state names or status codes.
 
+### conn.auth_notice
+Case B follow-up: after `conn.check` returns `not_authorized`, post the
+structured **"go authorize" card** into this conversation. The chat renders it
+as a card whose button deep-links to that app's own connect dialog
+(`/connections?connect=<slug>`).
+
+```bash
+node src/cli/conn.js conn.auth_notice '{"conversationId":"<conversation-id>","apps":["notion"]}'
+```
+
+`apps` is a list of app slugs (display names / application ids also match,
+exactly and case-insensitively), resolved against the application catalog
+(`GET /connect/applications`) to `{name, slug}`. An app not in the catalog is
+refused with `404 unknown_connector` and nothing is posted. `conversationId` is
+mandatory (`400 conversation_context_invalid` otherwise). Returns
+`{ status: "sent", conversation_id, connectors }`. The message is
+`AGENT_STRUCTURED` with body schema `prototype.connector-auth-notice.v1`
+(`connector_names[]` / `connector_slugs[]`, index-aligned), a metadata copy, and
+a plain Chinese `fallback_text` for clients that don't render the card.
+
 ### conn.acquire
 Acquire the credential for a connection. Returns `access_token`, `token_type`,
 `expires_at`, `toolkits[]` — the token is cached locally and injected for you on

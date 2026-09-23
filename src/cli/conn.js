@@ -10,6 +10,7 @@
  */
 
 import fs from 'fs';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'url';
 import { apiPath, getForOrg, postForOrg, patchForOrg, delForOrg } from '../lib/client.js';
 import { loadConfig, enabledOrgs, resolveDefaultOrgId } from '../lib/config.js';
@@ -630,6 +631,97 @@ export function requireConversationId(p, verb) {
   return raw;
 }
 
+// --- conn.auth_notice: structured "go authorize" card (design §2.4 case B) ----
+//
+// When conn.check says an app is not_authorized, the agent posts ONE structured
+// Agent message the cws-fe chat already renders as an authorize card (click →
+// /connections?connect=<slug>, which opens that app's own connect dialog).
+// Shape mirrors the channel.js structured-message builders: AGENT_STRUCTURED +
+// content {content_type, body{schema,...}} + a metadata copy (cws-comm trims
+// structured bodies from the list hot path, and the FE parser falls back to
+// metadata.connector_auth_notice) + a plain-language fallback_text for any
+// client that does not know the schema.
+//
+// The schema string MUST stay byte-identical to cws-fe's
+// CONNECTOR_AUTH_NOTICE_SCHEMA (apps/web/src/lib/connector-auth-notice.ts) so no
+// frontend change is needed. Renaming it off the "prototype." prefix is a
+// coordinated FE+agent follow-up — do not change it on one side only.
+export const CONNECTOR_AUTH_NOTICE_SCHEMA = 'prototype.connector-auth-notice.v1';
+const AUTH_NOTICE_MAX_APPS = 10;
+
+// Pure builder. `connectors` = [{name, slug}] in display order; names and slugs
+// are emitted index-aligned (connector_slugs[i] belongs to connector_names[i]).
+export function buildConnectorAuthNoticeMessage(connectors) {
+  if (!Array.isArray(connectors) || connectors.length === 0) throw bad('at least one connector is required');
+  const names = [];
+  const slugs = [];
+  for (const c of connectors) {
+    const name = typeof c?.name === 'string' ? c.name.trim() : '';
+    const slug = typeof c?.slug === 'string' ? c.slug.trim() : '';
+    if (!name || !slug) throw bad('each connector needs a non-empty name and slug');
+    names.push(name);
+    slugs.push(slug);
+  }
+  const body = { schema: CONNECTOR_AUTH_NOTICE_SCHEMA, connector_names: names, connector_slugs: slugs };
+  return {
+    client_msg_id: randomUUID(),
+    type: 'AGENT_STRUCTURED',
+    content: { content_type: 'connector_auth_notice', body, attachments: [] },
+    metadata: { connector_auth_notice: { ...body, connector_names: [...names], connector_slugs: [...slugs] } },
+    fallback_text: `${names.join('、')} 还没有授权给我。请到「连接」页面（/connections）完成授权，授权后在对话里打开它就能用了。`,
+  };
+}
+
+// Parse + validate the `apps` param: a non-empty list (or a single string) of
+// slugs / display names / application ids, de-duplicated case-insensitively.
+export function parseAuthNoticeApps(p) {
+  let raw = p.apps ?? p.app;
+  if (typeof raw === 'string') raw = [raw];
+  if (!Array.isArray(raw) || raw.length === 0) throw bad('apps (non-empty list of app slugs) is required');
+  const seen = new Set();
+  const out = [];
+  for (const a of raw) {
+    if (typeof a !== 'string' || !a.trim()) throw bad('apps entries must be non-empty strings');
+    const key = a.trim().toLowerCase();
+    if (!seen.has(key)) { seen.add(key); out.push(a.trim()); }
+  }
+  if (out.length > AUTH_NOTICE_MAX_APPS) throw bad(`at most ${AUTH_NOTICE_MAX_APPS} apps per notice`);
+  return out;
+}
+
+function applicationItemsOf(resp) {
+  if (Array.isArray(resp)) return resp;
+  for (const k of ['data', 'applications', 'items']) if (Array.isArray(resp?.[k])) return resp[k];
+  return [];
+}
+
+// Resolve each requested app to {name, slug} against the application directory
+// (the catalog the /connections page renders and resolves `?connect=<slug>`
+// against — a not-authorized app is by definition absent from the local
+// connections index). Exact, case-insensitive match on slug / display name / id;
+// no fuzzy guess, so the deep link always targets a real catalog slug. An
+// unresolvable app is an error (404 unknown_connector) — never a card with a
+// dead link. `listApplications(query)` is injected for tests.
+export async function resolveAuthNoticeConnectors(apps, listApplications) {
+  const resolved = [];
+  const slugsSeen = new Set();
+  for (const app of apps) {
+    const want = app.toLowerCase();
+    const items = applicationItemsOf(await listApplications(app));
+    const hit = items.find((it) => it && [it.slug, it.display_name, it.name, it.id, it.application_id]
+      .some((v) => typeof v === 'string' && v.toLowerCase() === want));
+    const slug = hit && typeof hit.slug === 'string' ? hit.slug.trim() : '';
+    if (!slug) {
+      throw Object.assign(new Error(`unknown connector "${app}" — not found in the application catalog; use the exact app slug`), { status: 404, code: 'unknown_connector' });
+    }
+    if (slugsSeen.has(slug)) continue;
+    slugsSeen.add(slug);
+    const name = [hit.display_name, hit.name].find((v) => typeof v === 'string' && v.trim()) || slug;
+    resolved.push({ name: name.trim(), slug });
+  }
+  return resolved;
+}
+
 // True for the two F4 readiness codes thrown by fetchEnabledConnectorIds.
 function isPanelReadinessCode(code) {
   return code === 'connector_panel_not_ready' || code === 'connector_enabled_set_unavailable';
@@ -703,6 +795,23 @@ const COMMANDS = {
     const anyActive = matches.filter(isActive);
     if (anyActive.length) return { app, app_name: appName, state: 'not_enabled', connection_ids: anyActive.map(idOf) };
     return { app, app_name: appName, state: 'needs_reauth', connection_ids: matches.map(idOf) };
+  },
+
+  // conn.auth_notice {conversationId, apps:[slug...]} — case B follow-up to
+  // conn.check → not_authorized: post the structured "go authorize" card into
+  // this conversation (see buildConnectorAuthNoticeMessage). conversationId is
+  // mandatory and shape-checked like conn.list (it is interpolated into the
+  // POST path); validation runs before any request.
+  'conn.auth_notice': async () => {
+    const convId = requireConversationId(params, 'conn.auth_notice');
+    const apps = parseAuthNoticeApps(params);
+    const orgId = requireOrgId();
+    const connectors = await resolveAuthNoticeConnectors(apps, (q) => getForOrg(
+      orgId, apiPath('/connect/applications'), { query: q, page: '1', page_size: '50' },
+    ));
+    const message = buildConnectorAuthNoticeMessage(connectors);
+    await postForOrg(orgId, apiPath(`/conversations/${convId}/messages`), message, { timeoutMs: 30_000, quietOnSuccess: true });
+    return { status: 'sent', conversation_id: convId, connectors };
   },
 
   // Acquire a credential for a connection. This verb is DIRECT-only: it returns
@@ -1158,6 +1267,7 @@ Usage: node src/cli/conn.js <command> '<json-params>'
 Connections
   conn.list           {conversationId}                          # connections ENABLED for this conversation (conversationId REQUIRED)
   conn.check          {app, conversationId}                     # pre-invoke check: enabled | not_enabled | not_authorized | needs_reauth
+  conn.auth_notice    {conversationId, apps:[slug...]}          # case B: post the "go authorize" card for not-authorized apps
   conn.acquire        {connectionId}                            # acquire the direct access_token for a connection
   conn.actions        {connectionId}                            # discover named actions for a connection
   conn.status         {connectionId}                            # get connection details (status, owner, scopes)

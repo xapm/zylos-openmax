@@ -12,6 +12,7 @@ import {
   planAppCreate, planAppUpdate,
   planActionDefList, planActionDefCreate, planActionDefUpdate, planActionDefDelete,
   runAppImport, classifyPanelFetchFailure,
+  CONNECTOR_AUTH_NOTICE_SCHEMA, buildConnectorAuthNoticeMessage, parseAuthNoticeApps, resolveAuthNoticeConnectors,
 } from './conn.js';
 
 // buildNeedsSelection / buildCandidateLabels / resolveInvokeEntry are pure (no
@@ -1952,4 +1953,164 @@ test('conn.check: missing conversationId → 400 conversation_context_invalid be
   assert.equal(code, 1);
   assert.equal(JSON.parse(stderr).code, 'conversation_context_invalid');
   assert.deepEqual(seen, []);
+});
+
+// --- conn.auth_notice: structured "go authorize" card (case B) --------------
+//
+// The card must parse with cws-fe's parseConnectorAuthNotice
+// (apps/web/src/lib/connector-auth-notice.ts). This is a faithful JS port of
+// that parser, so a shape drift on the agent side fails here.
+function feParseConnectorAuthNotice(message) {
+  if (message.type !== 'AGENT_STRUCTURED' || message.sender_type !== 'AGENT') return null;
+  const asRecord = (v) => (v !== null && typeof v === 'object' && !Array.isArray(v) ? v : null);
+  const contentBody = asRecord(message.content?.body) || {};
+  const body = contentBody.schema === 'prototype.connector-auth-notice.v1'
+    ? contentBody
+    : asRecord(asRecord(message.metadata)?.connector_auth_notice);
+  if (!body || body.schema !== 'prototype.connector-auth-notice.v1') return null;
+  if (!Array.isArray(body.connector_names)) return null;
+  const connectorNames = body.connector_names.filter((n) => typeof n === 'string' && n.trim() !== '');
+  if (connectorNames.length === 0) return null;
+  const slugs = Array.isArray(body.connector_slugs) ? body.connector_slugs : [];
+  const connectorSlugs = connectorNames.map((_, i) => (typeof slugs[i] === 'string' && slugs[i].trim() !== '' ? slugs[i] : null));
+  return { connectorNames, connectorSlugs };
+}
+
+test('buildConnectorAuthNoticeMessage: exact FE schema + structured shape + metadata copy + Chinese fallback', () => {
+  assert.equal(CONNECTOR_AUTH_NOTICE_SCHEMA, 'prototype.connector-auth-notice.v1');
+  const m = buildConnectorAuthNoticeMessage([{ name: 'Notion', slug: 'notion' }, { name: 'Jira', slug: 'jira' }]);
+  assert.equal(m.type, 'AGENT_STRUCTURED');
+  assert.match(m.client_msg_id, /^[0-9a-f-]{36}$/);
+  assert.equal(m.content.content_type, 'connector_auth_notice');
+  assert.deepEqual(m.content.attachments, []);
+  assert.deepEqual(m.content.body, {
+    schema: 'prototype.connector-auth-notice.v1',
+    connector_names: ['Notion', 'Jira'],
+    connector_slugs: ['notion', 'jira'],
+  });
+  assert.deepEqual(m.metadata.connector_auth_notice, m.content.body);
+  assert.notEqual(m.metadata.connector_auth_notice, m.content.body, 'metadata is a copy, not the same object');
+  assert.match(m.fallback_text, /Notion、Jira/);
+  assert.match(m.fallback_text, /\/connections/);
+  assert.match(m.fallback_text, /授权/);
+  assert.doesNotMatch(m.fallback_text, /not_authorized|403|conversation/);
+});
+
+test('buildConnectorAuthNoticeMessage: FE parser reads it from content AND from metadata only (list hot path)', () => {
+  const m = buildConnectorAuthNoticeMessage([{ name: 'Notion', slug: 'notion' }, { name: 'Google Drive', slug: 'googledrive' }]);
+  const expected = { connectorNames: ['Notion', 'Google Drive'], connectorSlugs: ['notion', 'googledrive'] };
+  // As stored/rendered: the server stamps sender_type=AGENT on an agent post.
+  assert.deepEqual(feParseConnectorAuthNotice({ ...m, sender_type: 'AGENT' }), expected);
+  // Body trimmed by cws-comm on the list path → metadata fallback still parses.
+  assert.deepEqual(feParseConnectorAuthNotice({ ...m, sender_type: 'AGENT', content: { content_type: m.content.content_type } }), expected);
+});
+
+test('buildConnectorAuthNoticeMessage: rejects empty list and entries without name/slug', () => {
+  assert.throws(() => buildConnectorAuthNoticeMessage([]), /at least one/);
+  assert.throws(() => buildConnectorAuthNoticeMessage([{ name: 'Notion' }]), /name and slug/);
+  assert.throws(() => buildConnectorAuthNoticeMessage([{ name: ' ', slug: 'notion' }]), /name and slug/);
+});
+
+test('parseAuthNoticeApps: string or list, trimmed, case-insensitive de-dup, bounded', () => {
+  assert.deepEqual(parseAuthNoticeApps({ apps: 'notion' }), ['notion']);
+  assert.deepEqual(parseAuthNoticeApps({ apps: [' notion ', 'NOTION', 'jira'] }), ['notion', 'jira']);
+  assert.throws(() => parseAuthNoticeApps({}), /apps/);
+  assert.throws(() => parseAuthNoticeApps({ apps: [] }), /apps/);
+  assert.throws(() => parseAuthNoticeApps({ apps: [''] }), /non-empty/);
+  assert.throws(() => parseAuthNoticeApps({ apps: Array.from({ length: 11 }, (_, i) => `a${i}`) }), /at most/);
+});
+
+const CATALOG_APPS = [
+  { id: 'app-n', slug: 'notion', display_name: 'Notion' },
+  { id: 'app-j', slug: 'jira', display_name: 'Jira Cloud' },
+  { id: 'app-gd', slug: 'googledrive', display_name: 'Google Drive' },
+];
+
+test('resolveAuthNoticeConnectors: slug/name/id → index-aligned {name, slug} in request order', async () => {
+  const queries = [];
+  const list = async (q) => { queries.push(q); return CATALOG_APPS; };
+  const out = await resolveAuthNoticeConnectors(['jira', 'google drive', 'app-n'], list);
+  assert.deepEqual(out, [
+    { name: 'Jira Cloud', slug: 'jira' },
+    { name: 'Google Drive', slug: 'googledrive' },
+    { name: 'Notion', slug: 'notion' },
+  ]);
+  assert.deepEqual(queries, ['jira', 'google drive', 'app-n']);
+  // Envelope-wrapped / paginated shapes are accepted too; the same app twice collapses.
+  const out2 = await resolveAuthNoticeConnectors(['notion', 'Notion'], async () => ({ data: CATALOG_APPS }));
+  assert.deepEqual(out2, [{ name: 'Notion', slug: 'notion' }]);
+});
+
+test('resolveAuthNoticeConnectors: unknown or only-fuzzy-matching app → 404 unknown_connector (no dead-link card)', async () => {
+  await assert.rejects(resolveAuthNoticeConnectors(['confluence'], async () => CATALOG_APPS),
+    (e) => e.status === 404 && e.code === 'unknown_connector');
+  await assert.rejects(resolveAuthNoticeConnectors(['not'], async () => CATALOG_APPS),
+    (e) => e.code === 'unknown_connector');
+  await assert.rejects(resolveAuthNoticeConnectors(['x'], async () => [{ display_name: 'x' }]),
+    (e) => e.code === 'unknown_connector', 'a catalog hit without a slug is not linkable');
+});
+
+async function runAuthNotice(params) {
+  const home = setupHome({ connections: {} });
+  const seen = [];
+  const posted = [];
+  const server = createServer((req, res) => {
+    seen.push(`${req.method} ${req.url}`);
+    if (req.method === 'GET' && req.url.startsWith('/api/v1/connect/applications')) {
+      const q = new URL(req.url, 'http://x').searchParams.get('query') || '';
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: CATALOG_APPS.filter((a) => a.slug.includes(q.toLowerCase()) || a.display_name.toLowerCase().includes(q.toLowerCase())), request_id: 'r-a' }));
+      return;
+    }
+    if (req.method === 'POST' && req.url === `/api/v1/conversations/${CONV}/messages`) {
+      let buf = '';
+      req.on('data', (c) => { buf += c; });
+      req.on('end', () => {
+        posted.push(JSON.parse(buf));
+        res.writeHead(201, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ data: { id: 'msg-1' }, request_id: 'r-p' }));
+      });
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r9"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const out = await runConn(home, 'conn.auth_notice', params, `http://127.0.0.1:${server.address().port}`);
+    return { ...out, seen, posted };
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+}
+
+test('conn.auth_notice: resolves from the catalog and posts the card to this conversation', async () => {
+  const { code, stdout, posted } = await runAuthNotice({ conversationId: CONV, apps: ['notion', 'Jira Cloud'] });
+  assert.equal(code, 0, stdout);
+  const out = JSON.parse(stdout);
+  assert.equal(out.status, 'sent');
+  assert.deepEqual(out.connectors, [{ name: 'Notion', slug: 'notion' }, { name: 'Jira Cloud', slug: 'jira' }]);
+  assert.equal(posted.length, 1);
+  assert.deepEqual(feParseConnectorAuthNotice({ ...posted[0], sender_type: 'AGENT' }),
+    { connectorNames: ['Notion', 'Jira Cloud'], connectorSlugs: ['notion', 'jira'] });
+});
+
+test('conn.auth_notice: unknown app → 404 unknown_connector and NOTHING is posted', async () => {
+  const { code, stderr, posted } = await runAuthNotice({ conversationId: CONV, apps: ['notion', 'confluence'] });
+  assert.equal(code, 1);
+  const err = JSON.parse(stderr);
+  assert.equal(err.status, 404);
+  assert.equal(err.code, 'unknown_connector');
+  assert.equal(posted.length, 0);
+});
+
+test('conn.auth_notice: missing / malformed conversationId → 400 conversation_context_invalid before any request', async () => {
+  for (const params of [{ apps: ['notion'] }, { conversationId: '../x', apps: ['notion'] }]) {
+    const { code, stderr, seen } = await runAuthNotice(params);
+    assert.equal(code, 1);
+    const err = JSON.parse(stderr);
+    assert.equal(err.status, 400);
+    assert.equal(err.code, 'conversation_context_invalid');
+    assert.deepEqual(seen, []);
+  }
 });

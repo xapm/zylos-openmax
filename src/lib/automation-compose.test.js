@@ -207,17 +207,69 @@ test('worker preserves UTF-8 characters split across stdout chunks', async () =>
   assert.equal(result.message, expected);
 });
 
-test('request inference failure does not reclassify a ready worker or charge another probe', async () => {
+test('valid request business error does not reclassify a ready worker or charge another probe', async () => {
   const r = request(); let probes = 0, calls = 0;
   const consumer = createComposeConsumer({ orgId: 'o1', agentId: 'a1', config,
     get: async route => route.includes('/pending') ? [r] : r, post: async () => {},
     run: async (_config, content) => {
       if (content.startsWith('Readiness check only')) { probes++; return { kind: 'clarification', message: 'Ready' }; }
-      calls++; throw new Error('request-specific malformed output');
+      calls++; return { kind: 'error', message: 'Please provide a valid schedule.' };
     },
   });
   await consumer.tick(); await consumer.tick();
   assert.equal(probes, 1); assert.equal(calls, 2);
+});
+
+test('broken worker stops renewal and queue processing until backed-off readiness recovers', async () => {
+  for (const invalidResult of [false, true]) {
+    let clock = 0, probes = 0, registrations = 0, reads = 0, runs = 0, healthy = true;
+    const r = request(); const results = [];
+    const consumer = createComposeConsumer({ orgId: 'o1', agentId: 'a1', config, now: () => clock,
+      probe: async () => { probes++; if (!healthy) throw new Error('worker unavailable'); },
+      get: async route => { if (route.includes('/pending')) { reads++; return [r, { ...r, request_id: 'r2' }]; } return r; },
+      post: async (route, body) => { if (route.endsWith('/register')) registrations++; else results.push(body.result); },
+      run: async () => { runs++; healthy = false; if (invalidResult) return {}; throw new Error('worker crashed'); },
+    });
+    await consumer.tick();
+    assert.equal(probes, 1); assert.equal(registrations, 1); assert.equal(runs, 1);
+    assert.equal(results[0].kind, 'error');
+    for (let i = 1; i <= 10; i++) { clock = i * 5000; await consumer.tick(); }
+    assert.equal(probes, 1); assert.equal(registrations, 1); assert.equal(reads, 1);
+    clock = 60000; await consumer.tick();
+    assert.equal(probes, 2); assert.equal(registrations, 1); assert.equal(reads, 1);
+    clock = 119999; await consumer.tick(); assert.equal(probes, 2);
+    healthy = true; clock = 120000; await consumer.tick();
+    assert.equal(probes, 3); assert.equal(registrations, 2); assert.equal(reads, 2);
+  }
+});
+
+test('invalid queue input and authorization exceptions preserve worker readiness', async () => {
+  const invalid = request(); invalid.session.org_id = 'wrong'; let probes = 0, registrations = 0, clock = 1;
+  const consumer = createComposeConsumer({ orgId: 'o1', agentId: 'a1', config, now: () => clock,
+    probe: async () => { probes++; }, get: async () => [invalid, request()],
+    authorize: async () => { throw new Error('policy unavailable'); },
+    post: async () => { registrations++; }, run: async () => { assert.fail('invalid requests must not invoke worker'); },
+  });
+  await consumer.tick(); clock += 60000; await consumer.tick();
+  assert.equal(probes, 1); assert.equal(registrations, 2);
+});
+
+test('queue aliases mutated during inference cannot rewrite trusted lookup routes or reply bindings', async () => {
+  for (const mutate of [r => { r.session.session_id = 's2'; }, r => { r.request_id = 'r2'; },
+    r => { r.session.conversation_id = 'c2'; }, r => { r.form_revision = 'changed'; }]) {
+    const queued = request(), trusted = structuredClone(queued), lookups = [], replies = [];
+    const consumer = createComposeConsumer({ orgId: 'o1', agentId: 'a1', config, probe: async () => {},
+      get: async route => { if (route.includes('/pending')) return [queued]; lookups.push(route); return trusted; },
+      post: async (route, body) => { if (route.endsWith('/result')) replies.push({ route, body }); },
+      run: async () => { mutate(queued); return { kind: 'clarification', message: 'When?' }; },
+    });
+    await consumer.tick();
+    assert.deepEqual(lookups, ['/automation-compose/sessions/s1/requests/r1']);
+    assert.equal(replies.length, 1);
+    assert.equal(replies[0].route, '/automation-compose/sessions/s1/requests/r1/result');
+    assert.equal(replies[0].body.conversation_id, 'c1');
+    assert.equal(replies[0].body.form_revision, 'revision');
+  }
 });
 
 test('missing authorization and every non-boolean approval deny inference', async () => {

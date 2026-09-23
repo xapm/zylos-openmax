@@ -8,13 +8,20 @@ import { fileURLToPath } from 'node:url';
 
 const worker = fileURLToPath(new URL('./compose-claude-worker.js', import.meta.url));
 
-async function runWorker(t, source, { pauseOutput = false, signalOnReady } = {}) {
+async function runWorker(t, source, { pauseOutput = false, signalOnReady, delayWrites = false } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'compose-worker-test-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   if (source !== null) {
     await writeFile(join(dir, 'claude'), `#!${process.execPath}\n${source}\n`, { mode: 0o700 });
   }
-  const child = spawn(process.execPath, [worker], {
+  const args = [worker];
+  if (delayWrites) {
+    const preload = join(dir, 'delay-stdout.mjs');
+    await writeFile(preload, `const write = process.stdout.write.bind(process.stdout);
+process.stdout.write = (...args) => { setTimeout(() => write(...args), 200); return false; };`);
+    args.unshift('--import', preload);
+  }
+  const child = spawn(process.execPath, args, {
     env: { ...process.env, PATH: dir },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -46,13 +53,22 @@ async function runWorker(t, source, { pauseOutput = false, signalOnReady } = {})
   return result;
 }
 
-test('compose worker drains a large JSON response under stdout backpressure', { timeout: 10000 }, async t => {
-  const size = 512 * 1024;
-  const result = await runWorker(t, `process.stdin.resume(); process.stdout.write(JSON.stringify({kind:'clarification',message:'x'.repeat(${size})}));`, { pauseOutput: true });
+for (const kib of [160, 192, 224, 512]) {
+  test(`compose worker drains ${kib} KiB JSON under stdout backpressure`, { timeout: 10000 }, async t => {
+    const size = kib * 1024;
+    const result = await runWorker(t, `process.stdin.resume(); process.stdout.write(JSON.stringify({kind:'clarification',message:'x'.repeat(${size})}));`, { pauseOutput: true });
+    assert.equal(result.code, 0);
+    assert.equal(result.signal, null);
+    assert.deepEqual(JSON.parse(result.stdout), { kind: 'clarification', message: 'x'.repeat(size) });
+    assert.equal(result.stderr, '');
+  });
+}
+
+test('compose worker waits for pending stdout writes after child closes', { timeout: 10000 }, async t => {
+  const expected = { kind: 'clarification', message: 'Pending output must survive child close' };
+  const result = await runWorker(t, `process.stdin.resume(); process.stdout.write(${JSON.stringify(JSON.stringify(expected))});`, { delayWrites: true });
   assert.equal(result.code, 0);
-  assert.equal(result.signal, null);
-  assert.deepEqual(JSON.parse(result.stdout), { kind: 'clarification', message: 'x'.repeat(size) });
-  assert.equal(result.stderr, '');
+  assert.equal(result.stdout, JSON.stringify(expected));
 });
 
 test('compose worker fails cleanly when claude cannot spawn', { timeout: 10000 }, async t => {

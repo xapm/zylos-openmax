@@ -109,7 +109,7 @@ export async function runComposeWorker(config, content, { signal } = {}) {
 
 export function createComposeConsumer({ orgId, agentId: agentIdentity, get, post, config, authorize = async () => false, run = runComposeWorker, probe, warn = () => {}, now = Date.now }) {
   const currentAgentId = () => typeof agentIdentity === 'function' ? agentIdentity() : agentIdentity;
-  let stopped = false, polling = false, registeredAt = 0, timer, readyConfig = '', probeFailedAt = 0;
+  let stopped = false, polling = false, registeredAt = 0, timer, readyConfig = '', probeFailedAt = null;
   const controller = new AbortController();
   // Retain a completed result until the server acknowledges it; transport retry
   // must not invoke the model again within this process.
@@ -123,12 +123,12 @@ export function createComposeConsumer({ orgId, agentId: agentIdentity, get, post
     try {
       const signature = JSON.stringify(config());
       if (readyConfig !== signature) {
-        if (probeFailedAt && now() - probeFailedAt < 60000) return;
+        if (probeFailedAt !== null && now() - probeFailedAt < 60000) return;
         try {
           if (probe) await probe(config());
           else validateComposeResult(await run(config(), 'Readiness check only. Return exactly {"kind":"clarification","message":"Ready"}. Do not perform any actions.', { signal: controller.signal }));
           readyConfig = signature;
-          probeFailedAt = 0;
+          probeFailedAt = null;
         } catch { probeFailedAt = now(); throw new Error('compose worker not ready'); }
       }
       if (!registeredAt || now() - registeredAt >= 60000) {
@@ -140,7 +140,7 @@ export function createComposeConsumer({ orgId, agentId: agentIdentity, get, post
       const liveKeys = new Set(pending.map(requestBinding));
       for (const key of completed.keys()) if (!liveKeys.has(key)) completed.delete(key);
       for (const item of pending) {
-        if (stopped) break;
+        if (stopped || readyConfig !== signature) break;
         try {
           if (now() - registeredAt >= 60000) {
             await post(`${base}/capabilities/register`, { schema_version: 1 });
@@ -150,14 +150,20 @@ export function createComposeConsumer({ orgId, agentId: agentIdentity, get, post
           const key = requestBinding(request);
           let result = completed.get(key);
           if (!result) {
-            try {
-              result = (await authorize(request)) === true
-                ? await run(config(), request.content, { signal: controller.signal })
-                : { kind: 'error', message: 'You do not have permission to draft with this agent.' };
-            }
-            catch {
-              if (stopped) break;
-              result = { kind: 'error', message: 'The agent could not generate a draft. Please try again.' };
+            if ((await authorize(request)) === true) {
+              try {
+                result = validateComposeResult(await run(config(), request.content, { signal: controller.signal }));
+              } catch {
+                if (stopped) break;
+                // Execution/protocol failures invalidate readiness. Request validation,
+                // policy failures and valid business errors do not enter this branch.
+                readyConfig = '';
+                probeFailedAt = now();
+                registeredAt = 0;
+                result = { kind: 'error', message: 'The agent could not generate a draft. Please try again.' };
+              }
+            } else {
+              result = { kind: 'error', message: 'You do not have permission to draft with this agent.' };
             }
             result = validateComposeResult(result);
             completed.set(key, result);

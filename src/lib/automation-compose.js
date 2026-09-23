@@ -114,6 +114,10 @@ export function createComposeConsumer({ orgId, agentId: agentIdentity, get, post
   // Retain a completed result until the server acknowledges it; transport retry
   // must not invoke the model again within this process.
   const completed = new Map();
+  const cacheResult = (key, request, result) => {
+    completed.set(key, { result, expiresAt: Math.min(request.session.expires_at_ms, now() + 600000) });
+    while (completed.size > 256) completed.delete(completed.keys().next().value);
+  };
   const base = '/automation-compose';
   const unwrap = response => response?.data ?? response;
   async function tick() {
@@ -137,8 +141,9 @@ export function createComposeConsumer({ orgId, agentId: agentIdentity, get, post
       }
       const pending = unwrap(await get(`${base}/requests/pending?limit=20`));
       if (!Array.isArray(pending)) throw new Error('invalid compose queue');
-      const liveKeys = new Set(pending.map(requestBinding));
-      for (const key of completed.keys()) if (!liveKeys.has(key)) completed.delete(key);
+      // Absence from a paginated queue is not cancellation. Bound retention by
+      // session expiry, ten minutes, and 256 entries rather than the current page.
+      for (const [key, cached] of completed) if (cached.expiresAt <= now()) completed.delete(key);
       for (const item of pending) {
         if (stopped || readyConfig !== signature) break;
         try {
@@ -148,7 +153,7 @@ export function createComposeConsumer({ orgId, agentId: agentIdentity, get, post
           }
           const request = structuredClone(validateComposeRequest(item, orgId, agentId, now()));
           const key = requestBinding(request);
-          let result = completed.get(key);
+          let result = completed.get(key)?.result;
           if (!result) {
             if ((await authorize(request)) === true) {
               try {
@@ -166,7 +171,7 @@ export function createComposeConsumer({ orgId, agentId: agentIdentity, get, post
               result = { kind: 'error', message: 'You do not have permission to draft with this agent.' };
             }
             result = validateComposeResult(result);
-            completed.set(key, result);
+            cacheResult(key, request, result);
           }
           if (stopped) break;
           // Fetch again after inference: cancelled/expired sessions and stale turns
@@ -178,7 +183,7 @@ export function createComposeConsumer({ orgId, agentId: agentIdentity, get, post
           if (currentAgentId() !== agentId) throw new Error('compose agent changed');
           if ((await authorize(latest)) !== true) {
             result = { kind: 'error', message: 'You do not have permission to draft with this agent.' };
-            completed.set(key, result);
+            cacheResult(key, request, result);
           }
           const resultRoute = `${base}/sessions/${request.session.session_id}/requests/${request.request_id}/result`;
           const envelope = {
@@ -189,7 +194,7 @@ export function createComposeConsumer({ orgId, agentId: agentIdentity, get, post
           catch (error) {
             if (![400, 422].includes(error.status) || result.kind !== 'proposal') throw error;
             const rejected = { kind: 'error', message: 'The generated draft could not be validated. Please try again.' };
-            completed.set(key, rejected);
+            cacheResult(key, request, rejected);
             await post(resultRoute, { ...envelope, result: rejected });
           }
           completed.delete(key);

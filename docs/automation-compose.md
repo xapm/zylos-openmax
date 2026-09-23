@@ -50,8 +50,10 @@ Worker output/stderr and prompts are not written to routine logs.
 ## Delivery Semantics
 
 Five-second polling is non-overlapping. Results awaiting an HTTP acknowledgement
-are cached in-process; a transient submit failure retries without another model
-call. A crash may repeat inference, but server-side first-valid-terminal
+are cached in-process across temporary queue-page absence for up to ten minutes
+or session expiry, capped at 256 entries. A transient submit failure within those
+bounds retries without another model call. Eviction or a crash may repeat inference,
+but server-side first-valid-terminal
 idempotency prevents duplicate results and there are no model-side actions.
 After inference the adapter rechecks cancellation/expiry and immutable binding.
 Shutdown aborts the inference process group. No raw credentials are put into the
@@ -64,12 +66,20 @@ reviewed worker for inference. Parent messaging/session credentials, OpenMax
 credentials and Node injection options are not inherited. This is input
 minimization, not filesystem isolation from the same OS user's credentials.
 
-Retry cache entries bind the complete immutable request, including requester,
-conversation, revision and content. A changed binding cannot reuse an old result;
+Retry cache entries bind ten explicit fields: session ID, conversation ID, org ID,
+requester ID, agent ID, session schema version, request ID, form revision, request
+schema version and content. Unknown additional fields are not part of this binding;
+new server fields that affect inference or routing require extending it.
+A change to a bound field cannot reuse an old result;
 the binding and current local DM policy are rechecked before every submission.
 Comm additionally rejects changed content/revision for an existing request ID.
-Request inference failures return isolated errors without resetting successful
-worker readiness or causing another readiness probe.
+Valid business error results preserve worker readiness. Worker execution or
+protocol failures return an isolated error, suspend queue processing and capability
+renewal, and require a successful readiness probe after a one-minute backoff.
+An existing capability lease expires naturally; there is no immediate revocation.
+Request validation failures and policy-check errors do not invalidate readiness.
+The explicit latest-status check also evicts cached terminal requests; the same
+pending-status predicate in request validation provides an additional guard.
 
 Cancellation observed after inference suppresses submission. It does not yet
 interrupt inference immediately; sequential polling can delay the next request

@@ -2243,8 +2243,6 @@ function startOrgWs(orgConfig, wsBaseUrl) {
     post: (route, body) => postForOrg(orgConfig.org_id, apiPath(route), body, { timeoutMs: 15000 }),
     warn: message => warn(`[${orgConfig.slug}] ${message}`),
   });
-  composeConsumers.push(compose);
-  compose.start();
   const session = loadOrgSession(orgConfig.slug) || {};
   // Backward compat: migrate last_seq → sync_seq on first boot after upgrade.
   const syncSeq = session.sync_seq ?? session.last_seq ?? 0;
@@ -2441,6 +2439,8 @@ function startOrgWs(orgConfig, wsBaseUrl) {
   activeOrgConfigs.set(orgConfig.slug, orgConfig);
   liveOrgCount += 1;
   ws.start();
+  composeConsumers.push(compose);
+  compose.start();
   log(`[${orgConfig.slug}] started (org=${orgConfig.org_id})`);
 }
 

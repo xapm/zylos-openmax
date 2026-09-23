@@ -284,6 +284,40 @@ test('missing authorization and every non-boolean approval deny inference', asyn
   }
 });
 
+test('same queue and detail object mutated during inference never submits', async () => {
+  for (const mutate of [r => { r.session.conversation_id = 'c-ATTACK'; }, r => { r.form_revision = 'rev-ATTACK'; }]) {
+    const r = request(); let submits = 0;
+    const consumer = createComposeConsumer({ orgId: 'o1', agentId: 'a1', config, probe: async () => {},
+      get: async route => route.includes('/pending') ? [r] : r,
+      post: async route => { if (route.endsWith('/result')) submits++; },
+      run: async () => { mutate(r); return { kind: 'proposal', draft: {} }; },
+    });
+    await consumer.tick(); assert.equal(submits, 0);
+  }
+});
+
+test('unacknowledged result survives temporary absence from the first queue page', async () => {
+  const r = request(); let page = [r], runs = 0, submits = 0;
+  const consumer = createComposeConsumer({ orgId: 'o1', agentId: 'a1', config, probe: async () => {},
+    get: async route => route.includes('/pending') ? page : r,
+    post: async route => { if (route.endsWith('/result') && ++submits === 1) throw new Error('network'); },
+    run: async () => { runs++; return { kind: 'proposal', draft: {} }; },
+  });
+  await consumer.tick(); page = []; await consumer.tick(); page = [r]; await consumer.tick();
+  assert.equal(runs, 1); assert.equal(submits, 2);
+});
+
+test('retry cache expires after ten minutes even if the session remains active', async () => {
+  const r = request(); r.session.expires_at_ms = 2000000; let clock = 1, runs = 0;
+  const consumer = createComposeConsumer({ orgId: 'o1', agentId: 'a1', config, now: () => clock, probe: async () => {},
+    get: async route => route.includes('/pending') ? [r] : r,
+    post: async route => { if (route.endsWith('/result')) throw new Error('network'); },
+    run: async () => { runs++; return { kind: 'proposal', draft: {} }; },
+  });
+  await consumer.tick(); clock = 600000; await consumer.tick(); assert.equal(runs, 1);
+  clock = 600001; await consumer.tick(); assert.equal(runs, 2);
+});
+
 test('late identity hydration resumes polling and identity change during inference blocks submission', async () => {
   let identity, runs = 0, submissions = 0, reads = 0; const r = request();
   const consumer = createComposeConsumer({ orgId: 'o1', agentId: () => identity, config, probe: async () => {},

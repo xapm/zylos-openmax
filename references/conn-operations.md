@@ -28,15 +28,38 @@ Either way you never hold a URL or craft a raw request. Prefer the cache-aware v
 ## Commands
 
 ### conn.list
-List connections available to this agent.
+List the connections **enabled for this conversation**.
 
 ```bash
-node src/cli/conn.js conn.list '{}'
+node src/cli/conn.js conn.list '{"conversationId":"<conversation-id from <message-context>>"}'
 ```
+
+`conversationId` is **mandatory** (also for `conn.check` / `conn.invoke`): a
+missing or malformed one is refused with `400 conversation_context_invalid`
+before any request — there is no flag/env that skips it (fail-closed; a flag
+the agent can set would be an escape hatch the model could forge). Returns the
+agent-authorized connections filtered to this conversation's enabled set (read
+from cws-core `GET /conversations/{id}/connectors`); `[]` when nothing is
+enabled, and also `[]` (fail-closed) when the enabled set can't be read.
 
 Self only — cws-core derives the caller's identity from the authenticated
 principal, not from any client-supplied parameter (no `agentMemberId` override
-exists). Returns array of connections with status, application, owner, scopes.
+exists). Each entry carries status, application, owner, scopes.
+
+### conn.check
+Read-only, pre-invoke availability check for **one** app in this conversation —
+use it before `conn.invoke` when the user names an app.
+
+```bash
+node src/cli/conn.js conn.check '{"app":"<slug or name>","conversationId":"<conversation-id>"}'
+```
+
+Returns `{ app, app_name, state, connection_ids }`; `state` is `enabled` (go
+ahead), `not_enabled` (authorized but switched off here — ask the user whether
+to enable it in the input-box connector panel), `not_authorized` (guide them to
+`/connections`), or `needs_reauth` (ask them to re-authorize). An unreadable
+enabled set fails closed with a 503 readiness code, never `enabled`. Reply to
+the user in plain language — never surface the state names or status codes.
 
 ### conn.acquire
 Acquire the credential for a connection. Returns `access_token`, `token_type`,
@@ -372,7 +395,7 @@ against that org's index, JWT, and member. The action catalog stays global
 Any bot with this skill gets the flow for free by calling the cache-aware verbs —
 it does not need to "know" the sequence:
 
-1. **`conn.invoke {app, action, params}`** — resolves the connection for `app`
+1. **`conn.invoke {app, action, params, conversationId}`** — (`conversationId` mandatory; gated on this conversation's enabled set) resolves the connection for `app`
    from `connections-index.json` (refreshing from `conn.list` on a miss), then
    routes on its `credential_mode`:
    - **`direct`** — assemble the request from the local catalog's `url_template`
@@ -418,7 +441,7 @@ disambiguate:
     { "connection_id": "c-8f2a4e91", "label": "工作邮箱", "display_name": "工作邮箱", "status": "active" },
     { "connection_id": "c-1b7d0c33", "label": "个人邮箱", "display_name": "个人邮箱", "status": "active" }
   ],
-  "retry_hint": "conn.invoke {\"connectionId\":\"<chosen>\",\"action\":\"<same>\",\"params\":{...}}"
+  "retry_hint": "conn.invoke {\"connectionId\":\"<chosen>\",\"action\":\"<same>\",\"params\":{...},\"conversationId\":\"<same>\"}"
 }
 ```
 
@@ -455,7 +478,7 @@ present it **skips app-resolution entirely** and runs the action against that
 connection directly:
 
 ```bash
-node src/cli/conn.js conn.invoke '{"connectionId":"c-8f2a4e91","action":"gmail/messages-send","params":{...}}'
+node src/cli/conn.js conn.invoke '{"connectionId":"c-8f2a4e91","action":"gmail/messages-send","params":{...},"conversationId":"<conversation-id>"}'
 ```
 
 This is exactly the retry after a `needs_selection` prompt: the user picked by

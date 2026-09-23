@@ -61,7 +61,7 @@ function runConnMultiOrg(home, command, params, apiUrl = 'http://127.0.0.1:1') {
 }
 
 for (const c of [
-  { command: 'conn.list', params: {} },
+  { command: 'conn.list', params: { conversationId: 'conv-1' } },
   { command: 'conn.status', params: { connectionId: 'c1' } },
   { command: 'conn.acquire', params: { connectionId: 'c1' } },
   { command: 'conn.actions', params: { connectionId: 'c1' } },
@@ -76,7 +76,7 @@ for (const c of [
   // used bare resolveOrgId() and would go out identity-only / return a
   // misleading empty result). invoke needs app+action to reach the org check.
   { command: 'conn.catalog', params: { applicationId: 'app-1' } },
-  { command: 'conn.invoke', params: { app: 'gmail', action: 'gmail-labels/list' } },
+  { command: 'conn.invoke', params: { app: 'gmail', action: 'gmail-labels/list', conversationId: 'conv-1' } },
   { command: 'conn.index', params: {} },
   // Custom-connector management verbs must fail-fast too. Params are valid enough
   // to pass local validation so the requireOrgId() gate is what trips (UUIDs where

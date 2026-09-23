@@ -5,7 +5,7 @@
  *
  * Usage:
  *   node src/cli/conn.js <command> '<json-params>'
- *   node src/cli/conn.js conn.list     '{}'
+ *   node src/cli/conn.js conn.list     '{"conversationId":"..."}'
  *   node src/cli/conn.js conn.acquire  '{"connectionId":"..."}'
  */
 
@@ -461,7 +461,7 @@ export function buildNeedsSelection(app, action, candidates) {
       display_name: e.displayName ?? null,
       status: e.status,
     })),
-    retry_hint: `conn.invoke {"connectionId":"<chosen>","action":"${action}","params":{...}}`,
+    retry_hint: `conn.invoke {"connectionId":"<chosen>","action":"${action}","params":{...},"conversationId":"<same>"}`,
   };
 }
 
@@ -600,6 +600,36 @@ async function fetchEnabledConnectorIds(orgId, conversationId) {
   return new Set(rows.filter((r) => r && r.enabled !== false).map((r) => r.connector_id).filter(Boolean));
 }
 
+// Conversation context is MANDATORY for the model-facing verbs conn.list /
+// conn.invoke (fail-closed, design §4 L2 branch ④ / R4-1). The CLI is only ever
+// run by the agent from its own shell, so there is no trustworthy way to tell a
+// model call from an ops/code call: any "ops mode" flag or env var would be
+// forgeable by the model (R4-1 — no in-shell escape hatch). Omitting the
+// conversation id used to silently return / permit the FULL authorized set,
+// bypassing the per-conversation enabled set; it is now refused with the named
+// code `conversation_context_invalid`. The id comes from the turn's
+// server-issued <message-context conversation-id="..."/>. Non-conversation code
+// paths that genuinely need a connector must go through a service account
+// (separate process + credential boundary), not this CLI. The id is also
+// shape-checked because it is interpolated into a request path.
+const CONV_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+export function requireConversationId(p, verb) {
+  const raw = p.conversationId ?? p.conversation_id;
+  if (raw == null || raw === '') {
+    throw Object.assign(
+      new Error(`${verb} requires conversationId — pass the conversation-id from this turn's <message-context .../>. Connectors are enabled per conversation, so without a conversation there is no enabled set and the call is refused.`),
+      { status: 400, code: 'conversation_context_invalid' },
+    );
+  }
+  if (typeof raw !== 'string' || !CONV_ID_RE.test(raw)) {
+    throw Object.assign(
+      new Error(`${verb}: conversationId is malformed — copy it exactly from this turn's <message-context conversation-id="..."/>.`),
+      { status: 400, code: 'conversation_context_invalid' },
+    );
+  }
+  return raw;
+}
+
 // True for the two F4 readiness codes thrown by fetchEnabledConnectorIds.
 function isPanelReadinessCode(code) {
   return code === 'connector_panel_not_ready' || code === 'connector_enabled_set_unavailable';
@@ -610,17 +640,18 @@ const COMMANDS = {
   // Always uses the agent's own member_id (resolveSelfMemberId) — no
   // client-supplied override; see the security note above resolveSelfMemberId.
   'conn.list': async () => {
+    // Fail closed BEFORE any network call: no conversation ⇒ no enabled set.
+    const convId = requireConversationId(params, 'conn.list');
     const orgId = requireOrgId();
     const agentId = resolveSelfMemberId(orgId);
     if (!agentId) throw Object.assign(new Error('cannot resolve agent member_id'), { status: 400 });
-    const all = await getForOrg(orgId, apiPath('/connect/agents/me/connections'));
-    // Conversation-scoped view (opt-in per conversation): when a conversationId is
-    // supplied, return only the connectors ENABLED for that conversation. The
-    // enabled set is the source of truth held by cws-core (never an agent-supplied
-    // list); a conversation with no enabled connectors returns []. Without a
-    // conversationId this is the full agent-authorized list (unchanged behavior).
-    const convId = params.conversationId || params.conversation_id || null;
-    if (!convId || !Array.isArray(all)) return all;
+    const resp = await getForOrg(orgId, apiPath('/connect/agents/me/connections'));
+    // Conversation-scoped view: return only the connectors ENABLED for this
+    // conversation. The enabled set is the source of truth held by cws-core
+    // (never an agent-supplied list); a conversation with no enabled connectors
+    // returns []. Normalize the response shape so an unexpected (non-array)
+    // payload can never fall through unfiltered.
+    const all = Array.isArray(resp) ? resp : (Array.isArray(resp?.connections) ? resp.connections : []);
     let enabledIds;
     try {
       enabledIds = await fetchEnabledConnectorIds(orgId, convId);
@@ -633,6 +664,45 @@ const COMMANDS = {
       throw err;
     }
     return all.filter((c) => enabledIds.has(c.id || c.connection_id));
+  },
+
+  // conn.check {app, conversationId} — PRE-INVOKE availability check for one app
+  // in this conversation, so the agent can answer the user in plain language
+  // BEFORE trying to run anything (design §2.4 cases A/B/C). Returns
+  //   { app, app_name, state, connection_ids }
+  // where state is one of:
+  //   - 'enabled'        → usable here; go ahead with conn.catalog / conn.invoke
+  //   - 'not_enabled'    → case A: authorized to you but switched off in this
+  //                         conversation — ask the user whether to enable it
+  //   - 'not_authorized' → case B: no connection for this app — guide the user to
+  //                         /connections to authorize it
+  //   - 'needs_reauth'   → case C: connected but expired/revoked/errored —
+  //                         ask the user to re-authorize it
+  // This is discovery only (it never executes); conn.invoke still enforces the
+  // enabled set itself. conversationId is mandatory like conn.list/conn.invoke,
+  // and an unreadable enabled set fails closed (503 readiness code), never
+  // reporting 'enabled'.
+  'conn.check': async () => {
+    const convId = requireConversationId(params, 'conn.check');
+    const app = params.app || params.applicationId || params.application_id || params.slug;
+    if (!app || typeof app !== 'string') throw Object.assign(new Error('app (slug, name or applicationId) is required'), { status: 400 });
+    const orgId = requireOrgId();
+    if (!resolveSelfMemberId(orgId)) throw Object.assign(new Error('cannot resolve agent member_id'), { status: 400 });
+    const resp = await getForOrg(orgId, apiPath('/connect/agents/me/connections'));
+    const all = Array.isArray(resp) ? resp : (Array.isArray(resp?.connections) ? resp.connections : []);
+    const want = app.trim().toLowerCase();
+    const matches = all.filter((c) => c && [c.application_slug, c.slug, c.provider, c.application_name, c.application_id, c.applicationId]
+      .some((v) => typeof v === 'string' && v.toLowerCase() === want));
+    if (matches.length === 0) return { app, app_name: null, state: 'not_authorized', connection_ids: [] };
+    const appName = matches.find((c) => c.application_name)?.application_name || matches[0].application_slug || app;
+    const isActive = (c) => (c.status || 'active') === 'active' && c.needs_reauth !== true && c.needsReauth !== true;
+    const enabledIds = await fetchEnabledConnectorIds(orgId, convId);
+    const idOf = (c) => c.id || c.connection_id;
+    const enabledActive = matches.filter((c) => enabledIds.has(idOf(c)) && isActive(c));
+    if (enabledActive.length) return { app, app_name: appName, state: 'enabled', connection_ids: enabledActive.map(idOf) };
+    const anyActive = matches.filter(isActive);
+    if (anyActive.length) return { app, app_name: appName, state: 'not_enabled', connection_ids: anyActive.map(idOf) };
+    return { app, app_name: appName, state: 'needs_reauth', connection_ids: matches.map(idOf) };
   },
 
   // Acquire a credential for a connection. This verb is DIRECT-only: it returns
@@ -868,6 +938,9 @@ const COMMANDS = {
     const app = params.app || params.applicationId || params.application_id || params.slug;
     if (!explicitConnId && !app) throw Object.assign(new Error('app (slug or applicationId) is required unless connectionId is given'), { status: 400 });
     if (!params.action) throw Object.assign(new Error('action is required (format: toolkit-slug/action-name)'), { status: 400 });
+    // Fail closed BEFORE any resolution/credential work: no conversation ⇒ no
+    // enabled set ⇒ nothing may run (see requireConversationId).
+    const invokeConvId = requireConversationId(params, 'conn.invoke');
     const orgId = requireOrgId();
     const agentId = resolveSelfMemberId(orgId);
     if (!agentId) throw Object.assign(new Error('cannot resolve agent member_id'), { status: 400 });
@@ -923,8 +996,7 @@ const COMMANDS = {
     // truth) for the caller-supplied conversation_id; we deliberately do NOT
     // trust an agent-supplied "is this a group" flag. org-scope connectors are
     // shared/admin-authorized and are unaffected by this gate.
-    const invokeConvId = params.conversationId || params.conversation_id || null;
-    if (invokeConvId && entry.ownerScope !== 'org') {
+    if (entry.ownerScope !== 'org') {
       // A sparse WS event may have left ownerScope null; refresh once so a stale
       // index cannot mask a personal connector (mirrors the credential_mode
       // self-heal below). org entries short-circuit above and never reach here.
@@ -952,15 +1024,15 @@ const COMMANDS = {
       }
     }
 
-    // Per-conversation enablement gate (opt-in per conversation): when invoked
-    // with a conversationId, a connector may run only if it is ENABLED for that
-    // conversation. This backstops the conn.list filter — the agent's filtered
-    // list already hides non-enabled connectors, but an explicitly named one can
+    // Per-conversation enablement gate (opt-in per conversation): a connector
+    // may run only if it is ENABLED for this turn's conversation (the
+    // conversationId is mandatory, see requireConversationId). This backstops
+    // the conn.list filter — the agent's filtered list already hides non-enabled connectors, but an explicitly named one can
     // still reach here. Reject with a distinct code (`not_enabled_in_conversation`)
     // so the agent can offer to enable it (authorized-but-off) rather than treat it
     // as unauthorized. org and personal connectors alike are gated; the enabled set
     // is cws-core's source of truth, never an agent-supplied flag.
-    if (invokeConvId) {
+    {
       const enabledIds = await fetchEnabledConnectorIds(orgId, invokeConvId);
       if (!enabledIds.has(entry.id)) {
         throw Object.assign(
@@ -1084,7 +1156,8 @@ function printUsage() {
 Usage: node src/cli/conn.js <command> '<json-params>'
 
 Connections
-  conn.list           {}                                        # list connections available to this agent (self only)
+  conn.list           {conversationId}                          # connections ENABLED for this conversation (conversationId REQUIRED)
+  conn.check          {app, conversationId}                     # pre-invoke check: enabled | not_enabled | not_authorized | needs_reauth
   conn.acquire        {connectionId}                            # acquire the direct access_token for a connection
   conn.actions        {connectionId}                            # discover named actions for a connection
   conn.status         {connectionId}                            # get connection details (status, owner, scopes)
@@ -1106,8 +1179,10 @@ Applications (custom connector management)
                                                                  #   action-def Authorization header is forbidden (see reference doc)
 
 Capability cache (runtime/connect/)
-  conn.invoke         {app, action, params?}                    # app-keyed execute: resolve connection via local index → execute
-                      {connectionId, action, params?}           #   or target a specific connection (skips app-resolution)
+  conn.invoke         {app, action, conversationId, params?}    # app-keyed execute: resolve connection via local index → execute
+                      {connectionId, action, conversationId, params?} # or target a specific connection (skips app-resolution)
+                                                                 #   conversationId REQUIRED: missing/malformed → 400
+                                                                 #   conversation_context_invalid (fail-closed)
                                                                  #   >1 connections for an app → returns needs_selection (ask
                                                                  #   the user by candidate label; map the choice back to its
                                                                  #   connection_id, retry with connectionId)

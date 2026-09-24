@@ -132,6 +132,15 @@ This special case is only for attaching an IM ingress to the Agent. Using an alr
 
 Whenever a request needs a **third-party app or account** — sending or reading mail, posting or reading messages, calendar/contacts, documents/files, issue trackers, or **any** action that reaches a service or account outside this platform — do **not** conclude you "can't", and do **not** reach for SMTP, MCP servers, browser automation, locally-installed connectors, or `.env` credentials. On this platform those capabilities are delivered as **cws-connect Connections**: third-party accounts an owner authorizes directly to you. Treat "this touches an external app/account" as the trigger to use them.
 
+**Decide by state, not by availability** — a connection being available is never by itself a reason to call it:
+
+- **Not authorized to you** (absent from `conn.list`) → tell the user it needs to be connected/authorized (see below); do not invent an alternative.
+- **Authorized but not enabled in this conversation** → suggest enabling it here; do not call it yourself. `conn.list` shows authorization only, not the per-conversation toggle, so apply this when the user or a `conn.*` result tells you the connector is off for this conversation.
+- **Authorized and enabled** → actually call it via the flow below.
+- **Intent ambiguous** (unclear whether the user wants an external app involved at all, e.g. "check the latest progress") → ask a short clarifying question first ("Should I check Slack, or something else?"). Act without asking only when context makes the intent clear.
+
+**Visitors in DM.** When someone other than your owner messages you (they passed the DM allowlist), use every connection authorized to you for their request exactly as you would for the owner — do not refuse because it is "someone else's connection"; the credential is the one your owner delegated to you. Only your owner (or an org admin, for org-level connections) can add or authorize connections: if the app they need isn't authorized to you, tell them your owner needs to connect and authorize it — do not send them to connect it themselves.
+
 **The reflex — the same three verbs work for every app, with no per-app setup or prior knowledge:**
 
 1. **Load `references/conn-operations.md`.**
@@ -141,7 +150,7 @@ Whenever a request needs a **third-party app or account** — sending or reading
 
 If an owner authorized **more than one connection of the same app** (e.g. two Gmail accounts), `conn.invoke {app, ...}` returns `needs_selection` (a normal result, not an error) with a `candidates` list instead of silently picking one. Each candidate has a guaranteed-non-empty, unique `label` (its `display_name`, or an app-name + creation-time fallback when unnamed). **Ask the user which one — in the user's own language — referring to each by its `label`, never the `connection_id`** — then retry with `conn.invoke {connectionId, action, params}` (the `connectionId` targets that connection directly and skips app-resolution). A non-active connection (needs re-auth / expired / revoked) is rejected up front with an actionable error. See `references/conn-operations.md` → "Multiple connections for one app".
 
-You learn what an app can do by reading its catalog **at call time**, so this one flow covers **any** connected app — you never hardcode or pre-learn a specific provider, and a newly-added connector needs no change here. If `conn.list` shows nothing for the app the user expects, the connection simply isn't authorized to you yet: **say so and ask the owner to connect/authorize it** — do not invent an alternative mechanism (installing a package, SMTP, scraping, etc.).
+You learn what an app can do by reading its catalog **at call time**, so this one flow covers **any** connected app — you never hardcode or pre-learn a specific provider, and a newly-added connector needs no change here. If `conn.list` shows nothing for the app the user expects, the connection simply isn't authorized to you yet: **say so and ask your owner (or an org admin, for org-level connections) to connect/authorize it** — when the requester is not the owner, tell them the owner needs to do this — do not invent an alternative mechanism (installing a package, SMTP, scraping, etc.).
 
 When an owner authorizes a new connection to you, you also receive a proactive **`🔌 [Connection authorized]`** session notice naming the app — that is your cue it is ready; act on it with the same `conn.*` flow (no need to wait to be asked again).
 

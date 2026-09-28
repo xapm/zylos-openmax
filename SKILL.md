@@ -1,6 +1,6 @@
 ---
 name: openmax
-version: 2.21.0
+version: 2.22.0
 description: >-
   OpenMax Task Agent (Guided Autonomy). For any user message received via openmax,
   you MUST load and follow this skill before handling the task: route explicit automation-create-request form handoffs to the creation workflow before generic Issue intake; otherwise first decide whether it is a task or a question/chat;

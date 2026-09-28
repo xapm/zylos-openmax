@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.0] - 2026-09-28
+
 ### Added
 
 - **A choice card can now be sent through the C4 reply path, as a `[CARD]{…}` message body.** Every inbound message prints one reply command, and until now that command could only carry text: a card had to be asked with a different verb. `scripts/send.js` recognizes a `[CARD]` prefix and hands the inline JSON to the new `src/lib/card-message.js`, which runs the same `buildChoiceRequest` and the same `recordPendingQuestion` that `comm.ask_card` runs — the two entries produce identical results, so a receipt decodes the same way whichever asked it.

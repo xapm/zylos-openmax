@@ -321,7 +321,7 @@ There are two opening flows. Which one applies is decided by the platform, never
 
    The first two tell you which flow the DM is in; the third tells you the user answered a card.
 
-   Otherwise it is the **legacy interview flow** (older platform, or the platform switch is off) — see the end of this section.
+   Otherwise — no onboarding card in the DM and no `opening_mode` — it is the **legacy interview flow**, which exists only for an older platform that does not send the cards yet. See the end of this section.
 3. Never guess, never restart an opening that already happened.
 
 ### Guide-card flow (platform sends the cards; you do the work)
@@ -353,7 +353,7 @@ Tolerant fallback — only where a surface cannot show the buttons (a bridge ren
 - A second click on the same task card (same `card-id`) while you are already on it is the same request: say you're on it, do not start over. A different card is a new task.
 - The onboarding core Issue and its blueprint are **not** walked in this flow; leave them unless the user asks. Do not self-report `d7_first_delivery` and never accept anything on the user's behalf.
 
-### Legacy interview flow (only when the recognition step found no guide cards)
+### Legacy interview flow (older platform only: no onboarding cards and no `opening_mode`)
 
 Walk three steps in the same DM, continuously. `core_issue_id` is the core conversation Issue: read it and its blueprint + comments with tm.js to find which step you are at, and continue from there.
 

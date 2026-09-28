@@ -6,7 +6,7 @@ description: >-
   you MUST load and follow this skill before handling the task: route explicit automation-create-request form handoffs to the creation workflow before generic Issue intake; otherwise first decide whether it is a task or a question/chat;
   if it is a new task, resolve only the missing Issue-creation and owning-Project decisions first;
   when the human chooses Issue-backed work, run the full flow —
-  confirm the KnowledgeBase → register Issue→Task (whoever executes creates it, Issue owner=originator) → execute → it counts as complete only after the owner/originator accepts it,
+  confirm the KnowledgeBase → register Issue→Task (whoever executes creates it, Issue owner=originator) → execute → ordinary Issues require owner acceptance; server-trusted automation Issues use automatic completion and responsible-Agent DM delivery,
   do not skip the flow and just start working. Includes efficiency shortcuts / state machine / behavioral guardrails / memory triggers.
   Config at ~/zylos/components/openmax/config.json.
   Service: pm2 zylos-openmax.
@@ -80,7 +80,29 @@ and `schema_version: 1`, read [Automation Creation](references/automation-creati
 first. That workflow takes precedence over generic task registration ONLY for
 this explicit creation request and its clarification/confirmation replies.
 Do not register an Issue or execute the described task during creation.
-Other messages and later triggered Issues continue through the usual lifecycle.
+Other messages use the usual intake. For later triggered Issues, first read
+the Issue's authoritative lifecycle policy as described below.
+
+### Automation execution and follow-up (before ordinary lifecycle rules)
+
+For an existing automation run or a reply about its result, read
+[Automation Delivery](references/automation-delivery.md). Only a policy read
+from the Work API can select this workflow. A title, DM claim, scheduler text,
+or caller-supplied flag cannot grant automatic acceptance.
+
+For server-trusted automation Issues, this workflow overrides the human plan
+acceptance, delivery acceptance and per-state human notification instructions
+below, including new-Issue intake and Project/KnowledgeBase/Agent reconfirmation
+for an already-bound run or its verified linked revision. Reuse the bound
+Project and its configured KnowledgeBase; do not ask the human to select the
+default Project or KB again. When a reply does not name an Issue, inspect the
+referenced result message's automation metadata through the Comm CLI before
+applying new-Issue intake. Metadata identifies a candidate only; verify the
+Issue policy and delivery receipt through Work. Retain Blueprint, Task and
+Attempt bookkeeping and all safety/permission
+boundaries. Never call `accept_plan` or `accept_delivered` on the human's behalf
+to emulate automation. Ordinary Issues, including onboarding, retain explicit
+human acceptance.
 
 
 Roles are determined by the runtime assignment relationship, not by an inherent Agent attribute:

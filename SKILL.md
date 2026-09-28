@@ -1,9 +1,9 @@
 ---
 name: openmax
-version: 2.20.0
+version: 2.21.0
 description: >-
   OpenMax Task Agent (Guided Autonomy). For any user message received via openmax,
-  you MUST load and follow this skill before handling the task: first decide whether it is a task or a question/chat;
+  you MUST load and follow this skill before handling the task: route explicit automation-create-request form handoffs to the creation workflow before generic Issue intake; otherwise first decide whether it is a task or a question/chat;
   if it is a new task, resolve only the missing Issue-creation and owning-Project decisions first;
   when the human chooses Issue-backed work, run the full flow —
   confirm the KnowledgeBase → register Issue→Task (whoever executes creates it, Issue owner=originator) → execute → it counts as complete only after the owner/originator accepts it,
@@ -72,6 +72,16 @@ dependencies:
 > Paradigm: Guided Autonomy — it does not prescribe process steps, only provides shortcuts, guardrails, and trigger points.
 
 ## Role Model
+
+### Automation creation form handoff (before Issue intake)
+
+For a human DM containing fenced JSON with `kind: "automation-create-request"`
+and `schema_version: 1`, read [Automation Creation](references/automation-creation.md)
+first. That workflow takes precedence over generic task registration ONLY for
+this explicit creation request and its clarification/confirmation replies.
+Do not register an Issue or execute the described task during creation.
+Other messages and later triggered Issues continue through the usual lifecycle.
+
 
 Roles are determined by the runtime assignment relationship, not by an inherent Agent attribute:
 

@@ -250,6 +250,54 @@ export function findActiveConnectionsByApp(app, indexPath = INDEX_PATH) {
   );
 }
 
+/**
+ * List every PER-ORG connections index file in the connect dir.
+ *
+ * The connections index is org-scoped — one `connections-index.<orgId>.json` per
+ * org (see indexPathForOrg) — but the action catalog is GLOBAL (one
+ * `action-catalog/<applicationId>.json` shared across all orgs, because an app's
+ * capabilities are identical everywhere). Any cross-org decision — chiefly
+ * whether dropping one org's connection may invalidate the shared catalog — must
+ * therefore consult ALL org indexes, not just the caller's. Missing dir → [].
+ * The legacy single-file INDEX_PATH ("connections-index.json", no `<orgId>`
+ * segment) is intentionally excluded: it is the non-org-scoped default and never
+ * coexists with the per-org files in a real multi-org runtime.
+ */
+export function listIndexPaths(dir = CONNECT_DIR) {
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return []; }
+  return names
+    .filter((n) => /^connections-index\..+\.json$/.test(n))
+    .map((n) => path.join(dir, n));
+}
+
+/**
+ * Count connections referencing an applicationId across ALL org indexes,
+ * optionally excluding one connectionId (the connection being torn down). This
+ * reference-counts the GLOBAL action catalog: the revoke/disconnect handler may
+ * invalidate action-catalog/<applicationId>.json ONLY when this returns 0 (no
+ * OTHER org still has a connection to the app) — otherwise clearing it on one
+ * org's revoke would wrongly wipe the shared cache the other orgs still use.
+ *
+ * Any surviving connection referencing the app counts (not only status:"active"):
+ * an org whose connection is e.g. needs_reauth still references the app and can
+ * re-warm/consume the shared catalog, so the safe rule is to RETAIN while any
+ * reference remains. `dir` selects the connect dir (tests inject a temp dir;
+ * production uses CONNECT_DIR).
+ */
+export function countConnectionsForApp(applicationId, { dir = CONNECT_DIR, excludeConnectionId = null } = {}) {
+  if (!applicationId) return 0;
+  let count = 0;
+  for (const idxPath of listIndexPaths(dir)) {
+    const conns = readIndex(idxPath).connections;
+    for (const [id, entry] of Object.entries(conns)) {
+      if (id === excludeConnectionId) continue;
+      if (entry && entry.applicationId === applicationId) count += 1;
+    }
+  }
+  return count;
+}
+
 // ---------------------------------------------------------------------------
 //  Action catalog (applicationId → capability metadata)
 // ---------------------------------------------------------------------------

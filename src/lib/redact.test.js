@@ -2,6 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { redactSecrets } from './redact.js';
 
+test('webhook creation credentials are redacted from nested RPC responses', () => {
+  const response = { data: { binding: { id: 'binding' }, webhook_url: 'https://example.test/workspace/webhook/secret' } };
+  assert.deepEqual(redactSecrets(response), {
+    data: { binding: { id: 'binding' }, webhook_url: '[REDACTED]' },
+  });
+  assert.equal(response.data.webhook_url, 'https://example.test/workspace/webhook/secret');
+});
+
 test('redacts known sensitive keys at the top level', () => {
   const out = redactSecrets({ access_token: 'eyJabc', org_id: 'o1' });
   assert.equal(out.access_token, '[REDACTED]');

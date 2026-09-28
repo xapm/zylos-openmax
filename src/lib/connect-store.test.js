@@ -8,6 +8,7 @@ import {
   readIndex, upsertConnection, removeConnection, replaceIndexFromList, findConnectionByApp,
   findActiveConnectionsByApp,
   readCatalog, writeCatalog, invalidateCatalog, catalogPath, indexPathForOrg,
+  listIndexPaths, countConnectionsForApp,
 } from './connect-store.js';
 
 function tmpIndex() {
@@ -421,4 +422,39 @@ test('invalidateCatalog 幂等删除', () => {
   assert.equal(invalidateCatalog('app-1', dir), true);
   assert.equal(readCatalog('app-1', { dir }), null);
   assert.equal(invalidateCatalog('app-1', dir), false); // 幂等
+});
+
+test('listIndexPaths 只枚举 per-org 索引文件（connections-index.<orgId>.json），排除无 orgId 段的旧默认文件', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'connect-list-'));
+  // 缺失目录 → []
+  assert.deepEqual(listIndexPaths(path.join(dir, 'nope')), []);
+  // 两个 per-org 索引 + 一个旧默认文件 + 一个无关文件
+  fs.writeFileSync(indexPathForOrg('org-a', dir), JSON.stringify({ connections: {} }));
+  fs.writeFileSync(indexPathForOrg('org-b', dir), JSON.stringify({ connections: {} }));
+  fs.writeFileSync(path.join(dir, 'connections-index.json'), JSON.stringify({ connections: {} })); // legacy, excluded
+  fs.writeFileSync(path.join(dir, 'action-catalog.json'), '{}'); // unrelated
+  const got = listIndexPaths(dir).sort();
+  assert.deepEqual(got, [indexPathForOrg('org-a', dir), indexPathForOrg('org-b', dir)].sort());
+});
+
+test('countConnectionsForApp 跨所有 org 索引按 applicationId 引用计数（可排除正在撤销的连接）', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'connect-count-'));
+  const idxA = indexPathForOrg('org-a', dir);
+  const idxB = indexPathForOrg('org-b', dir);
+  // orgA: 一条 app-X + 一条 app-Y；orgB: 一条 app-X
+  upsertConnection({ connection_id: 'a1', application_id: 'app-X', application_slug: 'github' }, idxA);
+  upsertConnection({ connection_id: 'a2', application_id: 'app-Y', application_slug: 'notion' }, idxA);
+  upsertConnection({ connection_id: 'b1', application_id: 'app-X', application_slug: 'github' }, idxB);
+
+  assert.equal(countConnectionsForApp('app-X', { dir }), 2, '跨 org 共 2 条引用 app-X');
+  assert.equal(countConnectionsForApp('app-Y', { dir }), 1);
+  assert.equal(countConnectionsForApp('app-Z', { dir }), 0, '无引用 → 0');
+  // 排除某条连接后再计数（撤销当前连接的场景）
+  assert.equal(countConnectionsForApp('app-X', { dir, excludeConnectionId: 'a1' }), 1, '排除 a1 → 仅剩 orgB 的 b1');
+  assert.equal(countConnectionsForApp('app-X', { dir, excludeConnectionId: 'b1' }), 1);
+  // 撤销跨 org 的最后一条 → 0（允许清除全局 catalog）
+  removeConnection('a1', idxA);
+  assert.equal(countConnectionsForApp('app-X', { dir, excludeConnectionId: 'b1' }), 0, 'orgA 撤销后再排除 orgB 的 b1 → 最后一条');
+  // 空 applicationId → 0，不抛
+  assert.equal(countConnectionsForApp(null, { dir }), 0);
 });

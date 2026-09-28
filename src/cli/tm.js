@@ -26,6 +26,7 @@
 
 import { getForOrg, postForOrg, patchForOrg, putForOrg, delForOrg, apiPath } from '../lib/client.js';
 import { resolveDefaultOrgId } from '../lib/config.js';
+import { automationConfiguration } from '../lib/automation-configuration.js';
 
 const [command, ...rest] = process.argv.slice(2);
 const params = rest.length ? JSON.parse(rest.join(' ')) : {};
@@ -414,18 +415,10 @@ const COMMANDS = {
   //  否则被 cws-work 护栏拒（lead≠自己 / owner 缺失或=自己）。见 SKILL.md。
   // =========================================================================
 
-  // create-event-binding body: { cron_expr*, lead_member_id*,
-  // owner_member_id?, spec{ project_id*, title*, description? } }
-  'event-binding.create': () => post(apiPath('/event-bindings'), {
-    cron_expr:       params.cronExpr,
-    lead_member_id:  params.leadMemberId,
-    owner_member_id: params.ownerMemberId,
-    spec: {
-      project_id:  params.projectId,
-      title:       params.title,
-      description: params.description,
-    },
-  }),
+  'event-binding.create': () => post(apiPath('/event-bindings'), automationConfiguration(params, 'timer')),
+
+  'webhook.create': () => post(apiPath('/webhooks'), automationConfiguration(params, 'webhook')),
+  'webhook.get': () => get(apiPath(`/webhooks/${encodeURIComponent(params.id)}`)),
 
   'event-binding.list': () => get(apiPath('/event-bindings')),
 
@@ -500,9 +493,12 @@ ATTEMPT  (all ✅ on contract-v2)
                           blockedOnApprovalRequestIds?}
 
 EVENT BINDING  (定时任务 / create-by-agent)
-  event-binding.create   {cronExpr, leadMemberId, ownerMemberId, projectId,
+  event-binding.create   {org, source_kind:"timer", configuration} # supported REST body; cron/once/interval + timezone
+                         Legacy: {cronExpr, leadMemberId, ownerMemberId, projectId,
                           title, description?}                                   # agent: leadMemberId=自己, ownerMemberId=对话人类
   event-binding.list     {}                                                     # 本 org 的定时任务
+  webhook.create         {org, source_kind:"webhook", configuration} # {lead_member_id, owner_member_id, spec, event_filter?}
+  webhook.get            {org, id}
   event-binding.get      {id}
   event-binding.delete   {id}                                                   # 停止后续触发, 不影响已生成的 Issue
 

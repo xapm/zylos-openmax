@@ -53,7 +53,7 @@ test('neither present → no org suffix, no <org-context> element', () => {
 
 test('every inbound envelope requires the openmax skill before current-message', () => {
   const out = formatInboundForC4(conv, sender, current, [], {});
-  const instruction = '<openmax-instruction>\nBefore handling the current message, invoke the openmax skill and follow it. For a new task, complete New-Issue Intake before doing the work.\n</openmax-instruction>';
+  const instruction = '<openmax-instruction>\nBefore handling the current message, invoke the openmax skill and follow it. For an explicit automation-create-request form handoff or its confirmation conversation, follow the skill\'s Automation Creation workflow before generic Issue intake. For other new tasks, complete New-Issue Intake before doing the work.\n</openmax-instruction>';
   assert.equal(out.match(/<openmax-instruction>/g)?.length, 1);
   assert.ok(out.includes(instruction));
   assert.ok(out.indexOf(instruction) < out.indexOf('<current-message>'));

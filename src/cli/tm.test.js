@@ -6,6 +6,101 @@ import test from 'node:test';
 
 const cliPath = fileURLToPath(new URL('./tm.js', import.meta.url));
 
+test('wrong route and unsupported fields fail before HTTP submission', async () => {
+  let requests = 0;
+  const server = createServer((req, res) => { requests++; req.resume(); res.end('{}'); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    for (const params of [
+      { source_kind: 'timer', configuration: { schedule_kind: 'cron', cron_expr: '0 9 * * 1', timezone: 'UTC' } },
+      { source_kind: 'webhook', configuration: { schedule_kind: 'cron' } },
+      { source_kind: 'webhook', configuration: { spec: { title: 'Task', unsupported: true } } },
+    ]) {
+      const result = await new Promise(resolve => execFile(process.execPath, [cliPath, 'webhook.create', JSON.stringify({ org: 'org-automation', ...params })], {
+        env: { ...process.env, COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: 'test', COCO_USER_TOKEN: '', COCO_RPC_LOG: '0' }, timeout: 5000,
+      }, (error, stdout, stderr) => resolve({ error, stderr })));
+      assert.ok(result.error);
+      assert.match(result.stderr, /source_kind must be webhook|unsupported/);
+    }
+    assert.equal(requests, 0);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+for (const schedule of [
+  { schedule_kind: 'cron', cron_expr: '0 9 * * 1', timezone: 'Asia/Singapore' },
+  { schedule_kind: 'once', run_at: '2030-01-01T01:00:00Z', timezone: 'America/New_York' },
+  { schedule_kind: 'interval', interval_seconds: 90, anchor_at: '2030-01-01T01:00:00Z', timezone: 'UTC' },
+]) {
+  test(`automation create preserves ${schedule.schedule_kind} form configuration`, async () => {
+    const configuration = {
+      lead_member_id: 'agent', owner_member_id: 'human',
+      spec: { project_id: 'project', title: 'Review', description: 'Inputs and output destination' },
+      ...schedule,
+    };
+    const request = await captureRequest('event-binding.create', {
+      org: 'org-automation', source_kind: 'timer', request_id: 'not-an-idempotency-key', configuration,
+    });
+    assert.equal(request.method, 'POST');
+    assert.equal(request.url, '/api/v1/event-bindings');
+    assert.deepEqual(request.body, configuration);
+  });
+}
+
+test('legacy cron creation remains compatible', async () => {
+  const request = await captureRequest('event-binding.create', {
+    org: 'org-automation', cronExpr: '0 9 * * 1', leadMemberId: 'agent',
+    ownerMemberId: 'human', projectId: 'project', title: 'Legacy',
+  });
+  assert.deepEqual(request.body, {
+    cron_expr: '0 9 * * 1', lead_member_id: 'agent', owner_member_id: 'human',
+    spec: { project_id: 'project', title: 'Legacy' },
+  });
+});
+
+test('webhook create preserves filter without forwarding envelope fields', async () => {
+  const configuration = {
+    lead_member_id: 'agent', owner_member_id: 'human',
+    spec: { project_id: 'project', title: 'Incoming', description: '' },
+    event_filter: 'payload.type == "ready"',
+  };
+  const request = await captureRequest('webhook.create', {
+    org: 'org-automation', configuration, source_kind: 'webhook',
+  });
+  assert.equal(request.url, '/api/v1/webhooks');
+  assert.deepEqual(request.body, configuration);
+  const read = await captureRequest('webhook.get', { org: 'org-automation', id: 'binding' });
+  assert.equal(read.method, 'GET');
+  assert.equal(read.url, '/api/v1/webhooks/binding');
+});
+
+test('ambiguous webhook server failure does not retry creation', async () => {
+  let requests = 0;
+  const server = createServer((req, res) => {
+    requests += 1;
+    req.resume();
+    res.writeHead(503, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { detail: 'write outcome unknown' } }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const result = await new Promise(resolve => execFile(process.execPath, [cliPath, 'webhook.create', JSON.stringify({
+      org: 'org-automation', source_kind: 'webhook', configuration: {
+        lead_member_id: 'agent', owner_member_id: 'human',
+        spec: { project_id: 'project', title: 'Incoming' }, event_filter: '',
+      },
+    })], { env: { ...process.env, COCO_API_URL: `http://127.0.0.1:${server.address().port}`,
+      COCO_AUTH_TOKEN: 'contract-token', COCO_USER_TOKEN: '', COCO_RPC_LOG: '0' }, timeout: 5000 },
+    (error, stdout, stderr) => resolve({ error, stdout, stderr })));
+    assert.ok(result.error);
+    assert.match(result.stderr, /write outcome unknown/);
+    assert.equal(requests, 1);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 async function captureRequest(command, params) {
   let resolveRequest;
   const requestPromise = new Promise((resolve) => { resolveRequest = resolve; });

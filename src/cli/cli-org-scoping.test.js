@@ -167,6 +167,20 @@ function runRealToken(home, cliName, command, params, apiUrl) {
   });
 }
 
+test('core.me with explicit org uses that org member token while bootstrap remains available', async () => {
+  const home = setupMultiOrgHome({ agent: { api_key: 'cwsk_test' } });
+  const { server, seen } = tokenHarness((u) => u.endsWith('/me'));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const result = await runRealToken(home, 'core.js', 'core.me', { org: 'org-2' }, `http://127.0.0.1:${server.address().port}`);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(seen.auth, 'Bearer tok-org-2');
+  } finally {
+    await new Promise((r) => server.close(r));
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('org routing: tm.js project.list {org} carries THAT org\'s exchanged JWT', async () => {
   const home = setupMultiOrgHome({ agent: { api_key: 'cwsk_test' } });
   const { server, seen } = tokenHarness((u) => u.includes('/projects'));

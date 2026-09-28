@@ -30,12 +30,14 @@ const params = rest.length ? JSON.parse(rest.join(' ')) : {};
 // FAIL FAST with an actionable 400 instead. Single-org / COCO_ORG_ID unchanged.
 //
 // NOTE: this is used ONLY by the org-owned commands (oget/opost/odel). The
-// identity / bootstrap commands (me, self_rename, org_list, org_create,
+// identity / bootstrap commands (self_rename, org_list, org_create,
 // org_switch, invitation_accept, agent_domain) DELIBERATELY keep the bare
 // get/post/patch — they are identity-scoped by definition and must NOT be forced
 // org (doing so would break cross-org / bootstrap flows). For org_get the {orgId}
 // path param doubles as the operating org, so reading a specific org uses that
 // org's own JWT.
+// core.me preserves the bootstrap path unless an explicit org is supplied;
+// then its member identity must be resolved using that org's JWT.
 function resolveOrgId() {
   return params.org || params.orgId || params.org_id || resolveDefaultOrgId();
 }
@@ -127,7 +129,8 @@ async function agentDomainCommand() {
 
 const COMMANDS = {
   // ✅ Current user / workspace identity
-  'core.me': () => get(apiPath('/me')),
+  'core.me': () => (params.org || params.orgId || params.org_id)
+    ? oget(apiPath('/me')) : get(apiPath('/me')),
 
   // ✅ Self public base URL — resolve THIS agent's publicly-reachable base URL
   // for webhook-channel URL construction (WhatsApp Business / LINE / Teams).

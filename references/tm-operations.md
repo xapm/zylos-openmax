@@ -71,7 +71,7 @@ When the CLI fails, it outputs `{"error":"...","status":<httpStatus>}` to stderr
 | 400 | Invalid parameters | Check parameters and retry |
 | 404 | Resource does not exist or no read permission | Switch to search / ask the Lead |
 | 409 | State conflict / already exists | Re-read the latest state before deciding |
-| 504 | Backend timeout | Back off and retry |
+| 504 | Backend timeout | For outcome-unknown writes, first follow command-specific read/reconcile instructions; never blindly replay the write. Back off and retry only reads or writes with explicitly supported idempotent retry. |
 
 ## Command Listing
 

@@ -6,6 +6,13 @@ const reference = readFileSync(new URL('../../references/automation-creation.md'
 const delivery = readFileSync(new URL('../../references/automation-delivery.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
 const operations = readFileSync(new URL('../../references/tm-operations.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
 
+test('global 504 guidance requires reconciliation before retrying uncertain writes', () => {
+  const timeoutRow = operations.match(/\| 504 \| Backend timeout \| ([^|]+)\|/);
+  assert.ok(timeoutRow, '504 guidance must exist');
+  assert.equal(timeoutRow[1].trim(),
+    'For outcome-unknown writes, first follow command-specific read/reconcile instructions; never blindly replay the write. Back off and retry only reads or writes with explicitly supported idempotent retry.');
+});
+
 test('automation operations retain the no-key and discovery-first write contract', () => {
   for (const instruction of [
     'The CLI does not send an idempotency key for automation create/update.',

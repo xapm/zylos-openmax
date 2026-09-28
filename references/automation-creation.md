@@ -33,13 +33,72 @@ JSON with this envelope:
 
 `configuration` accepts only the existing create REST fields listed here;
 unknown fields (including unknown `spec` fields) are rejected before any POST,
-not silently discarded. For `timer`, preserve
+not silently discarded. A timer handoff is a draft: `schedule_kind` and schedule
+values may be absent when the picker is untouched or incomplete; `timezone`
+is retained. Missing schedule fields are not a malformed handoff and must not
+be filled from UI defaults. This does not relax the complete configuration
+required by authorization preview or the actual create API. For `timer`, preserve
 `schedule_kind` (`cron`, `once`, `interval`), `timezone`, and its applicable
 `cron_expr`, `run_at`, `interval_seconds`, `anchor_at`. Timestamps are instants;
 do not reinterpret them in the machine timezone or convert intervals to cron.
 For `webhook`, preserve `lead_member_id`, `owner_member_id`, `spec` and optional
 `event_filter` (a CEL expression; an empty filter means all events).
 `form_context` is display context only, not API parameters or proof of identity.
+It contains only explicit inputs from the active schedule mode, including partial
+selections. Use those inputs to understand what is still missing; do not restore
+hidden-mode values or treat an absent frequency/time as a user choice.
+
+## Resolving a draft timer schedule
+
+Apply these rules during step 3, after verifying the human and organization:
+
+- With no explicit picker schedule, parse a complete time in `spec.description`
+  using the retained user timezone. Do not ask the human to choose between that
+  time and an absent picker value. Never invent Monday 09:00, a one-hour interval,
+  or any other default schedule. Preserve any timezone explicitly stated in the
+  description; resolve genuine timezone ambiguity instead of silently rewriting it.
+- A deliberately selected template's prefilled schedule counts as explicit user
+  input. Preserve a complete picker/template schedule when the description gives
+  no time. When both give the same schedule, ask no redundant time question.
+- Compare meaning, including timezone and one-time versus recurring, before
+  declaring a conflict. Only genuinely conflicting explicit picker/template and
+  description values require a choice. Compatible partial inputs can complete
+  each other; retain them instead of asking the human to repeat supplied values.
+  If neither source gives a complete schedule, ask only for the missing pieces
+  in the user's timezone. Do not infer a date, frequency, or interval merely
+  because a mode was selected. If the timezone itself is missing or ambiguous,
+  clarify it; do not use the machine timezone as a fallback.
+- For a real two-way conflict, send a clickable clarification card with two
+  options, one for the description and one for the picker/template. Each option
+  must name its actual local time and timezone and whether it is one-time or
+  recurring (with date or frequency as applicable). Do not send a plain-text
+  A/B question when the existing OpenMax card workflow is available. Use `[CARD]`
+  through the exact routed C4 reply path, or `comm.ask_card` for a proactive
+  question in the verified DM, following `references/comm-operations.md`.
+  Set `kind` to `automation-schedule-clarification`, `askedOf` to the verified
+  human member ID, and `meta` to the request ID and current draft revision so
+  the answer can be matched to this request. Retain the two candidate schedules
+  in the pending context; do not turn card labels into API parameters.
+  On receipt, use `comm.answered` and accept only an `actionable` answer for
+  this request's current revision; then clear it with `comm.pending_clear`.
+  Ignore stale or duplicate receipts and unauthorized actors. A failed card send
+  leaves the conflict unresolved; do not silently choose a schedule.
+- A clarification card choice only resolves schedule input; it is not final
+  authorization to create. After resolving the draft, follow step 4 unchanged:
+  obtain the canonical authorization preview and the verified human's quoted
+  confirmation. Do not use a card receipt as an authorization confirmation ID.
+
+Reference acceptance scenarios (instruction checks, not live Agent evidence):
+
+| Input | Expected clarification |
+| --- | --- |
+| Untouched picker; description says every weekday at 18:15; user timezone Asia/Singapore | Parse description; no picker-versus-description question. |
+| Explicit weekly Monday 09:00 picker; description says weekly Monday 18:15; both Asia/Singapore | Two clickable options naming each time, timezone, and weekly recurrence. |
+| Explicit weekly Monday 09:00 picker; description gives the same time and timezone | No redundant time question. |
+| Neither description nor picker supplies time; user timezone Asia/Singapore | Ask for the missing schedule in Asia/Singapore; no invented default. |
+| Once mode with an explicit date but no time; description gives no time | Keep the date and ask only for the time in the user timezone. |
+| Explicit template has a complete schedule; description gives no time | Keep the template schedule. |
+| Current schedule clarification card is answered | Revise the draft, then preview and request quoted confirmation; no create from the click. |
 
 ## Conversation workflow
 
@@ -72,9 +131,11 @@ For `webhook`, preserve `lead_member_id`, `owner_member_id`, `spec` and optional
    owner, required inputs/access, concrete work and expected output/destination.
    Ask only for missing or ambiguous information. Do not ask again for fields
    already supplied. Preserve clarified task instructions in `spec.description`;
-   do not merely leave information required at execution time in the DM.
+   do not merely leave information required at execution time in the DM. For a
+   draft timer, apply the schedule-resolution rules above before previewing.
 4. Show the final plan in the same DM: task, project, human owner, agent, trigger
-   (human-readable local time plus timezone, or webhook condition), inputs,
+   (human-readable local time plus timezone and one-time or recurring schedule,
+   including its date or frequency, or webhook condition), inputs,
    work and output. Explain relevant unresolved prerequisites. Request explicit
    confirmation of this plan before any create call, even if no questions were
    needed. First call `tm.js automation.authorization_preview` with

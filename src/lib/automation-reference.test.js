@@ -6,6 +6,66 @@ const reference = readFileSync(new URL('../../references/automation-creation.md'
 const delivery = readFileSync(new URL('../../references/automation-delivery.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
 const operations = readFileSync(new URL('../../references/tm-operations.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
 
+// These guards protect the shipped Agent instructions, not live Agent behavior.
+function assertScheduleClarificationContract(source) {
+  const handoff = source.split('## Handoff contract')[1]?.split('## Resolving a draft timer schedule')[0]?.replace(/\s+/g, ' ');
+  const resolution = source.split('## Resolving a draft timer schedule')[1]?.split('## Conversation workflow')[0]?.replace(/\s+/g, ' ');
+  const confirmation = source.split('4. Show the final plan')[1]?.split('5. After')[0]?.replace(/\s+/g, ' ');
+  for (const [scope, text, instructions] of [
+    ['draft handoff', handoff, [
+      'values may be absent when the picker is untouched or incomplete; `timezone` is retained.',
+      'This does not relax the complete configuration required by authorization preview or the actual create API.',
+      'It contains only explicit inputs from the active schedule mode, including partial selections.',
+    ]],
+    ['time resolution', resolution, [
+      'With no explicit picker schedule, parse a complete time in `spec.description` using the retained user timezone.',
+      'Never invent Monday 09:00, a one-hour interval, or any other default schedule.',
+      "A deliberately selected template's prefilled schedule counts as explicit user input.",
+      'When both give the same schedule, ask no redundant time question.',
+      'Only genuinely conflicting explicit picker/template and description values require a choice.',
+      'Compatible partial inputs can complete each other;',
+      "If neither source gives a complete schedule, ask only for the missing pieces in the user's timezone.",
+      'Each option must name its actual local time and timezone and whether it is one-time or recurring',
+      'Use `[CARD]` through the exact routed C4 reply path, or `comm.ask_card` for a proactive question in the verified DM',
+      '`askedOf` to the verified human member ID',
+      "accept only an `actionable` answer for this request's current revision",
+      'Ignore stale or duplicate receipts and unauthorized actors.',
+      'A failed card send leaves the conflict unresolved;',
+      'A clarification card choice only resolves schedule input; it is not final authorization to create.',
+      'Do not use a card receipt as an authorization confirmation ID.',
+      'instruction checks, not live Agent evidence',
+    ]],
+    ['final authorization', confirmation, [
+      'human-readable local time plus timezone and one-time or recurring schedule',
+      '`tm.js automation.authorization_preview`',
+      'Send the returned `data.proposal_text` verbatim as its own Agent message',
+      'Ask the human to quote that exact proposal',
+      'Generic unquoted assent, card receipts, or assent with additional changes cannot authorize this operation.',
+    ]],
+  ]) {
+    assert.ok(text, `missing ${scope} section`);
+    for (const instruction of instructions) {
+      assert.ok(text.includes(instruction), `missing ${scope} safeguard: ${instruction}`);
+    }
+  }
+}
+
+test('draft timer guidance resolves missing and conflicting inputs without bypassing authorization', () => {
+  assertScheduleClarificationContract(reference);
+});
+
+test('schedule guards reject deletion of missing-time and card-authorization safeguards', () => {
+  for (const instruction of [
+    /If neither source gives a complete schedule, ask only for the missing pieces\s+in the user's timezone\./,
+    /A clarification card choice only resolves schedule input; it is not final\s+authorization to create\./,
+    /Generic unquoted assent, card receipts,\s+or assent with additional changes cannot authorize this operation\./,
+  ]) {
+    assert.match(reference, instruction, 'negative control must mutate an existing safeguard');
+    assert.throws(() => assertScheduleClarificationContract(reference.replace(instruction, '')),
+      /missing .* safeguard/);
+  }
+});
+
 test('global 504 guidance requires reconciliation before retrying uncertain writes', () => {
   const timeoutRow = operations.match(/\| 504 \| Backend timeout \| ([^|]+)\|/);
   assert.ok(timeoutRow, '504 guidance must exist');

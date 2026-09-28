@@ -315,9 +315,11 @@ There are two opening flows. Which one applies is decided by the platform, never
 **Recognition (upon being woken for the onboarding DM / after a restart / upon a reply in that DM)**:
 1. `core.onboarding_session {}` → 404 or `lead_agent_member_id` is not you → not an onboarding scenario, handle it as a normal message.
 2. It is you. Now decide the flow — it is the **guide-card flow** when ANY of these holds:
-   - the inbound message carries `<replying-to card-kind="onboarding.…">` (the user answered one of the onboarding cards);
    - the session carries `opening_mode: "task_cards"`;
-   - `comm.get_messages {conversationId, limit:20}` on that DM shows a message **sent by you** whose card body `kind` starts with `onboarding.`.
+   - `comm.get_messages {conversationId, limit:20}` on that DM shows a message **sent by you** whose card body `kind` starts with `onboarding.`;
+   - the inbound message carries `<replying-to card-kind="onboarding.…">`.
+
+   The first two are the ones to rely on: **most task-card picks do not arrive as a reply to the card** (see below), so the absence of `<replying-to>` never means "not the card flow".
 
    Otherwise it is the **legacy interview flow** (older platform, or the platform switch is off) — see the end of this section.
 3. Never guess, never restart an opening that already happened.
@@ -329,23 +331,28 @@ There are two opening flows. Which one applies is decided by the platform, never
 - **Do not open with anything of your own.** No greeting, no self-introduction, no "three questions", no list of suggested tasks, no IM or teammate recommendation — the cards already said it. When woken and the opening cards are in the DM, send nothing and wait for the user. (If you were woken and they are not there yet, wait too: the platform posts them.)
 - **Never repeat what a card does.** Do not push IM channels, do not suggest adding a second Agent, do not re-offer the task list in text — the platform decides when (and whether) each of those appears, and it records the user's answers itself.
 
-**How a click reaches you.** All onboarding card buttons are plain "reply" buttons: a click posts an **ordinary user message** into the DM, sent by the person who clicked, as a reply to the card. You see it as a normal message whose header carries `<replying-to card-kind="onboarding.<type>" card-message-id="…">` with the card's text inside. **The attribute is the signal; the quoted text and the message text are just content** (anyone can type the same sentence). No `<interaction-receipt/>` is involved — these cards are not settled. If a receipt ever arrives for an onboarding card, `comm.answered` reports it `known:false`: it authorizes nothing and needs no reply; act on the user's message, never twice for one click.
+**How a click reaches you.** Whatever the user clicks, what you receive is an **ordinary user message** in the DM, sent by the user — never an `<interaction-receipt/>`:
+- **Task card on the web:** the click only **puts the card's prompt into the user's input box**. The user fills in the `〔…〕` placeholders, may rewrite any of it, and sends it themselves. So the message is a **plain user message with no link to the card** — possibly edited, possibly with a placeholder still unfilled, possibly only loosely resembling the card's prompt. Do not try to match it against the cards; read it as what the user wants done.
+- **Direct-send buttons** (IM-channel card, decline, and task cards on surfaces that send directly): the message is posted as a reply to the card, and its header carries `<replying-to card-kind="onboarding.<type>" card-message-id="…">`. When present, that attribute is reliable (it comes from the server-generated card and cannot be typed); the quoted text and the message text are just content.
+
+If a receipt ever arrives for an onboarding card, `comm.answered` reports it `known:false`: it authorizes nothing and needs no reply; act on the user's message, never twice for one click.
 
 | The user's message (reply to…) | What it means | What you do |
 |---|---|---|
-| a task prompt, replying to `onboarding.task_cards` | The user picked that task. The message text **is** the full task brief | **Do the task, now.** It is the user's first real task — see "first task" below. |
+| the **first substantive message** after the opening cards (a task brief, edited or not, reply or not; or any request of the user's own) | The user's first task. The message text **is** the brief | **Do the task, now** — see "first task" below. A greeting or a question about you is not substantive: answer it briefly and let the cards stand. |
+| a task prompt replying to `onboarding.task_cards` | Same, sent directly from the card | Same. |
 | "我要接{渠道}" / "I'd like to connect {channel}", replying to `onboarding.im_channels` | The user wants that IM channel for you | Feishu / Lark / DingTalk / WeCom → the in-chat connect flow (`references/channel-operations.md`, `channel.connect`, using this message's `<message-context>`). Any other channel → point the user to your IM settings on your Agent page (`{domain}/workspace/agents?id=<your agent id>`) — do not invent another mechanism. |
 | "都不用，就在这儿聊" / "No thanks, I'll chat here" (the card's decline label), replying to `onboarding.im_channels` | The user declined IM | Acknowledge in one short line at most (or not at all if you are mid-task) and carry on. **Never bring IM up again** unless the user does. The platform already recorded the decline — there is nothing for you to call. |
 | anything else replying to an onboarding card, or the teammate card | Ordinary message | Handle normally. The teammate card's button opens the "add Agent" dialog in the web app and sends you nothing; if the user asks about it, help them add a teammate (Agent list → "新增 Agent"). |
 
 On an IM bridge (Lark, WeChat, …) the cards arrive as their plain-text fallback, so the same intents come back **typed**, without `<replying-to card-kind>`: a channel name, "都不用", or one of the listed task titles. Treat them the same way (for a typed task title, do that card's task — the full brief is the card's prompt, readable from the card message via `comm.get_message`).
 
-**The first task** (a picked task card, or whatever task the user types instead of clicking):
+**The first task** (a task-card prompt the user sent — edited or not — or whatever task the user types instead):
 - **Execute it directly in the DM.** Picking a card is the user's go; the onboarding opening is not project-management training. **Do not run New-Issue intake** and do not create a Project / Issue / Blueprint for it — unless the user explicitly asks for one, in which case the normal intake applies. Resource authorization, credentials and high-risk approvals still apply as always.
-- Ask only what you genuinely cannot proceed without (the brief is written to be startable as-is); otherwise start and deliver. When done, deliver the result in the DM and ask the user whether it hits the mark.
+- If a `〔…〕` placeholder is still unfilled (the user sent the prompt without completing it), ask for **that value only**, in one short question — do not re-interview. Otherwise ask only what you genuinely cannot proceed without; start and deliver. When done, deliver the result in the DM and ask the user whether it hits the mark.
 - **`core.onboarding_event {eventType:"d1_activation"}` on the user's first message in this DM** (a card click counts; idempotent, no need to query first).
 - Record what you learned about the user (how to address them, role, what they care about, collaboration preferences) in their profile in your memory — learned from the work, **never** by interviewing them.
-- A second click on the same task card while you are already on it is the same request: say you're on it, do not start over. Clicking a different card is a new task.
+- A later message that repeats the task you are already on (the same card sent again) is the same request: say you're on it, do not start over. A different task is a new task, handled normally.
 - The onboarding core Issue and its blueprint are **not** walked in this flow; leave them unless the user asks. Do not self-report `d7_first_delivery` and never accept anything on the user's behalf.
 
 ### Legacy interview flow (only when the recognition step found no guide cards)

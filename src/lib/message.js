@@ -133,6 +133,18 @@ function escapeXml(s) {
  * escapeXml. Accepts the shape returned by fetchRecentMessages
  * ({senderName, content}) as well as generic {user_name|sender_id, text|content}.
  */
+/**
+ * Attribute-safe rendering. escapeXml deliberately leaves `"` alone — harmless
+ * in element text, but inside a quoted attribute a `"` ends the value and the
+ * rest becomes attributes of our own element. Line breaks would do the same to
+ * the one-element-per-line framing. Attributes carry ids, kinds and timestamps,
+ * so dropping these characters costs nothing and removes the breakout.
+ */
+function attrValue(v) {
+  if (v === undefined || v === null) return '';
+  return String(v).replace(/[<>"\r\n\u2028\u2029]/g, '').trim();
+}
+
 function formatContextLine(m) {
   const name = escapeXml(
        m.senderName
@@ -163,13 +175,13 @@ function formatContextLine(m) {
  *                              type?:'text'|'image'|'file', mediaLocalPath?:string }
  * @param {Array}  [recent] - recent group messages used for `<group-context>`
  * @param {object} [opts]   - { groupName, quotedContent, threadContext,
- *                              threadRootId, smartHint }
+ *                              threadRootId, smartHint, receipt }
  * @returns {string}
  */
 export function formatInboundForC4(conv, sender, current, recent = [], opts = {}) {
   const rawType = (conv?.type || '').toLowerCase();
   const type = VALID_TYPES.has(rawType) ? rawType : 'dm';
-  const { groupName, quotedContent, threadContext, threadRootId, smartHint, orgId, orgName } = opts;
+  const { groupName, quotedContent, threadContext, threadRootId, smartHint, orgId, orgName, receipt } = opts;
 
   const name = sender?.displayName || sender?.display_name || sender?.id || 'unknown';
   const safeName = escapeXml(name);
@@ -209,6 +221,22 @@ export function formatInboundForC4(conv, sender, current, recent = [], opts = {}
   // angle brackets in the message body are escaped below.
   if (conv?.id && current?.messageId) {
     header += `<message-context conversation-id="${escapeXml(conv.id)}" source-message-id="${escapeXml(current.messageId)}"/>\n`;
+  }
+  // An interaction receipt's answer and actor decide whether an irreversible
+  // action runs, so they are emitted as a structural element rather than left
+  // in the message text. Anyone can type text that reads like a receipt; nobody
+  // can type this element, because `<` and `>` in content are escaped below.
+  if (receipt) {
+    const attrs = [
+      `selected-action-ids="${attrValue(receipt.selectedActionIds.join(','))}"`,
+      `selected-count="${attrValue(receipt.selectedCount)}"`,
+    ];
+    if (receipt.actorMemberId) attrs.push(`actor-member-id="${attrValue(receipt.actorMemberId)}"`);
+    if (receipt.actorKind) attrs.push(`actor-kind="${attrValue(receipt.actorKind)}"`);
+    if (receipt.cardConversationId) attrs.push(`card-conversation-id="${attrValue(receipt.cardConversationId)}"`);
+    if (receipt.cardMessageId) attrs.push(`card-message-id="${attrValue(receipt.cardMessageId)}"`);
+    if (receipt.settledAt) attrs.push(`settled-at="${attrValue(receipt.settledAt)}"`);
+    header += `<interaction-receipt ${attrs.join(' ')}/>\n`;
   }
   const parts = [header];
 

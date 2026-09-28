@@ -26,7 +26,16 @@
 import { randomUUID } from 'crypto';
 import { getForOrg, postForOrg, delForOrg, apiPath } from '../lib/client.js';
 import { looksLikeMarkdown } from '../lib/message.js';
-import { buildDisplayCard } from '../lib/card.js';
+import { buildChoiceRequest } from '../lib/interaction-request.js';
+import { formatLocalTime } from '../lib/local-time.js';
+import {
+  clearPendingQuestion,
+  findPendingQuestion,
+  isAnswerAuthorized,
+  isExpired,
+  listPendingQuestions,
+  recordPendingQuestion,
+} from '../lib/pending-question.js';
 import {
   buildMentions,
   needsRosterHydration,
@@ -443,29 +452,108 @@ const COMMANDS = {
     return post(apiPath(`/conversations/${params.conversationId}/messages`), buildSendBody(params));
   },
 
-  // ✅ POST /api/v1/conversations/{id}/messages  (type: CARD)
-  //   Send a `cws.card.v1` display card: a title/summary plus up to five
-  //   `ui.quick_reply` buttons. Use it instead of a plain-text question when
-  //   the user is picking from a few fixed answers (yes/no, approve/reject) —
-  //   the reply comes back as a stable action id rather than free text.
-  //   Interactive (business-operation) cards are out of scope here; they need
-  //   a context plus a registry entry.
-  //   buildDisplayCard() enforces the cws-comm caps locally, so a malformed
-  //   card names the offending field instead of returning an opaque 422.
-  'comm.send_card': async () => {
-    const cardBody = buildDisplayCard(params);
-    // Drop any caller-supplied `body`: buildSendBody treats one carrying both
-    // `content` and `type` as a verbatim override, which would silently send
-    // that instead of the card just built and validated here.
-    const { body: _ignoredOverride, ...rest } = params;
-    // The card body is not text, so buildSendBody's @name resolution cannot
-    // run over it; an explicit `mentions` array still passes through.
-    return post(apiPath(`/conversations/${params.conversationId}/messages`), buildSendBody({
-      ...rest,
-      type:    'CARD',
-      content: { content_type: 'card', body: cardBody },
-    }));
+  // ✅ POST /api/v1/conversations/{id}/interaction-requests
+  //   Ask the humans in a conversation to pick one of a few fixed answers.
+  //   Use it instead of a plain-text question when the answer is a choice
+  //   (yes/no, approve/reject); use plain text for open questions, for more
+  //   choices than the server allows, or when a typed explanation is wanted.
+  //
+  //   The agent states what it wants — title, body blocks, option labels — and
+  //   cws-comm builds the card. Nothing here names an operation, a URL, a
+  //   handler or an option id.
+  //
+  //   🔴 Keep the `action_ids` from the response. They are the server's ids for
+  //   the options, in the order supplied, and they are how the answer is read
+  //   back later; there is no way to recover which option was which without
+  //   them.
+  'comm.send_card': async () => post(
+    apiPath(`/conversations/${params.conversationId}/interaction-requests`),
+    buildChoiceRequest(params),
+  ),
+
+  //   Ask a question AND remember what it was, in one call.
+  //
+  //   Sending and remembering are one verb on purpose. The answer arrives later
+  //   as a separate receipt naming only the card, so a send whose `action_ids`
+  //   were not written down produces an answer nobody can decode — and that is
+  //   a two-step sequence away from happening every time the second step is
+  //   skipped, forgotten, or lost to a restart between them.
+  //
+  //   `kind` says what the question is for, `askedOf` is the member whose
+  //   answer counts, and `meta` is kept verbatim with the record for the
+  //   answering side. Those three are this verb's own; everything else is a
+  //   card field and is validated as one.
+  'comm.ask_card': async () => {
+    if (!params.kind || !params.askedOf) {
+      throw new Error('comm.ask_card: kind and askedOf are required — an answer with neither cannot be acted on');
+    }
+    // Strip this verb's own arguments before building the request. `kind`,
+    // `askedOf` and `meta` describe the QUESTION, not the card, and the card
+    // builder refuses every field the endpoint has no place for — including a
+    // `kind`, which the old card API used for something else entirely. Passing
+    // them through made this verb throw on its own required argument.
+    const { kind, askedOf, meta, ...cardParams } = params;
+    const res = await post(
+      apiPath(`/conversations/${params.conversationId}/interaction-requests`),
+      buildChoiceRequest(cardParams),
+    );
+    const actionIds = res?.action_ids || res?.data?.action_ids;
+    const messageId = res?.message_id || res?.data?.message_id;
+    if (!Array.isArray(actionIds) || !actionIds.length || !messageId) {
+      // The card is already posted; say so rather than implying nothing happened.
+      throw new Error(`comm.ask_card: card was SENT but the response carried no ${messageId ? 'action_ids' : 'message_id'}, so the answer will not be decodable: ${JSON.stringify(res)}`);
+    }
+    recordPendingQuestion({
+      kind,
+      askedOf,
+      conversationId: params.conversationId,
+      cardMessageId: messageId,
+      actionIds,
+      askedAt: new Date().toISOString(),
+      title: params.title,
+      meta,
+    });
+    return { ...res, recorded: true };
   },
+
+  //   Resolve a receipt against what was asked. Give it the receipt's
+  //   `card-message-id`, the chosen `actionId`, and the `actor-member-id`; it
+  //   answers whether this is a question we asked, whether that member's answer
+  //   counts, whether it arrived in time, and which option was chosen.
+  //
+  //   It decides nothing and executes nothing — the caller still acts.
+  'comm.answered': () => {
+    const record = findPendingQuestion(params.cardMessageId);
+    if (!record) return { known: false, reason: 'no pending question for this card' };
+    const authorized = isAnswerAuthorized(record, params.actorMemberId);
+    const expired = isExpired(record, Date.now());
+    const index = Array.isArray(record.actionIds)
+      ? record.actionIds.indexOf(params.actionId)
+      : -1;
+    return {
+      known: true,
+      authorized,
+      expired,
+      actionable: authorized && !expired && index >= 0,
+      optionIndex: index,
+      reason: !authorized ? 'the answering member is not who the question was asked of'
+        : expired ? 'the question expired before it was answered'
+        : index < 0 ? 'the chosen action id was not one of this card\'s options'
+        : 'ok',
+      question: record,
+    };
+  },
+
+  //   Questions still waiting, and forgetting one that has been dealt with.
+  //
+  //   `askedAtLocal` is added for reading only; the stored `askedAt` stays the
+  //   UTC ISO string every comparison uses (`isExpired` parses it), because a
+  //   local rendering carries no zone once it is copied anywhere else.
+  'comm.pending': () => listPendingQuestions().map((r) => {
+    const local = formatLocalTime(r.askedAt);
+    return local ? { ...r, askedAtLocal: local } : r;
+  }),
+  'comm.pending_clear': () => ({ cleared: clearPendingQuestion(params.cardMessageId) }),
 
   // ✅ GET /api/v1/conversations/{id}/messages/{msg_id}
   'comm.get_message': () => get(
@@ -588,9 +676,69 @@ Messages
   comm.send                 {conversationId, content, replyTo?, clientMsgId?, mentions?}
                             # content: string | {text|body, markdown?} | {type,body} | [{type,body}]
                             # mentions auto-resolved from @name in text if omitted (array of member_id or {type,member_id})
-  comm.send_card            {conversationId, title, summary, text?, options?, kind?, fallbackText?, replyTo?, mentions?}
-                            # display card + up to 5 ui.quick_reply buttons; options: ["是","否"] or [{text,label?,id?,style?}]
-                            # read the answer back from card_state.action_id (match the id, never the label)
+  comm.ask_card             {conversationId, title, summary, options, kind, askedOf, text?|blocks?, confirm?, meta?}
+                            # send a choice card AND record what was asked, so the later receipt
+                            #   can be decoded. Prefer this over comm.send_card for any question
+                            #   you intend to act on
+                            # this is the PROACTIVE form. Replying to a message routed to you?
+                            #   send the same card through that message's own "reply via"
+                            #   command instead, as a [CARD]{...} body:
+                            #     c4-send.js openmax '<conv>' <<'EOF'
+                            #     [CARD]{"kind":..,"askedOf":..,"title":..,"summary":..,"text":..,"options":[..]}
+                            #     EOF
+                            #   same builder, same record, identical result — but it also leaves
+                            #   a C4 conversation-log row (this verb leaves none, so a card asked
+                            #   here is invisible to the history Memory Sync reads). Fields are
+                            #   these minus conversationId; the JSON is INLINE, never a file path,
+                            #   so the logged row stays readable on its own.
+                            #   See references/comm-operations.md and src/lib/card-message.js
+                            # kind / askedOf / meta belong to the QUESTION and are consumed here;
+                            #   every other key is a CARD field, checked exactly as under
+                            #   comm.send_card below — body shape (text vs blocks) included
+                            # option styles work exactly as under comm.send_card below: undeclared
+                            #   renders secondary, the primary one has to be declared
+                            # confirm {text, label?} adds the inline second step: the click opens a
+                            #   confirm row in the card instead of settling straight away. Pass it for
+                            #   anything you cannot undo — 'authorized' tells you WHO clicked, never
+                            #   whether they meant it. Omitting it is why the upgrade card shipped
+                            #   without that step
+  comm.answered             {cardMessageId, actionId, actorMemberId}
+                            # resolve a receipt against what was asked: known / authorized /
+                            #   expired / actionable. Decides nothing, executes nothing
+  comm.pending              {}                                   # questions still awaiting an answer
+  comm.pending_clear        {cardMessageId}                       # forget one that has been dealt with
+  comm.send_card            {conversationId, title, summary, text?|blocks?, options, confirm?, clientMsgId?}
+                            # BODY: "text" is shorthand for one paragraph; anything richer passes
+                            #   "blocks" INSTEAD (pass one or the other, never both):
+                            #     "blocks": [
+                            #       {"type":"text",  "text":"确认升级以下组件?"},
+                            #       {"type":"fields","items":[{"label":"core","value":"0.7.1 → 0.8.1"}]}
+                            #     ]
+                            #   block types: text | markdown | fields | divider | image | quote |
+                            #     artifact_list (each also takes fallback_text)
+                            #   "fields" is a BLOCK, not a top-level key — one row per item is how
+                            #     structured detail (per-component versions, amounts) is shown
+                            # the accepted top-level keys are exactly the ones above: anything else
+                            #   is REFUSED with the field named, never carried along. A top-level
+                            #   "fields" used to be dropped in silence and the card posted without it
+                            # client_msg_id is generated when omitted, which only de-dupes a retry
+                            #   of the same request. To survive a lost response, KEEP your own
+                            #   clientMsgId and pass the same one back — otherwise re-running
+                            #   posts a second card
+                            # asks a choice: options ["Yes","No"] or [{label,style?}] — at least one, no id
+                            # an option that declares no style renders SECONDARY (white/outline).
+                            #   There is no "first option is the primary one" rule: if the card has
+                            #   one action you are actually asking for, mark that one
+                            #   {"label":"...","style":"primary"}. Peer choices declare nothing
+                            # style accepts primary | secondary | danger and nothing else — cws-comm
+                            #   rejects any other value outright instead of falling back to a default
+                            # an option may carry its own {label, confirm:{text,label?}} — that confirm
+                            #   applies to THAT option only and overrides the card-level one below.
+                            #   Use it whenever one choice is destructive and another is not: the
+                            #   card-level confirm is applied to EVERY option, so on a mixed card it
+                            #   makes the safe button warn about the dangerous one's consequences
+                            # KEEP the response's action_ids: they are the server's option ids, in order,
+                            # and the only way to read back which option was chosen
   comm.get_messages         {conversationId, afterSeq?, beforeSeq?, limit?}
   comm.get_message          {conversationId, messageId}
 

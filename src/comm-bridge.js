@@ -30,6 +30,8 @@ import { WsClient, createDeduper } from './lib/ws.js';
 import { resolveInboundContent } from './lib/inbound-content.js';
 import { formatInboundForC4, formatEndpoint, newClientMsgId } from './lib/message.js';
 import { isSystemSender, systemEventPriority } from './lib/system-message.js';
+import { formatReceiptForModel, receiptFacts, resolveReplyTarget } from './lib/interaction-receipt.js';
+import { formatStructuredForModel } from './lib/structured-body.js';
 import { isSiblingAgentSender } from './lib/dm-access.js';
 import { recordParticipants } from './lib/mention.js';
 import { getMediaUrl, downloadMedia } from './cli/as.js';
@@ -1011,6 +1013,9 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
           const text = mStructured.body?.text
                    || (typeof m.content === 'string' ? m.content : '')
                    || m.content_text
+                   // Same hole as the forward path: without this a card already in
+                   // history renders as an empty turn in the replayed context.
+                   || formatStructuredForModel(m)
                    || '';
           const mType = (m.type || m.message?.type || '').toLowerCase();
           const mAttachments = Array.isArray(mStructured.attachments) ? mStructured.attachments
@@ -1039,10 +1044,20 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
     // and `.media_id`, which silently produced empty content under the
     // current cws-core schema.
     const structured = (msg.content && typeof msg.content === 'object') ? msg.content : {};
+    // A receipt's answer lives in structured fields that the arms below cannot
+    // reach — they read one string, and for a receipt that string is a human
+    // sentence with no option id, no actor and no card in it. Render those
+    // fields instead; anything that is not a trusted receipt returns null here
+    // and takes the ordinary path unchanged.
     const text =
-        structured.body?.text
+        formatReceiptForModel(msg)
+     || structured.body?.text
      || (typeof msg.message?.content === 'string' ? msg.message.content : '')
      || (typeof msg.content === 'string' ? msg.content : '')
+     // A card's prose is in `body.blocks[].text`, never `body.text`, so every arm
+     // above misses it. Placed last so it changes nothing for a body that already
+     // has text — it only fills the gap that used to forward an empty string.
+     || formatStructuredForModel(msg)
      || '';
 
     const allAttachments = Array.isArray(structured.attachments) ? structured.attachments : [];
@@ -1080,17 +1095,50 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
                     || (await fetchMemberName(orgConfig.org_id, msg.sender_id))
                     || msg.sender_id;
     const msgType = (msg.type || msg.message?.type || '').toLowerCase();
+    // Where our answer goes. Same as the message's own conversation for
+    // everything except an interaction receipt, which arrives in the read-only
+    // `interaction_center` system DM and names the card's conversation in its
+    // body (see src/lib/interaction-receipt.js). Answering the system DM would
+    // be rejected by cws-comm, so the C4 envelope must carry the origin.
+    const replyTarget = resolveReplyTarget(msg);
+    const replyConvId = replyTarget.conversationId;
+    // Everything the model is shown about "which conversation is this" has to
+    // describe the conversation its answer lands in, or it is asked to approve
+    // an irreversible action without being able to see who will read the
+    // approval. Only the reply-facing view moves: the read watermark, local
+    // history and the policy decision stay on the conversation the message
+    // actually arrived in, which is where its seq and membership live.
+    const replyConv = replyTarget.redirected
+      ? await fetchConversation(orgConfig.org_id, replyConvId)
+      : conv;
+    const replyConvType = (replyConv?.type || '').toLowerCase() || convType;
+    if (replyTarget.redirected) {
+      // A redirect whose target cannot be fetched still routes correctly — only
+      // the framing degrades, and it degrades to the arrival conversation's type,
+      // which for a receipt is always the system DM. That is a wrong label, not a
+      // harmless one, so say so rather than logging a resolved-looking type.
+      if (replyConv) {
+        log(`receipt [${orgConfig.slug}] msg=${msg.id} reply target ${msg.conversation_id} -> ${replyConvId} (${replyConvType})`);
+      } else {
+        warn(`receipt [${orgConfig.slug}] msg=${msg.id} reply target ${replyConvId} could not be fetched; framing falls back to ${replyConvType}`);
+      }
+    }
     const endpoint = formatEndpoint({
-      type: convType,
-      conversationId: msg.conversation_id,
-      threadConversationId: msg.thread_id || undefined,
-      parentMessageId: msg.thread_id ? msg.parent_message_id : undefined,
+      type: replyConvType,
+      conversationId: replyConvId,
+      // Thread and parent belong to the conversation the message ARRIVED in. On
+      // a redirect they name a thread inside the read-only system DM, and the
+      // send path prefers a thread id over the conversation id — so carrying
+      // them would route the answer back to the place the redirect exists to
+      // avoid, while every log and the model's own framing said otherwise.
+      threadConversationId: replyTarget.redirected ? undefined : (msg.thread_id || undefined),
+      parentMessageId: (!replyTarget.redirected && msg.thread_id) ? msg.parent_message_id : undefined,
     });
     // smartHint mirrors zylos-feishu: only emitted when the group is in smart
     // mode AND the bot was NOT @-mentioned. When the bot was directly @-ed we
     // want a direct reply, not a "should I respond?" deliberation.
     const smartHint = decision.mode === 'smart' && !decision.mentioned;
-    const groupName = decision.groupCfg?.name || conv?.name;
+    const groupName = decision.groupCfg?.name || replyConv?.name;
 
     // Record the display name + member_id seen in this conversation (sender +
     // group context) so an outbound `@name` can both be canonicalized to the
@@ -1169,20 +1217,29 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
     }
 
     const body = formatInboundForC4(
-      { type: convType, id: msg.conversation_id, name: groupName },
+      { type: replyConvType, id: replyConvId, name: groupName },
       { displayName: senderName },
       {
         content: displayContent,
-        messageId: msg.id,
+        // <message-context> is the server-issued pair other verbs copy verbatim
+        // (channel.connect, issue origins). Pairing the origin conversation with
+        // the receipt's own id would name a message that does not live in it, so
+        // a redirect carries the card's id — the message that pair is about.
+        messageId: replyTarget.cardMessageId || msg.id,
         type: isImage ? 'image' : (isFile ? 'file' : 'text'),
         mediaItems,
       },
       recent,
-      { groupName, smartHint, quotedContent, orgId: orgConfig.org_id, orgName: orgConfig.org_name },
+      {
+        groupName, smartHint, quotedContent,
+        orgId: orgConfig.org_id, orgName: orgConfig.org_name,
+        receipt: receiptFacts(msg),
+      },
     );
 
     try {
       registerConvOrg(msg.conversation_id, orgConfig.org_id);
+      if (replyConvId !== msg.conversation_id) registerConvOrg(replyConvId, orgConfig.org_id);
       await forwardToC4(endpoint, body, systemEventPriority(msg));
       log(`fwd [${orgConfig.slug}] ${convType} ${msg.conversation_id} msg=${msg.id} seq=${msg.seq}`);
       markRead(orgConfig, msg.conversation_id, msg.seq);

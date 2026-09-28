@@ -19,6 +19,8 @@
  *   markdown-looking   → content=[{type:"markdown", body:<text>}]   (heuristic)
  *   [MEDIA:image]/path → upload via as.js → content=[{type:"image", body:<media_id>}]
  *   [MEDIA:file]/path  → upload via as.js → content=[{type:"file",  body:<media_id>}]
+ *   [CARD]{...json...}  → POST .../interaction-requests (a choice card), and
+ *                         record what was asked — see src/lib/card-message.js
  *
  * Long text is split into ≤3000-char chunks (paragraph → newline → hard) and
  * sent as sequential POSTs to the same conversation. Each chunk gets its own
@@ -56,6 +58,7 @@ import {
   splitMessage,
 } from '../src/lib/message.js';
 import { uploadMedia } from '../src/cli/as.js';
+import { parseCardMessage, sendCardMessage } from '../src/lib/card-message.js';
 import {
   resolveMentions,
   buildMentions,
@@ -87,7 +90,8 @@ function usage() {
   console.error('  <conversationId>|thread:<threadId>|parent:<parentMsgId>');
   console.error('  (legacy [COCO TYPE]/<conversationId>... is still accepted)');
   console.error('');
-  console.error('Message: plain text, markdown (auto-detected), or [MEDIA:image|file]/abs/path');
+  console.error('Message: plain text, markdown (auto-detected), [MEDIA:image|file]/abs/path,');
+  console.error('         or [CARD]{"title":..,"summary":..,"text":..,"options":[..],"kind":..,"askedOf":..}');
 }
 
 /**
@@ -282,11 +286,22 @@ async function main() {
   }
 
   try {
-    const media = parseMediaPrefix(message);
-    const result = media
-      ? await sendMediaMessage(ep, media.kind, media.localPath, media.caption)
-      : await sendText(ep, message);
+    // Three-way dispatch, and nothing more: what a `[CARD]` body means, and
+    // what a malformed one costs, lives in src/lib/card-message.js, where
+    // there is a test surface. A card that fails to parse throws out of here
+    // into the catch below — it is NEVER downgraded to sendText, because
+    // posting the raw JSON as chat looks, to this agent, exactly like having
+    // asked the question.
+    const card = parseCardMessage(message);
+    const media = card ? null : parseMediaPrefix(message);
+    let result;
+    if (card) result = await sendCardMessage(resolveTargetConversation(ep), card);
+    else if (media) result = await sendMediaMessage(ep, media.kind, media.localPath, media.caption);
+    else result = await sendText(ep, message);
     markTypingDone(ep.replyTo || ep.conversationId);
+    // Contract, not incidental output: this line is how `action_ids` get back
+    // to the caller, and an answer cannot be decoded without them. See the
+    // note on sendCardMessage.
     console.log(JSON.stringify(result));
   } catch (e) {
     const payload = { error: e.message };

@@ -6,10 +6,23 @@ import test from 'node:test';
 
 const cliPath = fileURLToPath(new URL('./comm.js', import.meta.url));
 
-async function captureRequest(command, params) {
+/**
+ * Run a command against a local stub server and return the request it sent.
+ *
+ * `allowFailure` keeps the captured request when the CLI exits non-zero AFTER
+ * sending it. It exists for `comm.ask_card`, which posts and then requires
+ * `message_id` / `action_ids` back before recording the question — the stub
+ * answers every route with `{}`, so the verb always fails on that check. What
+ * this harness can prove about it is exactly what we need: the request went out
+ * and carried what it should. Letting it succeed would also make the test write
+ * a real pending-question record into the component's runtime directory.
+ */
+async function captureRequest(command, params, { allowFailure = false } = {}) {
   let resolveRequest;
+  let sawRequest = false;
   const requestPromise = new Promise((resolve) => { resolveRequest = resolve; });
   const server = createServer((req, res) => {
+    sawRequest = true;
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
     req.on('end', () => {
@@ -43,7 +56,15 @@ async function captureRequest(command, params) {
         },
       },
       (error, stdout, stderr) => {
-        if (error) { reject(new Error(`comm.js failed: ${stderr || stdout}`)); return; }
+        if (error && !allowFailure) { reject(new Error(`comm.js failed: ${stderr || stdout}`)); return; }
+        // Under allowFailure, a CLI that exits BEFORE sending leaves the request
+        // promise pending forever — the test would hang to the runner's timeout
+        // and fail the whole file instead of naming what went wrong. Turn that
+        // into an immediate, readable failure.
+        if (error && !sawRequest) {
+          reject(new Error(`comm.js exited without sending a request: ${stderr || stdout}`));
+          return;
+        }
         resolve();
       },
     );
@@ -133,70 +154,99 @@ test('validation: member_add with neither id, remove without id, batch with empt
   assert.match((await captureFailure('comm.member_remove_batch', { conversationId: 'cv-1', memberIds: [] })).error, /non-empty/);
 });
 
-test('send_card → POST .../messages with type CARD and a cws.card.v1 display body', async () => {
+test('send_card → POST .../interaction-requests with an interaction_type=choice body', async () => {
   const request = await captureRequest('comm.send_card', {
     conversationId: 'cv-card-1',
-    title: '需要确认',
-    summary: '是否继续部署?',
-    options: ['是', '否'],
+    title: 'Confirm',
+    summary: 'Continue the deploy?',
+    text: 'The deploy is staged and waiting.',
+    options: ['Yes', 'No'],
   });
 
   assert.equal(request.method, 'POST');
-  assert.equal(request.url, '/api/v1/conversations/cv-card-1/messages');
-  // The message-level type, the content-level content_type and the schema are
-  // three different fields that all have to line up; cws-core rejects the
-  // message if any one of them is wrong.
-  assert.equal(request.body.type, 'CARD');
-  assert.equal(request.body.content.content_type, 'card');
-  assert.equal(request.body.content.body.schema, 'cws.card.v1');
-  assert.equal(request.body.content.body.mode, 'display');
-  assert.deepEqual(
-    request.body.content.body.actions.map((a) => [a.kind, a.operation, a.params.text]),
-    [['ui', 'ui.quick_reply', '是'], ['ui', 'ui.quick_reply', '否']],
-  );
-  assert.ok(request.body.client_msg_id, 'client_msg_id is always generated');
+  assert.equal(request.url, '/api/v1/conversations/cv-card-1/interaction-requests');
+  assert.equal(request.body.interaction_type, 'choice');
+  assert.equal(request.body.choice.title, 'Confirm');
+  assert.deepEqual(request.body.choice.options, [{ label: 'Yes' }, { label: 'No' }]);
+  // The card body is cws-comm's to build: nothing here names a schema, a mode,
+  // an operation or an option id.
+  assert.equal(request.body.choice.schema, undefined);
+  assert.equal(request.body.type, undefined);
 });
 
-test('send_card passes replyTo and an explicit mentions array through', async () => {
-  const request = await captureRequest('comm.send_card', {
-    conversationId: 'cv-card-2',
-    title: 't',
-    summary: 's',
-    replyTo: 'msg-parent',
-    mentions: ['member-9'],
-  });
-
-  assert.equal(request.body.parent_id, 'msg-parent');
-  assert.deepEqual(request.body.mentions, [{ type: 'member', member_id: 'member-9' }]);
-});
-
-test('send_card refuses a malformed card locally, naming the field', async () => {
-  // Six choices is over the frozen cap of five. The request must never leave
-  // the CLI — catching it here is the whole point of the local validation.
+test('send_card refuses an option id rather than dropping it', async () => {
+  // The server generates the ids and returns them as action_ids. A dropped id
+  // would leave the caller matching the answer against one the server never saw.
   const failure = await captureFailure('comm.send_card', {
     conversationId: 'cv-card-3',
     title: 't',
     summary: 's',
-    options: ['a', 'b', 'c', 'd', 'e', 'f'],
+    text: 'body',
+    options: [{ label: 'Yes', id: 'yes' }],
   });
-  assert.match(failure.error, /^options: /);
+  assert.match(failure.error, /^options\[0\]\.id: /);
   assert.equal(failure.status, undefined, 'no HTTP round trip happened');
 });
 
-test('send_card ignores a stray body param instead of letting it hijack the card', async () => {
-  // buildSendBody has an escape hatch: a `body` carrying both `content` and
-  // `type` is passed through verbatim. send_card spreads the caller's params,
-  // so without stripping it a stray `body` would silently send something other
-  // than the card that was just built and validated.
-  const request = await captureRequest('comm.send_card', {
-    conversationId: 'cv-card-4',
-    title: 't',
-    summary: 's',
-    options: ['是'],
-    body: { type: 'AGENT_TEXT', content: { content_type: 'text', body: { text: 'hijacked' } } },
-  });
+test('send_card refuses replyTo and mentions — the endpoint has no field for them', async () => {
+  for (const extra of [{ replyTo: 'msg-parent' }, { mentions: ['member-9'] }]) {
+    const failure = await captureFailure('comm.send_card', {
+      conversationId: 'cv-card-2', title: 't', summary: 's', text: 'body', options: ['Yes'], ...extra,
+    });
+    assert.match(failure.error, /is not supported by interaction-requests/);
+    assert.equal(failure.status, undefined, 'no HTTP round trip happened');
+  }
+});
 
-  assert.equal(request.body.type, 'CARD');
-  assert.equal(request.body.content.content_type, 'card');
-  assert.equal(request.body.content.body.schema, 'cws.card.v1');
+test('🔴 send_card refuses a top-level `fields` instead of posting a card without it', async () => {
+  // The real failure this guards: an upgrade card passed one row per component
+  // as top-level `fields`. The card posted successfully carrying only the prose
+  // body, the reader never saw the versions, and no error was raised anywhere.
+  const failure = await captureFailure('comm.send_card', {
+    conversationId: 'cv-card-5',
+    title: '确认升级', summary: 'openmax · 自动检查', text: '确认升级以下组件?',
+    options: ['升级', '先不升'],
+    fields: [{ label: 'core', value: '0.7.1 → 0.8.1' }],
+  });
+  assert.match(failure.error, /^fields: /);
+  assert.match(failure.error, /blocks/, 'the error has to say where fields belongs');
+  assert.equal(failure.status, undefined, 'no HTTP round trip happened');
+});
+
+test('🔴 a fields block inside `blocks` reaches the wire as sent', async () => {
+  // Refusing the misplaced key only helps if the destination the error names
+  // actually works end to end.
+  const blocks = [
+    { type: 'text', text: '确认升级以下组件?' },
+    { type: 'fields', items: [{ label: 'core', value: '0.7.1 → 0.8.1' }] },
+  ];
+  const request = await captureRequest('comm.send_card', {
+    conversationId: 'cv-card-6', title: '确认升级', summary: 'openmax · 自动检查',
+    blocks, options: ['升级', '先不升'],
+  });
+  assert.deepEqual(request.body.choice.blocks, blocks);
+});
+
+test('🔴 ask_card is not broken by the whitelist: kind/askedOf/meta still work', async () => {
+  // send_card and ask_card have DIFFERENT legitimate arguments, and the builder
+  // refuses ask_card's three. This is the cell that catches a whitelist applied
+  // without ask_card stripping them first — it would throw on the verb's own
+  // required argument, on every call, before any request went out.
+  const request = await captureRequest('comm.ask_card', {
+    conversationId: 'cv-card-7', title: '要升级吗', summary: 'openmax · 自动检查',
+    text: 'openmax 2.20.0 → 2.21.0。', options: [{ label: '升级', style: 'primary' }, '先不升'],
+    kind: 'component-upgrade', askedOf: 'm-owner', meta: { component: 'openmax' },
+  }, { allowFailure: true });
+  assert.equal(request.url, '/api/v1/conversations/cv-card-7/interaction-requests');
+  assert.equal(request.body.interaction_type, 'choice');
+  // The question's own arguments describe the question, not the card.
+  for (const key of ['kind', 'askedOf', 'meta']) assert.equal(key in request.body.choice, false, key);
+});
+
+test('send_card refuses a card with no options', async () => {
+  const failure = await captureFailure('comm.send_card', {
+    conversationId: 'cv-card-4', title: 't', summary: 's', text: 'body',
+  });
+  assert.match(failure.error, /^options: /);
+  assert.equal(failure.status, undefined, 'no HTTP round trip happened');
 });

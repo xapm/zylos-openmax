@@ -133,16 +133,18 @@ For `webhook`, preserve `lead_member_id`, `owner_member_id`, `spec` and optional
 
 ## Failure and duplicate handling
 
+- Timer/webhook create and update commands surface 401 without automatically
+  replaying the write. Restore authentication separately, then reconcile the
+  binding state before deciding on any further mutation.
 - A known validation or permission rejection is not success: report the precise
   missing field/access and keep the proposal. Changes require confirmation again.
 - Network timeout, connection loss after submission, 5xx or an unparseable success
   response means the write outcome may be unknown. The form `request_id`
-  remains only a conversation correlation key. The verified
-  confirmation proof is consumed atomically: within the proof validity window,
-  retry the exact same configuration and two message IDs to recover the same
-  mutation. Do not generate new proof or change fields to retry. A webhook replay
-  does not recover or rotate its one-time secret. If proof has expired or the
-  outcome still cannot be determined, read `event-binding.list` with the verified
+  remains only a conversation correlation key. Never blindly repeat the POST.
+  The CLI does not send an idempotency key for automation create/update.
+  Legacy create calls without both proof IDs have no proof-backed replay guarantee.
+  Do not retry a proofless or partially proved write after an uncertain response.
+  For every uncertain create/update, first read `event-binding.list` with the verified
   `org` (no binding ID needed): it lists both timer and webhook bindings.
   Narrow by `source_kind`, owner, lead, spec and creation time, then fetch
   candidate details with `event-binding.get` for timer or `webhook.get` for
@@ -152,6 +154,11 @@ For `webhook`, preserve `lead_member_id`, `owner_member_id`, `spec` and optional
   inspect the Automation page before authorizing any further write. A missing
   entry alone is not proof a delayed write cannot complete.
   Multiple matches remain uncertain; do not choose one by title or retry.
+  Do not automatically repeat PUT after an uncertain update either; first read
+  the target and compare its version and complete configuration. Proof-backed
+  replay is a backend capability, not an instruction to retry an uncertain write.
+  Do not generate new proof or change fields to retry an unresolved write.
+  Do not strip proof fields or switch endpoints to bypass a rejection.
   Webhooks are shared EventBinding records, not a separate list collection:
   `event-binding.delete {org,id}` is the existing soft-delete operation for
   either source kind. Never delete as automatic recovery; any cleanup needs

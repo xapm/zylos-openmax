@@ -73,6 +73,10 @@ export function automationMutation(params, sourceKind, operation = 'create') {
     authorization_confirmation_message_id: confirmationID,
     expected_version: expectedVersion, id, ...configurationParams } = params;
   const body = { ...automationConfiguration(configurationParams, sourceKind) };
+  if ((operation === 'update' || proposalID !== undefined || confirmationID !== undefined)
+    && (proposalID === undefined || confirmationID === undefined)) {
+    throw Object.assign(new Error(`${operation} requires both authorization_proposal_message_id and authorization_confirmation_message_id`), { status: 400 });
+  }
   for (const field of ['authorization_proposal_message_id', 'authorization_confirmation_message_id']) {
     if (params[field] !== undefined) {
       if (typeof params[field] !== 'string' || params[field].length > 128 || !/^[1-9][0-9]*$/.test(params[field])) {

@@ -180,7 +180,11 @@ and `spec`. Webhooks preserve `lead_member_id`, `owner_member_id`, `spec` and
 The webhook creation result contains a secret `webhook_url`; never put it in
 public output or persistent memory. The verified confirmation is atomically
 consumed as mutation proof; exact replay returns the original binding without
-rotating or recovering webhook secrets. Keep retries within proof validity.
+rotating or recovering webhook secrets. This is a backend capability, not a
+retry instruction. The CLI does not send an idempotency key for automation
+create/update. Legacy create without proof has no proof-backed replay guarantee.
+Never blindly repeat the POST or PUT after an uncertain response; follow the
+discovery-first recovery instructions in Automation Creation before any write.
 `event-binding.list` includes both source kinds; fetch webhook filters with
 `webhook.get` using candidate IDs from that list. `event-binding.delete` also
 soft-deletes webhook bindings, but requires explicit human cleanup authorization.

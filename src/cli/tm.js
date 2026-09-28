@@ -56,9 +56,9 @@ function requireOrgId() {
 // Org-scoped shadows of the bare verbs: each call carries the operating org's
 // JWT. Resolved lazily per call so `help` / usage never require an org.
 const get   = (path, query) => getForOrg(requireOrgId(), path, query);
-const post  = (path, body)  => postForOrg(requireOrgId(), path, body);
+const post  = (path, body, options) => postForOrg(requireOrgId(), path, body, options);
 const patch = (path, body)  => patchForOrg(requireOrgId(), path, body);
-const put   = (path, body)  => putForOrg(requireOrgId(), path, body);
+const put   = (path, body, options) => putForOrg(requireOrgId(), path, body, options);
 const del   = (path)        => delForOrg(requireOrgId(), path);
 
 // Build the standard PageParams query block from user-supplied camelCase.
@@ -237,7 +237,7 @@ const COMMANDS = {
       outcome: params.outcome,
       artifacts: artifacts.map(({ title, url }) => ({ title, url })),
       idempotency_key: params.idempotencyKey,
-    });
+    }, { retryOn401: false });
   },
   'issue.create_revision': () => {
     requireTextParams('issue.create_revision', ['id', 'description', 'originMessageId', 'idempotencyKey']);
@@ -245,7 +245,7 @@ const COMMANDS = {
       description: params.description,
       origin_message_id: params.originMessageId,
       idempotency_key: params.idempotencyKey,
-    });
+    }, { retryOn401: false });
   },
   'issue.resume':          () => post(
     apiPath(`/issues/${params.id}/resume`),
@@ -447,11 +447,11 @@ const COMMANDS = {
   // =========================================================================
 
   'automation.authorization_preview': () => post(apiPath('/automation-authorizations/preview'), automationAuthorizationPreview(params)),
-  'event-binding.create': () => post(apiPath('/event-bindings'), automationMutation(params, 'timer')),
-  'event-binding.update': () => put(apiPath(`/event-bindings/${encodeURIComponent(params.id)}`), automationMutation(params, 'timer', 'update')),
+  'event-binding.create': () => post(apiPath('/event-bindings'), automationMutation(params, 'timer'), { retryOn401: false }),
+  'event-binding.update': () => put(apiPath(`/event-bindings/${encodeURIComponent(params.id)}`), automationMutation(params, 'timer', 'update'), { retryOn401: false }),
 
-  'webhook.create': () => post(apiPath('/webhooks'), automationMutation(params, 'webhook')),
-  'webhook.update': () => put(apiPath(`/webhooks/${encodeURIComponent(params.id)}`), automationMutation(params, 'webhook', 'update')),
+  'webhook.create': () => post(apiPath('/webhooks'), automationMutation(params, 'webhook'), { retryOn401: false }),
+  'webhook.update': () => put(apiPath(`/webhooks/${encodeURIComponent(params.id)}`), automationMutation(params, 'webhook', 'update'), { retryOn401: false }),
   'webhook.get': () => get(apiPath(`/webhooks/${encodeURIComponent(params.id)}`)),
 
   'event-binding.list': () => get(apiPath('/event-bindings')),

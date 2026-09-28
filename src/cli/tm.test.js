@@ -27,6 +27,34 @@ for (const [kind, prefix, path] of [['timer', 'event-binding', 'event-bindings']
       assert.deepEqual(request.body, { ...configuration, ...proof, ...(operation === 'update' ? { expected_version: 3 } : {}) });
     });
   }
+  test(`${kind} mutations reject missing update proof and partial proof before HTTP`, async () => {
+    let requests = 0;
+    const server = createServer((req, res) => { requests++; req.resume(); res.end('{}'); });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const proof = { authorization_proposal_message_id: '1790220732844', authorization_confirmation_message_id: '1790220732845' };
+      const cases = [['update', {}]];
+      for (const operation of ['create', 'update']) {
+        cases.push([operation, { authorization_proposal_message_id: proof.authorization_proposal_message_id }]);
+        cases.push([operation, { authorization_confirmation_message_id: proof.authorization_confirmation_message_id }]);
+        for (const field of Object.keys(proof)) cases.push([operation, { ...proof, [field]: ' ' }]);
+      }
+      for (const [operation, authorization] of cases) {
+        const result = await new Promise(resolve => execFile(process.execPath, [cliPath, `${prefix}.${operation}`, JSON.stringify({
+          org: 'org-automation', id: 'binding-1', expected_version: 3, source_kind: kind,
+          configuration: { lead_member_id: 'agent', owner_member_id: 'human', spec: { project_id: 'project', title: 'Task' } },
+          ...authorization,
+        })], {
+          env: { ...process.env, COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: 'test', COCO_USER_TOKEN: '', COCO_RPC_LOG: '0' }, timeout: 5000,
+        }, (error, stdout, stderr) => resolve({ error, stderr })));
+        assert.ok(result.error, `${prefix}.${operation} must reject ${JSON.stringify(authorization)}`);
+        assert.match(result.stderr, /requires both authorization|canonical decimal/);
+      }
+      assert.equal(requests, 0);
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+    }
+  });
 }
 
 test('ordinary delivery preserves the empty-body acceptance workflow', async () => {
@@ -35,6 +63,48 @@ test('ordinary delivery preserves the empty-body acceptance workflow', async () 
   assert.equal(request.url, '/api/v1/issues/issue-1/deliver');
   assert.equal(request.body, undefined);
 });
+
+const authorizationProof = { authorization_proposal_message_id: '1790220732844', authorization_confirmation_message_id: '1790220732845' };
+for (const [command, params, retry] of [
+  ...['event-binding', 'webhook'].flatMap(prefix => {
+    const source_kind = prefix === 'event-binding' ? 'timer' : 'webhook';
+    const configuration = { lead_member_id: 'agent', owner_member_id: 'human', spec: { project_id: 'project', title: 'Task' } };
+    return [
+      [`${prefix}.create`, { source_kind, configuration, ...authorizationProof }, false],
+      [`${prefix}.update`, { source_kind, configuration, expected_version: 3, ...authorizationProof }, false],
+      [`${prefix}.create`, { leadMemberId: 'agent', ownerMemberId: 'human', projectId: 'project', title: 'Legacy task' }, false],
+    ];
+  }),
+  ['issue.deliver', { summary: 'Recorded result', outcome: 'success', idempotencyKey: 'delivery-1' }, false],
+  ['issue.create_revision', { description: 'Correct result', originMessageId: '1790220732845', idempotencyKey: 'revision-1' }, false],
+  ['issue.deliver', {}, true],
+]) {
+  test(`${command} ${params.title ? 'legacy create' : params.summary ? 'structured result' : retry ? 'ordinary' : 'automation'} ${retry ? 'retains' : 'disables'} 401 replay`, async () => {
+    let requests = 0;
+    const server = createServer((req, res) => {
+      requests++;
+      req.resume();
+      res.writeHead(requests === 1 ? 401 : 200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(requests === 1 ? { error: { detail: 'Original unauthorized response' } } : { ok: true }));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const result = await new Promise(resolve => execFile(process.execPath, [cliPath, command, JSON.stringify({ org: 'org-automation', id: 'binding-1', ...params })], {
+        env: { ...process.env, COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: 'test', COCO_USER_TOKEN: '', COCO_RPC_LOG: '0' }, timeout: 5000,
+      }, (error, stdout, stderr) => resolve({ error, stdout, stderr })));
+      if (retry) {
+        assert.ifError(result.error);
+      } else {
+        assert.ok(result.error);
+        assert.match(result.stderr, /Original unauthorized response/);
+        assert.match(result.stderr, /401/);
+      }
+      assert.equal(requests, retry ? 2 : 1);
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+    }
+  });
+}
 
 for (const [command, params] of [
   ['issue.deliver', { summary: 'Recorded result', outcome: 'success', idempotencyKey: 'delivery-1' }],

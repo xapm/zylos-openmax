@@ -44,16 +44,34 @@ test('preview rejects ambiguous scope and lossy update versions', () => {
 });
 
 for (const kind of ['timer', 'webhook']) {
+  test(`${kind} updates require both proofs and creates reject partial proof`, () => {
+    const params = { id: 'binding', expected_version: 2, source_kind: kind, configuration: base };
+    assert.deepEqual(automationMutation(params, kind), base);
+    assert.throws(() => automationMutation(params, kind, 'update'), /requires both authorization/);
+    for (const proof of [
+      { authorization_proposal_message_id: '1790220732844' },
+      { authorization_confirmation_message_id: '1790220732845' },
+    ]) {
+      for (const operation of ['create', 'update']) {
+        assert.throws(() => automationMutation({ ...params, ...proof }, kind, operation), /requires both authorization/);
+      }
+    }
+  });
   test(`${kind} authorization proof is transport metadata, never form configuration`, () => {
     const proof = { authorization_proposal_message_id: '1790220732844', authorization_confirmation_message_id: '1790220732845' };
     assert.deepEqual(automationMutation({ source_kind: kind, configuration: base, ...proof }, kind), { ...base, ...proof });
     assert.throws(() => automationMutation({ source_kind: kind, configuration: { ...base, ...proof } }, kind), /unsupported/);
-    for (const value of [1790220732844, '001', '', 'fake', '1'.repeat(129)]) {
-      assert.throws(() => automationMutation({ source_kind: kind, configuration: base, authorization_proposal_message_id: value }, kind), /canonical decimal/);
+    for (const field of Object.keys(proof)) {
+      for (const value of [1790220732844, '001', '', ' ', null, 'fake', '1'.repeat(129)]) {
+        for (const operation of ['create', 'update']) {
+          assert.throws(() => automationMutation({ id: 'binding', expected_version: 2, source_kind: kind, configuration: base, ...proof, [field]: value }, kind, operation), /canonical decimal/);
+        }
+      }
     }
   });
   test(`${kind} update preserves expected version and prevents malformed targets`, () => {
-    assert.equal(automationMutation({ id: 'binding', expected_version: 2, source_kind: kind, configuration: base }, kind, 'update').expected_version, 2);
-    assert.throws(() => automationMutation({ source_kind: kind, configuration: base }, kind, 'update'), /update requires/);
+    const proof = { authorization_proposal_message_id: '1790220732844', authorization_confirmation_message_id: '1790220732845' };
+    assert.equal(automationMutation({ id: 'binding', expected_version: 2, source_kind: kind, configuration: base, ...proof }, kind, 'update').expected_version, 2);
+    assert.throws(() => automationMutation({ source_kind: kind, configuration: base, ...proof }, kind, 'update'), /update requires/);
   });
 }

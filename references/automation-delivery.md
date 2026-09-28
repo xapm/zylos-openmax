@@ -39,6 +39,9 @@ is not the result sender or a conversation for human follow-up.
 If delivery is pending or a response is lost, read back the Issue/delivery state
 and use the same delivery identity for any supported retry. Never rerun business
 actions just to retry a message. Never call `accept_delivered` as a workaround.
+Structured `issue.deliver` and `issue.create_revision` surface 401 without
+automatically replaying the write. Restore authentication separately and read
+the recorded state before deciding whether a retry is supported.
 If the deployment lacks this protocol, report the unsupported operation and
 preserve the recorded result; do not fall back to manual self-acceptance or an
 untracked result send.

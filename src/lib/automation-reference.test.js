@@ -4,6 +4,25 @@ import test from 'node:test';
 
 const reference = readFileSync(new URL('../../references/automation-creation.md', import.meta.url), 'utf8');
 const delivery = readFileSync(new URL('../../references/automation-delivery.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
+const operations = readFileSync(new URL('../../references/tm-operations.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
+
+test('automation operations retain the no-key and discovery-first write contract', () => {
+  for (const instruction of [
+    'The CLI does not send an idempotency key for automation create/update.',
+    'Legacy create without proof has no proof-backed replay guarantee.',
+    'Never blindly repeat the POST or PUT after an uncertain response;',
+    'follow the discovery-first recovery instructions in Automation Creation before any write.',
+  ]) assert.ok(operations.includes(instruction), `missing operations safeguard: ${instruction}`);
+});
+
+test('automation references retain scoped 401 recovery instructions', () => {
+  assert.ok(reference.replace(/\s+/g, ' ').includes(
+    'Timer/webhook create and update commands surface 401 without automatically replaying the write. Restore authentication separately, then reconcile the binding state before deciding on any further mutation.',
+  ));
+  assert.ok(delivery.includes(
+    'Structured `issue.deliver` and `issue.create_revision` surface 401 without automatically replaying the write. Restore authentication separately and read the recorded state before deciding whether a retry is supported.',
+  ));
+});
 
 const deliverySafeguards = {
   'server-owned policy and bound DM': [

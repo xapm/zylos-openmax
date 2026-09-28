@@ -1,5 +1,11 @@
 # TM Operations Guide
 
+For server-read `automation_policy: "silent"`, follow
+[Automation Delivery](automation-delivery.md) instead of this guide's ordinary
+human plan/delivery acceptance steps. Structured delivery persists the result;
+the server owns automatic completion and responsible-Agent DM notification.
+Never proxy acceptance to simulate that policy.
+
 **Purpose**: Manage the Task Management service workflow — `Project → Issue → Blueprint → Task → Attempt`. The Blueprint is the source of truth for the plan; simple tasks also use a one-step Blueprint, while complex tasks use a multi-step / dependency Blueprint. All commands go through the cws-core BFF down to cws-work.
 
 **When to load this document**:
@@ -96,7 +102,8 @@ The write path uses the flat path `/issues/{id}`, not `/projects/{pid}/issues/{i
 | ✅ | `issue.activate` | backlog → in_progress; decides whether to wake the Lead based on source | `{id, source?}` | `POST /issues/{id}/activate` |
 | ✅ | `issue.submit_plan` | Lead submits the execution plan to the human for confirmation, writes an Issue comment, state → pending_plan; the new flow must include `blueprintId` | `{id, planText, blueprintId, source?, cardMessageId?}` | `POST /issues/{id}/submit-plan` |
 | ✅ | `issue.accept_plan` | Human accepts the execution plan; during the text-card simulation period the Lead clicks on their behalf, defaulting to `source=text_card_proxy`; state → in_progress | `{id, source?}` | `POST /issues/{id}/accept-plan` — `source` accepts `im` / `explicit` / `text_card_proxy`; default `text_card_proxy` |
-| ✅ | `issue.deliver` | in_progress → delivered | `{id}` | `POST /issues/{id}/deliver` |
+| ✅ | `issue.deliver` | Ordinary: in_progress → delivered; trusted automation: persist result and complete under server policy | `{id, summary?, outcome?, artifacts?, idempotencyKey?}` | `POST /issues/{id}/deliver`; structured result requires summary/outcome/key; artifacts are `{title,url}` |
+| ✅ | `issue.create_revision` | Create a linked revision of a trusted automation result after a human DM request | `{id, description, originMessageId, idempotencyKey}` | `POST /issues/{id}/revisions`; server verifies lineage and human message, inherits policy |
 | ✅ | `issue.resume` | After human feedback, continue the conversation, re-plan, or rework; pending_plan/delivered → in_progress | `{id, reason?, source?}` | `POST /issues/{id}/resume` |
 | ✅ | `issue.accept_delivered` | Owner accepts the delivery; during the text-card simulation period the Lead clicks on their behalf, defaulting to `source=text_card_proxy`; delivered → accepted | `{id, source?}` | `POST /issues/{id}/accept-delivered` — `source` accepts `im` / `explicit` / `text_card_proxy`; default `text_card_proxy` |
 | ✅ | `issue.reassign_owner` | Change the issue owner (ownerMemberId); archived objects cannot be changed | `{id, newOwnerMemberId (or 'ownerMemberId')}` | `POST /issues/{id}/reassign-owner` |

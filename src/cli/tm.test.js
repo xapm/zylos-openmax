@@ -6,6 +6,95 @@ import test from 'node:test';
 
 const cliPath = fileURLToPath(new URL('./tm.js', import.meta.url));
 
+test('ordinary delivery preserves the empty-body acceptance workflow', async () => {
+  const request = await captureRequest('issue.deliver', { org: 'org-automation', id: 'issue-1' });
+  assert.equal(request.method, 'POST');
+  assert.equal(request.url, '/api/v1/issues/issue-1/deliver');
+  assert.equal(request.body, undefined);
+});
+
+for (const [command, params] of [
+  ['issue.deliver', { summary: 'Recorded result', outcome: 'success', idempotencyKey: 'delivery-1' }],
+  ['issue.create_revision', { description: 'Correct result', originMessageId: 'human-1', idempotencyKey: 'revision-1' }],
+]) {
+  test(`${command} preserves ambiguous write failure without automatic replay or fallback`, async () => {
+    let requests = 0;
+    const server = createServer((req, res) => {
+      requests++;
+      req.resume();
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { detail: 'write outcome unknown' } }));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const result = await new Promise(resolve => execFile(process.execPath, [cliPath, command, JSON.stringify({ org: 'org-automation', id: 'issue-1', ...params })], {
+        env: { ...process.env, COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: 'test', COCO_USER_TOKEN: '', COCO_RPC_LOG: '0' }, timeout: 5000,
+      }, (error, stdout, stderr) => resolve({ error, stderr })));
+      assert.ok(result.error);
+      assert.match(result.stderr, /write outcome unknown/);
+      assert.equal(requests, 1);
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+    }
+  });
+}
+
+for (const outcome of ['success', 'partial', 'failed']) {
+  test(`structured delivery forwards ${outcome} without caller-defined lifecycle or sender`, async () => {
+    const request = await captureRequest('issue.deliver', {
+      org: 'org-automation', id: 'issue-1', summary: 'Result summary', outcome,
+      idempotencyKey: 'delivery-1', artifacts: [{ title: 'Report', url: 'https://example.com/report', injected: true }],
+      automation_policy: 'silent', source: 'text_card_proxy', conversationId: 'wrong-dm', leadAgentId: 'wrong-agent',
+    });
+    assert.equal(request.method, 'POST');
+    assert.equal(request.url, '/api/v1/issues/issue-1/deliver');
+    assert.deepEqual(request.body, {
+      summary: 'Result summary', outcome, idempotency_key: 'delivery-1',
+      artifacts: [{ title: 'Report', url: 'https://example.com/report' }],
+    });
+  });
+}
+
+test('linked revision submits the human-message reference but no inherited policy claims', async () => {
+  const request = await captureRequest('issue.create_revision', {
+    org: 'org-automation', id: 'issue-1', description: 'Correct this report',
+    originMessageId: '1789717014187', idempotencyKey: 'revision-1',
+    automationPolicy: 'silent', ownerMemberId: 'spoofed-owner', leadAgentId: 'spoofed-agent',
+  });
+  assert.equal(request.url, '/api/v1/issues/issue-1/revisions');
+  assert.equal(request.method, 'POST');
+  assert.deepEqual(request.body, {
+    description: 'Correct this report', origin_message_id: '1789717014187', idempotency_key: 'revision-1',
+  });
+});
+
+test('incomplete or malformed automation result and revision fail before HTTP', async () => {
+  let requests = 0;
+  const server = createServer((req, res) => { requests++; req.resume(); res.end('{}'); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    for (const [command, params] of [
+      ['issue.deliver', { summary: 'Missing outcome/key' }],
+      ['issue.deliver', { summary: ' ', outcome: 'success', idempotencyKey: 'd1' }],
+      ['issue.deliver', { summary: { text: 'Wrong type' }, outcome: 'success', idempotencyKey: 'd1' }],
+      ['issue.deliver', { summary: 'Invalid outcome', outcome: 'accepted', idempotencyKey: 'd1' }],
+      ['issue.deliver', { summary: 'Invalid artifact', outcome: 'success', idempotencyKey: 'd1', artifacts: [{}] }],
+      ['issue.create_revision', { description: 'Missing human message/key' }],
+      ['issue.create_revision', { description: 'Correction', originMessageId: ' ', idempotencyKey: 'r1' }],
+      ['issue.create_revision', { description: 'Correction', originMessageId: 1789717014187, idempotencyKey: 'r1' }],
+    ]) {
+      const result = await new Promise(resolve => execFile(process.execPath, [cliPath, command, JSON.stringify({ org: 'org-automation', id: 'issue-1', ...params })], {
+        env: { ...process.env, COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: 'test', COCO_USER_TOKEN: '', COCO_RPC_LOG: '0' }, timeout: 5000,
+      }, (error, stdout, stderr) => resolve({ error, stderr })));
+      assert.ok(result.error);
+      assert.match(result.stderr, /requires|outcome must|artifacts must/);
+    }
+    assert.equal(requests, 0);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 test('wrong route and unsupported fields fail before HTTP submission', async () => {
   let requests = 0;
   const server = createServer((req, res) => { requests++; req.resume(); res.end('{}'); });

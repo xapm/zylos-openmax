@@ -96,6 +96,11 @@ function requireParams(commandName, names) {
   }
 }
 
+function requireTextParams(commandName, names) {
+  const invalid = names.filter(name => typeof params[name] !== 'string' || !params[name].trim());
+  if (invalid.length) throw new Error(`${commandName} requires non-empty text: ${invalid.join(', ')}`);
+}
+
 const COMMANDS = {
   // =========================================================================
   //  PROJECT
@@ -215,7 +220,33 @@ const COMMANDS = {
     apiPath(`/issues/${params.id}/accept-plan`),
     { source: params.source ?? 'text_card_proxy' },
   ),
-  'issue.deliver':         () => post(apiPath(`/issues/${params.id}/deliver`)),
+  'issue.deliver': () => {
+    requireParams('issue.deliver', ['id']);
+    const structured = ['summary', 'outcome', 'artifacts', 'idempotencyKey'].some(key => Object.hasOwn(params, key));
+    if (!structured) return post(apiPath(`/issues/${params.id}/deliver`));
+    requireTextParams('issue.deliver', ['summary', 'outcome', 'idempotencyKey']);
+    if (!['success', 'partial', 'failed'].includes(params.outcome)) {
+      throw new Error('issue.deliver outcome must be success, partial, or failed');
+    }
+    const artifacts = params.artifacts ?? [];
+    if (!Array.isArray(artifacts) || artifacts.some(item => !item || typeof item.title !== 'string' || !item.title.trim() || typeof item.url !== 'string' || !item.url.trim())) {
+      throw new Error('issue.deliver artifacts must be an array of {title, url}');
+    }
+    return post(apiPath(`/issues/${params.id}/deliver`), {
+      summary: params.summary,
+      outcome: params.outcome,
+      artifacts: artifacts.map(({ title, url }) => ({ title, url })),
+      idempotency_key: params.idempotencyKey,
+    });
+  },
+  'issue.create_revision': () => {
+    requireTextParams('issue.create_revision', ['id', 'description', 'originMessageId', 'idempotencyKey']);
+    return post(apiPath(`/issues/${params.id}/revisions`), {
+      description: params.description,
+      origin_message_id: params.originMessageId,
+      idempotency_key: params.idempotencyKey,
+    });
+  },
   'issue.resume':          () => post(
     apiPath(`/issues/${params.id}/resume`),
     {
@@ -457,7 +488,8 @@ ISSUE  (all ✅ on contract-v2 — write paths use /issues/{id}, NOT /projects/{
   issue.activate         {id, source?}                                        # source: lead_chat|ui|event_binding|system
   issue.submit_plan      {id, planText, blueprintId, source?, cardMessageId?}
   issue.accept_plan      {id, source?}                                        # source: im|explicit|text_card_proxy; default text_card_proxy
-  issue.deliver          {id}
+  issue.deliver          {id, summary?, outcome?, artifacts?, idempotencyKey?}  # structured result requires summary/outcome/key; outcome: success|partial|failed
+  issue.create_revision {id, description, originMessageId, idempotencyKey}      # linked automation revision; server verifies human message
   issue.resume           {id, reason?, source?}                               # human feedback → in_progress
   issue.accept_delivered {id, source?}                                        # source: im|explicit|text_card_proxy; default text_card_proxy
   issue.reassign_owner   {id, newOwnerMemberId (or 'ownerMemberId')}          # change issue owner

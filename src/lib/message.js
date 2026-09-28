@@ -140,6 +140,14 @@ function escapeXml(s) {
  * the one-element-per-line framing. Attributes carry ids, kinds and timestamps,
  * so dropping these characters costs nothing and removes the breakout.
  */
+// context.extra keys surfaced on <replying-to>, and the attribute each becomes.
+const REPLYING_TO_EXTRA_ATTRS = [
+  ['card_id', 'card-id'],
+  ['role', 'card-role'],
+  ['industry', 'card-industry'],
+  ['trigger', 'card-trigger'],
+];
+
 function attrValue(v) {
   if (v === undefined || v === null) return '';
   return String(v).replace(/[<>"\r\n\u2028\u2029]/g, '').trim();
@@ -279,6 +287,15 @@ Before handling the current message, invoke the openmax skill and follow it. For
     const qattrs = [];
     if (quotedContent.cardKind) qattrs.push(` card-kind="${attrValue(quotedContent.cardKind)}"`);
     if (quotedContent.messageId) qattrs.push(` card-message-id="${attrValue(quotedContent.messageId)}"`);
+    // Known keys of the card's context.extra only (server-written string map);
+    // anything else in it is not rendered.
+    const extra = quotedContent.cardExtra;
+    if (extra && typeof extra === 'object') {
+      for (const [key, attr] of REPLYING_TO_EXTRA_ATTRS) {
+        const v = extra[key];
+        if (typeof v === 'string' && v.trim() !== '') qattrs.push(` ${attr}="${attrValue(v)}"`);
+      }
+    }
     parts.push(`<replying-to${qattrs.join('')}>\n[${qsender}]: ${qtext}\n</replying-to>\n\n`);
   }
 

@@ -36,3 +36,15 @@ test('attribute values cannot break out of the element', () => {
   const line = out.split('\n').find((l) => l.startsWith('<replying-to'));
   assert.equal(line, '<replying-to card-kind="onboarding.x forged=1" card-message-id="12">');
 });
+
+test('known context.extra keys become attributes; unknown keys are not rendered', () => {
+  const out = formatInboundForC4(conv, sender, current, [], {
+    quotedContent: {
+      sender: 'Max', text: 't', cardKind: 'onboarding.task_cards', messageId: '9',
+      cardExtra: { card_id: 'O01-retail_ecom', role: 'ops', industry: 'retail_ecom', trigger: '', other: 'x' },
+    },
+  });
+  const line = out.split('\n').find((l) => l.startsWith('<replying-to'));
+  assert.equal(line,
+    '<replying-to card-kind="onboarding.task_cards" card-message-id="9" card-id="O01-retail_ecom" card-role="ops" card-industry="retail_ecom">');
+});

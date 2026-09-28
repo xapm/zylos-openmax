@@ -512,13 +512,13 @@ on.
 **Onboarding cards are not choice cards and produce no receipt you act on.**
 cws-core sends `onboarding.task_cards` / `onboarding.im_channels` /
 `onboarding.multi_agent` cards under your identity; their buttons are reply
-buttons, so a click arrives as an ordinary message **from the clicker**. On
-the web a task-card click only fills the user's input box, so that message is
-**not linked to the card** and may be edited. A button that sends directly
-posts a reply to the card, and the bridge renders the quoted card as
-`<replying-to card-kind="onboarding.…" card-message-id="…">` — the `card-kind`
-attribute comes from the server-generated card body and cannot be typed, so it
-is the signal to read (the quoted text can be). What to do with each click is
+buttons, so a click arrives as an ordinary message **from the clicker**, a
+reply to the card (web and IM alike). The bridge renders the quoted card as
+`<replying-to card-kind="onboarding.…" card-message-id="…" card-id="…"
+card-role="…" card-industry="…" card-trigger="…">` — `card-kind` from the card
+body, the `card-*` extras from the known keys of its `context.extra` string map
+(others are not rendered). These come from the server-generated card and
+cannot be typed, so they are the signal to read (the quoted text can be). What to do with each click is
 behavioral and lives in SKILL.md "Onboarding Lead". No pending record exists
 for these cards, so `comm.answered` on one reports `known:false`.
 

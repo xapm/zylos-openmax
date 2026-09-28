@@ -1217,6 +1217,12 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
           if (qCardKind) {
             quotedContent.cardKind = qCardKind;
             quotedContent.messageId = String(quotedMsgId);
+            // Onboarding cards carry their metadata in context.extra (a string
+            // map written by cws-core: card_id / role / industry / trigger).
+            const qExtra = qStructured.body.context?.extra;
+            if (qExtra && typeof qExtra === 'object' && !Array.isArray(qExtra)) {
+              quotedContent.cardExtra = qExtra;
+            }
           }
         }
       }

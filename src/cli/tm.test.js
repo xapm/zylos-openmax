@@ -6,6 +6,29 @@ import test from 'node:test';
 
 const cliPath = fileURLToPath(new URL('./tm.js', import.meta.url));
 
+test('authorization preview forwards final configuration and update scope', async () => {
+  const configuration = { lead_member_id: 'agent', owner_member_id: 'human', spec: { project_id: 'project', title: 'Task' }, cron_expr: '0 9 * * *' };
+  const request = await captureRequest('automation.authorization_preview', {
+    org: 'org-automation', source_kind: 'timer', operation: 'update', target_binding_id: 'binding-1', expected_version: 3, configuration,
+  });
+  assert.equal(request.method, 'POST');
+  assert.equal(request.url, '/api/v1/automation-authorizations/preview');
+  assert.deepEqual(request.body, { source_kind: 'timer', operation: 'update', target_binding_id: 'binding-1', expected_version: 3, configuration });
+});
+
+for (const [kind, prefix, path] of [['timer', 'event-binding', 'event-bindings'], ['webhook', 'webhook', 'webhooks']]) {
+  for (const operation of ['create', 'update']) {
+    test(`${kind} ${operation} forwards proof and full replacement version`, async () => {
+      const configuration = { lead_member_id: 'agent', owner_member_id: 'human', spec: { project_id: 'project', title: 'Task' } };
+      const proof = { authorization_proposal_message_id: '1790220732844', authorization_confirmation_message_id: '1790220732845' };
+      const request = await captureRequest(`${prefix}.${operation}`, { org: 'org-automation', id: 'binding-1', expected_version: 3, source_kind: kind, configuration, ...proof });
+      assert.equal(request.method, operation === 'create' ? 'POST' : 'PUT');
+      assert.equal(request.url, `/api/v1/${path}${operation === 'create' ? '' : '/binding-1'}`);
+      assert.deepEqual(request.body, { ...configuration, ...proof, ...(operation === 'update' ? { expected_version: 3 } : {}) });
+    });
+  }
+}
+
 test('ordinary delivery preserves the empty-body acceptance workflow', async () => {
   const request = await captureRequest('issue.deliver', { org: 'org-automation', id: 'issue-1' });
   assert.equal(request.method, 'POST');

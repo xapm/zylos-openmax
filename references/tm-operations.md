@@ -165,7 +165,12 @@ Conversations on an Issue / Task, plan explanations, state-change explanations, 
 
 For explicit `automation-create-request` form handoffs, follow
 [Automation Creation](automation-creation.md) before generic Issue intake.
-`event-binding.create` and `webhook.create` accept `{org, source_kind, configuration}`.
+`event-binding.create` and `webhook.create` accept `{org, source_kind, configuration,
+authorization_proposal_message_id, authorization_confirmation_message_id}`.
+Agent calls require the real proposal and quoted human-confirmation IDs.
+Use `automation.authorization_preview {org,source_kind,operation,configuration,
+target_binding_id?,expected_version?}` to render the exact final proposal; send
+its `data.proposal_text` verbatim and obtain a quoted confirmation before writing.
 `source_kind` must match the command (`timer` / `webhook`). The configuration
 accepts only the listed create REST fields; unknown fields are rejected.
 Timers preserve `schedule_kind`, `timezone`, `cron_expr`,
@@ -173,18 +178,22 @@ Timers preserve `schedule_kind`, `timezone`, `cron_expr`,
 and `spec`. Webhooks preserve `lead_member_id`, `owner_member_id`, `spec` and
 `event_filter`. Use `webhook.get {org,id}` to read a webhook configuration.
 The webhook creation result contains a secret `webhook_url`; never put it in
-public output or persistent memory. The CLI sends no create idempotency key.
+public output or persistent memory. The verified confirmation is atomically
+consumed as mutation proof; exact replay returns the original binding without
+rotating or recovering webhook secrets. Keep retries within proof validity.
 `event-binding.list` includes both source kinds; fetch webhook filters with
 `webhook.get` using candidate IDs from that list. `event-binding.delete` also
 soft-deletes webhook bindings, but requires explicit human cleanup authorization.
 
-### Event Binding (4 commands)
+### Event Binding
 
 Scheduled task = `EventBinding(sourceKind=timer)`: when the time comes the platform creates an Issue and dispatches it to the lead (you), and you simply "receive a new Issue" without being aware that you were woken by cron.
 
 | Status | Command | Description | Parameters | Endpoint |
 | --- | --- | --- | --- | --- |
-| ✅ | `event-binding.create` | Create a scheduled task (create-by-agent main path) | `{cronExpr, leadMemberId, ownerMemberId, projectId, title, description?}` | `POST /event-bindings` |
+| ✅ | `event-binding.create` | Create a scheduled task with verified human confirmation | `{org,source_kind:"timer",configuration,authorization_proposal_message_id,authorization_confirmation_message_id}` | `POST /event-bindings` |
+| ✅ | `event-binding.update` | Replace a timer configuration with fresh confirmation | Create fields plus `{id,expected_version}` | `PUT /event-bindings/{id}` |
+| ✅ | `webhook.update` | Replace a webhook configuration with fresh confirmation | Create fields with `source_kind:"webhook"` plus `{id,expected_version}` | `PUT /webhooks/{id}` |
 | ✅ | `event-binding.list` | List the scheduled tasks of this org | `{}` | `GET /event-bindings` |
 | ✅ | `event-binding.get` | Get scheduled task details (view nextTriggerAt) | `{id}` | `GET /event-bindings/{id}` |
 | ✅ | `event-binding.delete` | Delete a scheduled task (stops future triggers, does not affect already-generated Issues) | `{id}` | `DELETE /event-bindings/{id}` |
@@ -194,6 +203,8 @@ create-by-agent guardrails (enforced by cws-work, violations error out directly)
 - `leadMemberId` must = **your own member id** (an agent can only set itself as lead)
 - `ownerMemberId` must = **the member id of that human in the conversation**, and cannot be yourself (owner is the governance responsible party = human)
 - `cronExpr` has 5 fields (minute hour day month weekday)
+- Core must verify the exact final proposal and its quoted human confirmation;
+  direct Agent writes to Work cannot bypass this verification.
 
 ## Typical Usage Scenarios
 
@@ -327,8 +338,12 @@ When a human says in a DM "help me set up a scheduled task", you (the selected l
 #    - how often to run → convert to a 5-field cron (state the timezone assumption clearly)
 #    - which project it belongs to
 #    - what to do when the time comes → title / description, ask for as much context as possible
-# 1) Restate and confirm, then create: leadMemberId=yourself, ownerMemberId=the human in the conversation
+# 1) Obtain server-rendered proposal and quoted human confirmation as described above.
+# 2) Create with those actual message IDs; never use placeholders as proof.
 node src/cli/tm.js event-binding.create '{
+  "org":"<verified organization>",
+  "authorization_proposal_message_id":"<actual proposal message ID>",
+  "authorization_confirmation_message_id":"<actual human reply ID>",
   "cronExpr":"0 9 * * 1",
   "leadMemberId":"<your own member id>",
   "ownerMemberId":"<the conversation human's member id>",
@@ -336,7 +351,7 @@ node src/cli/tm.js event-binding.create '{
   "title":"Weekly cleanup of expired artifacts",
   "description":"Clean up temporary artifacts older than 7 days and output a cleanup report"
 }'
-# 2) Report the result (binding id + nextTriggerAt)
+# 3) Report the result (binding id + nextTriggerAt)
 ```
 
 Key points:

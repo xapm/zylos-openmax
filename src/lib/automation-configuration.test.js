@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { automationConfiguration } from './automation-configuration.js';
+import { automationAuthorizationPreview, automationConfiguration, automationMutation } from './automation-configuration.js';
 
 const base = { lead_member_id: 'agent', owner_member_id: 'human', spec: { project_id: 'project', title: 'Task' } };
 for (const kind of ['timer', 'webhook']) {
@@ -21,3 +21,39 @@ test('wrong-route fields cannot silently disappear, including legacy calls', () 
   }
   assert.throws(() => automationConfiguration({ source_kind: 'timer', configuration: { ...base, event_filter: '' } }, 'timer'), /unsupported/);
 });
+
+test('authorization preview keeps final configuration and operation separate', () => {
+  const configuration = { ...base, cron_expr: '0 9 * * *' };
+  assert.deepEqual(automationAuthorizationPreview({ org: 'org', source_kind: 'timer', operation: 'create', configuration }), {
+    source_kind: 'timer', operation: 'create', target_binding_id: '', expected_version: 0, configuration,
+  });
+  assert.throws(() => automationAuthorizationPreview({ source_kind: 'timer', operation: 'delete', configuration }), /operation/);
+});
+
+test('preview rejects ambiguous scope and lossy update versions', () => {
+  for (const scope of [
+    { operation: 'create', target_binding_id: 'binding' },
+    { operation: 'create', expected_version: 1 },
+    { operation: 'update' },
+    { operation: 'update', target_binding_id: ' ', expected_version: 1 },
+    { operation: 'update', target_binding_id: 'binding', expected_version: '1' },
+    { operation: 'update', target_binding_id: 'binding', expected_version: Number.MAX_SAFE_INTEGER + 1 },
+  ]) {
+    assert.throws(() => automationAuthorizationPreview({ source_kind: 'timer', configuration: base, ...scope }), /preview requires/);
+  }
+});
+
+for (const kind of ['timer', 'webhook']) {
+  test(`${kind} authorization proof is transport metadata, never form configuration`, () => {
+    const proof = { authorization_proposal_message_id: '1790220732844', authorization_confirmation_message_id: '1790220732845' };
+    assert.deepEqual(automationMutation({ source_kind: kind, configuration: base, ...proof }, kind), { ...base, ...proof });
+    assert.throws(() => automationMutation({ source_kind: kind, configuration: { ...base, ...proof } }, kind), /unsupported/);
+    for (const value of [1790220732844, '001', '', 'fake', '1'.repeat(129)]) {
+      assert.throws(() => automationMutation({ source_kind: kind, configuration: base, authorization_proposal_message_id: value }, kind), /canonical decimal/);
+    }
+  });
+  test(`${kind} update preserves expected version and prevents malformed targets`, () => {
+    assert.equal(automationMutation({ id: 'binding', expected_version: 2, source_kind: kind, configuration: base }, kind, 'update').expected_version, 2);
+    assert.throws(() => automationMutation({ source_kind: kind, configuration: base }, kind, 'update'), /update requires/);
+  });
+}

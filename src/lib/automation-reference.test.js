@@ -14,8 +14,9 @@ test('creation reference retains actual same-human latest-plan confirmation safe
   }
 });
 test('uncertain-write instructions retain shared discovery and no blind retry', () => {
-  for (const required of ['Never blindly repeat the POST', 'event-binding.list',
+  for (const required of ['retry the exact same configuration and two message IDs', 'event-binding.list',
     'both timer and webhook bindings', 'list omits webhook `event_filter`',
     'Multiple matches remain uncertain', 'Never delete as automatic recovery',
-    'not a durable CLI confirmation state machine']) assert.ok(reference.includes(required), required);
+    'Work persists and consumes that proof in the same',
+    'The CLI does not itself grant authorization']) assert.ok(reference.includes(required), required);
 });

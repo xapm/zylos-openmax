@@ -26,7 +26,7 @@
 
 import { getForOrg, postForOrg, patchForOrg, putForOrg, delForOrg, apiPath } from '../lib/client.js';
 import { resolveDefaultOrgId } from '../lib/config.js';
-import { automationConfiguration } from '../lib/automation-configuration.js';
+import { automationAuthorizationPreview, automationMutation } from '../lib/automation-configuration.js';
 
 const [command, ...rest] = process.argv.slice(2);
 const params = rest.length ? JSON.parse(rest.join(' ')) : {};
@@ -446,9 +446,12 @@ const COMMANDS = {
   //  否则被 cws-work 护栏拒（lead≠自己 / owner 缺失或=自己）。见 SKILL.md。
   // =========================================================================
 
-  'event-binding.create': () => post(apiPath('/event-bindings'), automationConfiguration(params, 'timer')),
+  'automation.authorization_preview': () => post(apiPath('/automation-authorizations/preview'), automationAuthorizationPreview(params)),
+  'event-binding.create': () => post(apiPath('/event-bindings'), automationMutation(params, 'timer')),
+  'event-binding.update': () => put(apiPath(`/event-bindings/${encodeURIComponent(params.id)}`), automationMutation(params, 'timer', 'update')),
 
-  'webhook.create': () => post(apiPath('/webhooks'), automationConfiguration(params, 'webhook')),
+  'webhook.create': () => post(apiPath('/webhooks'), automationMutation(params, 'webhook')),
+  'webhook.update': () => put(apiPath(`/webhooks/${encodeURIComponent(params.id)}`), automationMutation(params, 'webhook', 'update')),
   'webhook.get': () => get(apiPath(`/webhooks/${encodeURIComponent(params.id)}`)),
 
   'event-binding.list': () => get(apiPath('/event-bindings')),
@@ -525,11 +528,14 @@ ATTEMPT  (all ✅ on contract-v2)
                           blockedOnApprovalRequestIds?}
 
 EVENT BINDING  (定时任务 / create-by-agent)
-  event-binding.create   {org, source_kind:"timer", configuration} # supported REST body; cron/once/interval + timezone
+  automation.authorization_preview {org, source_kind, operation, configuration, target_binding_id?, expected_version?}
+  event-binding.create   {org, source_kind:"timer", configuration, authorization_proposal_message_id?, authorization_confirmation_message_id?}
+  event-binding.update   {org, id, expected_version, source_kind:"timer", configuration, authorization_proposal_message_id, authorization_confirmation_message_id}
                          Legacy: {cronExpr, leadMemberId, ownerMemberId, projectId,
                           title, description?}                                   # agent: leadMemberId=自己, ownerMemberId=对话人类
   event-binding.list     {}                                                     # 本 org 的定时任务
-  webhook.create         {org, source_kind:"webhook", configuration} # {lead_member_id, owner_member_id, spec, event_filter?}
+  webhook.create         {org, source_kind:"webhook", configuration, authorization_proposal_message_id?, authorization_confirmation_message_id?}
+  webhook.update         {org, id, expected_version, source_kind:"webhook", configuration, authorization_proposal_message_id, authorization_confirmation_message_id}
   webhook.get            {org, id}
   event-binding.get      {id}
   event-binding.delete   {id}                                                   # 停止后续触发, 不影响已生成的 Issue

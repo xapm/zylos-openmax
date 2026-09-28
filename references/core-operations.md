@@ -132,10 +132,10 @@ A platform agent = an org-scoped bot member row; like a human member it occupies
 
 | Status | Command | Description | Input | Real Endpoint |
 | --- | --- | --- | --- | --- |
-| ✅ | `core.onboarding_session` | The org's onboarding lifecycle record; `core_issue_id`=the core conversation Issue, `project_id`=the onboarding project; 404=never started | `{}` | `GET /api/v1/onboarding/session` |
+| ✅ | `core.onboarding_session` | The org's onboarding lifecycle record; `core_issue_id`=the core conversation Issue, `project_id`=the onboarding project; `role_key` / `industry` = the first Agent's preset role and org industry (Onboarding v2, omitted otherwise); `opening_mode:"task_cards"` = the platform sends the onboarding guide cards and you must not run the interview (omitted = legacy flow; see SKILL.md "Onboarding Lead"); 404=never started | `{}` | `GET /api/v1/onboarding/session` |
 | ✅ | `core.onboarding_event` | Funnel event reporting; only callable by the lead agent of an in-progress session; duplicate reports are absorbed by the server's unique index (idempotent 200, `recorded=false`) | `{eventType, occurredAt?, meta?}` | `POST /api/v1/onboarding/events` |
 
-`eventType` only permits `d1_activation` (used at the core Issue ice-breaking stage when the user has replied ≥1 round) / `d3_im_connected` (third-party IM binding succeeded); `d7_first_delivery` is set automatically by the server when the core Issue is accepted, and self-reporting it will be rejected with 422. The startup self-report (`online-report`) is sent automatically by comm-bridge on startup and does not need to be called manually.
+`eventType` only permits `d1_activation` (used at the core Issue ice-breaking stage when the user has replied ≥1 round) / `d3_im_connected` (third-party IM binding succeeded); `d7_first_delivery` is set automatically by the server when the core Issue is accepted, and self-reporting it will be rejected with 422. In the guide-card flow `d1_activation` is reported on the user's first message in the onboarding DM (a card click counts). The onboarding cards themselves (`onboarding.task_cards` / `onboarding.im_channels` / `onboarding.multi_agent`) are sent and tracked by cws-core under your identity — there is no Agent-side command to send them or to record a click or a decline. The startup self-report (`online-report`) is sent automatically by comm-bridge on startup and does not need to be called manually.
 
 ## Typical Flow: Lead Decides and Dispatches
 

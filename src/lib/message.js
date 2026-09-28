@@ -271,7 +271,15 @@ Before handling the current message, invoke the openmax skill and follow it. For
   if (quotedContent && !(threadContext && threadContext.length > 0)) {
     const qsender = escapeXml(quotedContent.sender || quotedContent.senderName || 'unknown');
     const qtext   = escapeXml(quotedContent.text   || quotedContent.content    || '');
-    parts.push(`<replying-to>\n[${qsender}]: ${qtext}\n</replying-to>\n\n`);
+    // A reply to a card carries the card's kind and message id as attributes.
+    // Both come from the server-generated card body (raw card writes are refused
+    // by cws-comm), so unlike the quoted text they cannot be typed by the sender
+    // of the reply. Onboarding cards (`onboarding.*`, sent by cws-core under the
+    // agent's identity) are recognized by this element — see SKILL.md.
+    const qattrs = [];
+    if (quotedContent.cardKind) qattrs.push(` card-kind="${attrValue(quotedContent.cardKind)}"`);
+    if (quotedContent.messageId) qattrs.push(` card-message-id="${attrValue(quotedContent.messageId)}"`);
+    parts.push(`<replying-to${qattrs.join('')}>\n[${qsender}]: ${qtext}\n</replying-to>\n\n`);
   }
 
   if (smartHint) {

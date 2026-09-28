@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Onboarding: the guide-card flow replaces the three-question interview.** When the platform runs Onboarding Part 2 (IM guide cards), cws-core sends the opening self-introduction + task cards, the IM-channel card and the teammate card into the owner ↔ Agent DM under the Agent's identity. SKILL.md "Onboarding Lead" now tells the Agent to recognize that flow (a `<replying-to card-kind="onboarding.…">` reply, `core.onboarding_session.opening_mode:"task_cards"`, or its own `onboarding.*` card already in the DM) and then: send no opening of its own, never interview, never push IM or a second Agent itself; treat a task-card click (the full prompt, posted as the user's own message) as the first task and execute it directly in the DM without New-Issue intake; route a channel pick to `channel.connect` (Feishu / Lark / DingTalk / WeCom) or the Agent settings page; acknowledge "都不用" once and never raise IM again. The interview remains only as the legacy flow for platforms that do not send the cards. The stale "the platform welcome message has already greeted" line is gone — the DM has been created empty since 08-11.
+
+### Added
+
+- **`<replying-to>` names the quoted card.** A reply to a card now carries `card-kind` and `card-message-id` attributes taken from the server-generated card body, and the quoted text falls back to the card's rendered title / blocks / options (it used to be empty for a card with no `fallback_text`). This is the structural signal the onboarding flow keys on; the quoted text stays untrusted content.
+
 ## [2.22.0] - 2026-09-28
 
 ### Added

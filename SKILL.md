@@ -331,7 +331,7 @@ Rule of thumb for judging simple/complex: a single output that one agent can com
 
 ## Onboarding Lead (a new Agent's first conversation with its owner)
 
-- **Trigger**: a system message whose text contains `ref: event=onboarding.start`, or an owner message in the owner ↔ you DM while `core.onboarding_session {}` returns your record (404 = no onboarding, handle normally). **Load `references/onboarding-lead.md` and follow it.**
+- **Trigger**: a system message whose last line is `ref: event=onboarding.start onboarding=<record_id> owner=<owner_member_id>`, or an owner message in the owner ↔ you DM while `core.onboarding_session {}` returns your record (404 = no onboarding, handle normally). **Load `references/onboarding-lead.md` and follow it.**
 - You send the onboarding cards yourself (self-intro + 3 task cards, IM card, teammate card), each only when due and only after checking the events already recorded in the session; you never interview the user.
 - The owner's first task (a picked task card or a typed work request) is done directly in the DM — no New-Issue intake, no onboarding Project / Issue.
 

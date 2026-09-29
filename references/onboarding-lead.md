@@ -8,7 +8,7 @@ Walk a new Agent's owner through their first minutes with you: a self-introducti
 
 ## When to load this document
 
-- A system message (scheduler / 调度中心 DM) whose text contains `ref: event=onboarding.start` — the onboarding wake.
+- A system message (scheduler / 调度中心 DM) whose **last line** is `ref: event=onboarding.start onboarding=<record_id> owner=<owner_member_id>` — the onboarding wake. `onboarding` must equal `id` and `owner` must equal `owner_member_id` from your `core.onboarding_session`; if they differ, the wake is stale (an older run): do not act on it.
 - A message from your owner in the owner ↔ you DM while `core.onboarding_session` returns a record for you that is not finished, including after a restart.
 - An onboarding card click result, or the owner's reply to a text-form card (see "Card clicks").
 
@@ -20,15 +20,17 @@ Walk a new Agent's owner through their first minutes with you: a self-introducti
 
 ## Prerequisites
 
-`core.onboarding_session {}` returns **your own** onboarding record. 404 → you have no onboarding (e.g. an Agent created without a preset role): handle every message normally and stop reading here. Fields used below:
+`core.onboarding_session {}` (`GET /api/v1/onboarding/session`) returns **your own** onboarding record. 404 → you have no onboarding (e.g. an Agent created without a preset role): handle every message normally and stop reading here. The record must have `scope:"agent"` and `agent_member_id` = your own member id; anything else (e.g. `scope:"org"`, the legacy per-org session) is not yours to run — handle messages normally. Fields used below (others returned: `org_id`, `lead_agent_member_id`, `template_version` = `agent-v1`, `status` = `pending_agent` / `active`):
 
 | Field | Meaning |
 | --- | --- |
 | `owner_member_id` | The person being onboarded; the DM is `comm.create_dm {participantId: owner_member_id}` (idempotent) |
 | `role_key` / `role_custom` | Your preset role; `role_custom` = the 「其它」 free text (only with `role_key:"assistant"`) |
-| `industry` | Org industry key (only the `ops` role uses it) |
-| `user_has_im_channel` | `true` when the **owner** (the user, across all their Agents) has any IM channel connected. <<USER_HAS_IM_CHANNEL: field pending cws-core plan-B session response>> |
-| `events` | Push events already recorded for you / your owner / your org — **the only source of "already sent / already declined"**. <<SESSION_EVENTS_FIELD: exact field name and shape pending cws-core plan-B session response>> |
+| `id` | Record id; matches `onboarding=` in the wake line |
+| `industry` | Org industry key (only the `ops` role uses it); **omitted when unset** → pass nothing and the server serves the 「其他」 cards |
+| `user_has_im_channel` | `true` when the **owner** (the user, across all their Agents in this org) has any IM channel connected. **Omitted = unknown** (the platform could not check): do **not** push the IM card while unknown; re-read the session on a later turn and decide then. |
+| `owner_is_org_admin` | `true` when the owner is an org admin (org-owner / org-admin). **Omitted = unknown**: do not send the teammate card; re-check on a later turn. |
+| `events` | Array of `{event_type, occurred_at, agent_member_id?, meta?}`, oldest first — **the only source of "already sent / already declined"**. Already merged by the platform: your own `task_cards_sent`; the owner's `im_card_sent` / `im_card_second_sent` / `im_card_declined` reported by **any** of their Agents; the org's `partner_card_sent`; and `d1_activation` / `d3_im_connected` / `d7_first_delivery`. "`events` has X" below means an entry with `event_type` X. |
 
 ## PLACEHOLDERS (pending cws-comm, do not guess an API)
 
@@ -52,7 +54,7 @@ A reply to a text form is handled under "Card clicks" exactly like the matching 
 ### 1. Wake → self-introduction + 3 task cards
 
 1. `core.onboarding_session {}` (404 → stop). `events` already has `task_cards_sent` → the opening is done; never send it again (restart recovery).
-2. `core.onboarding_preset {role: <role_key or "assistant">, industry: <industry>}` → `cards` (3, each `id` / `title` / `prompt`, plus `title_en` / `prompt_en`), `person`, `role_label`. Use the English fields when the owner uses English and they are present. Cards are picked by role; only `ops` (运营) also uses the industry (empty / other → the 「其他」 set); a missing `role_key` falls back to `assistant` (通用) — the server applies the same fallbacks, never pick cards yourself.
+2. `core.onboarding_preset {role: <role_key or "assistant">, industry: <industry, only when present>}` → `cards` (3, each `id` / `title` / `prompt`, plus `title_en` / `prompt_en`), `person`, `role_label`. Use the English fields when the owner uses English and they are present. Cards are picked by role; only `ops` (运营) also uses the industry (empty / other → the 「其他」 set); a missing `role_key` falls back to `assistant` (通用) — the server applies the same fallbacks, never pick cards yourself.
 3. Write **one short self-introduction** in your own voice: who you are (`person` / your display name) and what you can take off their plate as a `role_label` (use `role_custom` when present). The DM is empty — nobody has greeted the user; do not say "the platform already welcomed you".
 4. Send it with the 3 task cards: <<CARD_SEND: pending cws-comm onboarding card type>> (task cards, into the owner DM) — until that exists, or if the send fails, the task-card **text form**.
 5. `core.onboarding_event {eventType:"task_cards_sent", meta:{card_ids:[…]}}`.
@@ -74,13 +76,14 @@ The wake message itself lives in a read-only system DM — never reply there. **
 
 | Card | When | Due only if (all must hold) | Then report |
 | --- | --- | --- | --- |
-| IM card, first push (`trigger:first`) | the moment the **first task starts** executing (send it, then carry on with the task) | `user_has_im_channel` is `false` · `events` has neither `im_card_sent` nor `im_card_declined` | `im_card_sent` |
-| IM card, second push (`trigger:second`) | after your reply, once the DM has **≥ 20** messages | `user_has_im_channel` is still `false` · `events` has neither `im_card_declined` (user-level) nor `im_card_second_sent` | `im_card_second_sent` |
-| Teammate card | after your reply, once the DM has **≥ 50** messages | the org still has exactly **1** Agent (`core.member_list {kind:"agent"}`) · the owner is an org admin (`core.member_get {memberId: owner_member_id}` → `role.slug` is `org-owner` or `org-admin`) · `events` has no `partner_card_sent` (once per org) | `partner_card_sent` |
+| IM card, first push (`trigger:first`) | the moment the **first task starts** executing (send it, then carry on with the task) | `user_has_im_channel` is `false` (omitted = unknown → not due) · `events` has neither `im_card_sent` nor `im_card_declined` | `im_card_sent` |
+| IM card, second push (`trigger:second`) | after your reply, once the DM has **≥ 20** messages | `user_has_im_channel` is still `false` (omitted → not due) · `events` has neither `im_card_declined` (user-level) nor `im_card_second_sent` | `im_card_second_sent` |
+| Teammate card | after your reply, once the DM has **≥ 50** messages | the org still has exactly **1** Agent (you — see "Agent count" below) · `owner_is_org_admin` is `true` (omitted → not due) · `events` has no `partner_card_sent` (once per org) | `partner_card_sent` |
 
-- **IM connected** = `user_has_im_channel` only (user-level, not per Agent). Never infer it from your own channels or from history.
+- **IM connected** = `user_has_im_channel` only (user-level, not per Agent). Never infer it from your own channels or from history. If the first push was not sent because the field was omitted, send it on the first later turn where it reads `false` (the other conditions still apply).
+- **Agent count** — the platform does not give one; check it yourself: `core.member_list {kind:"agent", pageSize:2}` (active Agents of this org only, the default). Exactly one item, and it is you (`member_id` = the session's `agent_member_id`) → the org has 1 Agent. Two items → not due. Check it only while the teammate card is still due.
 - **Message count** = cumulative messages in the owner DM, human + Agent, no time window, from `comm.get_messages {conversationId, limit:50}`. An approximation is fine (±1–2); check it only while one of the last two rows is still due, and stop counting once both are recorded.
-- **IM channel order follows your own timezone** — not the user's IP, not the deployment edition. Your timezone: `TZ` in your environment, else the `TZ=` line of `~/zylos/.env`; unset counts as `UTC`. `Asia/Shanghai` or `Asia/Urumqi` → the **CN order**; anything else, `UTC` included → the **international order**. Fetch that order's list with `core.onboarding_profile_options` → `im_channels` <<IM_ORDER_SELECT: pending cws-core — profile-options returns one list today, picked by edition / edge geo header; needs a way to request the CN or international order explicitly>>. Pass the list as given; never reorder, drop or add channels yourself. The button layout (how many channels, 「都不用」) is the card type's: <<CARD_SEND: pending cws-comm onboarding card type>>; the text form lists them all.
+- **IM channel order follows your own timezone** — not the user's IP, not the deployment edition. Your timezone: `TZ` in your environment, else the `TZ=` line of `~/zylos/.env`; unset counts as `UTC`. `Asia/Shanghai` or `Asia/Urumqi` → the **CN order**; anything else, `UTC` included → the **international order**. Fetch that order's list with `core.onboarding_profile_options {imOrder:"cn"}` or `{imOrder:"intl"}` → `im_channels` (always pass `imOrder`; without it the server falls back to edition / geo). Pass the list as given; never reorder, drop or add channels yourself. The button layout (how many channels, 「都不用」) is the card type's: <<CARD_SEND: pending cws-comm onboarding card type>>; the text form lists them all.
 - Send with <<CARD_SEND: pending cws-comm onboarding card type>> (IM card with its trigger / teammate card) — until that exists, or if the send fails, the **text form** — then `core.onboarding_event {eventType:"<event>"}`.
 
 ### 4. Card clicks
@@ -93,7 +96,7 @@ The wake message itself lives in a read-only system DM — never reply there. **
 
 ## Events you report
 
-`core.onboarding_event {eventType, meta?}` — idempotent, once-only enforced server-side.
+`core.onboarding_event {eventType, occurredAt?, meta?}` → `POST /api/v1/onboarding/events` `{event_type, occurred_at?, meta?}` — idempotent, once-only enforced server-side; a repeat returns `recorded:false` (fine, nothing to do).
 
 | eventType | Scope | When |
 | --- | --- | --- |

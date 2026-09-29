@@ -188,11 +188,12 @@ const COMMANDS = {
   }),
   'core.platform_agent_delete': () => odel(apiPath(`/platform-agents/${params.memberId}`)),
 
-  // ✅ Onboarding session — the calling Agent's own onboarding record: owner,
-  // preset role (role_key / role_custom), org industry, status, and the push
-  // events already recorded (task / IM / teammate cards, IM decline) that the
-  // Agent checks before sending any onboarding card. 404 = no onboarding for
-  // this Agent. See references/onboarding-lead.md.
+  // ✅ Onboarding session — the calling Agent's own onboarding record
+  // (scope:"agent"): owner, preset role (role_key / role_custom), org industry
+  // (omitted when unset), user_has_im_channel / owner_is_org_admin (omitted =
+  // unknown), and `events` [{event_type, occurred_at, agent_member_id?, meta?}]
+  // — the push records the Agent checks before sending any onboarding card.
+  // 404 = no onboarding for this Agent. See references/onboarding-lead.md.
   'core.onboarding_session': () => oget(apiPath('/onboarding/session')),
 
   // ✅ Onboarding preset — default name / persona / the three opening task
@@ -205,10 +206,12 @@ const COMMANDS = {
 
   // ✅ Onboarding profile options — option lists incl. `im_channels`. The IM
   // card's channel order is chosen by the Agent's own TZ (Asia/Shanghai or
-  // Asia/Urumqi → CN order, else international); the server today returns one
-  // list picked by edition / edge geo header, so selecting the order
-  // explicitly is pending on cws-core (see references/onboarding-lead.md).
-  'core.onboarding_profile_options': () => oget(apiPath('/onboarding/profile-options')),
+  // Asia/Urumqi → cn, else intl) and requested with `imOrder` (?im_order=);
+  // without it the server falls back to edition / geo. Any other value is a
+  // server-side 400. See references/onboarding-lead.md.
+  'core.onboarding_profile_options': () => oget(apiPath('/onboarding/profile-options'), {
+    im_order: params.imOrder || params.im_order,
+  }),
 
   // ✅ Onboarding event report. Self-reportable types: d1_activation (owner's
   // first message in the onboarding DM), d3_im_connected (IM channel linked),
@@ -336,7 +339,7 @@ Projects (directory view — workflow ops live in tm.js)
 Onboarding (see SKILL.md "Onboarding Lead" → references/onboarding-lead.md)
   core.onboarding_session  {}                                  # 本 Agent 的引导记录：岗位、行业、用户是否已接 IM、已记录的推送节点；404=无引导
   core.onboarding_preset   {role, industry?}                   # 按岗位（运营按行业）取 3 张开场任务卡 + 人设
-  core.onboarding_profile_options {}                           # 选项表；im_channels = IM 渠道顺序（按本 Agent 时区选国内/国际顺序，见 onboarding-lead）
+  core.onboarding_profile_options {imOrder?}                   # 选项表；imOrder=cn|intl 指定 im_channels 顺序（按本 Agent 时区选，见 onboarding-lead）
   core.onboarding_event    {eventType, occurredAt?, meta?}     # 上报：d1_activation|d3_im_connected|task_cards_sent|im_card_sent|im_card_second_sent|im_card_declined|partner_card_sent；重复上报幂等
 
 Organizations

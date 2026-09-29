@@ -219,3 +219,27 @@ test('Bug A: as.js as.url {org} carries THAT org\'s JWT on /artifacts/resolve (n
     await new Promise((r) => server.close(r));
   }
 });
+
+// core.onboarding_profile_options passes the Agent's timezone-picked IM order
+// as ?im_order=, and sends no im_order when none is given (server falls back
+// to edition / geo).
+for (const c of [
+  { params: { org: 'org-1', imOrder: 'cn' }, expect: 'im_order=cn' },
+  { params: { org: 'org-1', im_order: 'intl' }, expect: 'im_order=intl' },
+  { params: { org: 'org-1' }, expect: null },
+]) {
+  test(`core.onboarding_profile_options ${JSON.stringify(c.params)} → ${c.expect ?? 'no im_order'}`, async () => {
+    const home = setupMultiOrgHome({ agent: { api_key: 'cwsk_test' } });
+    const { server, seen } = tokenHarness((u) => u.includes('/onboarding/profile-options'));
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    try {
+      const r = await runRealToken(home, 'core.js', 'core.onboarding_profile_options', c.params, `http://127.0.0.1:${server.address().port}`);
+      assert.equal(r.code, 0, r.stderr);
+      if (c.expect) assert.match(seen.url, new RegExp(`[?&]${c.expect}(&|$)`));
+      else assert.doesNotMatch(seen.url, /im_order/);
+    } finally {
+      await new Promise((r) => server.close(r));
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+}

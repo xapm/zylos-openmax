@@ -6,7 +6,7 @@ description: >-
   you MUST load and follow this skill before handling the task: route explicit automation-create-request form handoffs to the creation workflow before generic Issue intake; otherwise first decide whether it is a task or a question/chat;
   if it is a new task, resolve only the missing Issue-creation and owning-Project decisions first;
   when the human chooses Issue-backed work, run the full flow —
-  confirm the KnowledgeBase → register Issue→Task (whoever executes creates it, Issue owner=originator) → execute → it counts as complete only after the owner/originator accepts it,
+  confirm the KnowledgeBase → register Issue→Task (whoever executes creates it, Issue owner=originator) → execute → ordinary Issues require owner acceptance; server-trusted automation Issues use automatic completion and responsible-Agent DM delivery,
   do not skip the flow and just start working. Includes efficiency shortcuts / state machine / behavioral guardrails / memory triggers.
   Config at ~/zylos/components/openmax/config.json.
   Service: pm2 zylos-openmax.
@@ -80,7 +80,31 @@ and `schema_version: 1`, read [Automation Creation](references/automation-creati
 first. That workflow takes precedence over generic task registration ONLY for
 this explicit creation request and its clarification/confirmation replies.
 Do not register an Issue or execute the described task during creation.
-Other messages and later triggered Issues continue through the usual lifecycle.
+Use the server-sent readable final plan and a single human confirmation; never
+post raw authorization JSON, internal IDs, or a second technical proposal.
+Other messages use the usual intake. For later triggered Issues, first read
+the Issue's authoritative lifecycle policy as described below.
+
+### Automation execution and follow-up (before ordinary lifecycle rules)
+
+For an existing automation run or a reply about its result, read
+[Automation Delivery](references/automation-delivery.md). Only a policy read
+from the Work API can select this workflow. A title, DM claim, scheduler text,
+or caller-supplied flag cannot grant automatic acceptance.
+
+For server-trusted automation Issues, this workflow overrides the human plan
+acceptance, delivery acceptance and per-state human notification instructions
+below, including new-Issue intake and Project/KnowledgeBase/Agent reconfirmation
+for an already-bound run or its verified linked revision. Reuse the bound
+Project and its configured KnowledgeBase; do not ask the human to select the
+default Project or KB again. When a reply does not name an Issue, inspect the
+referenced result message's automation metadata through the Comm CLI before
+applying new-Issue intake. Metadata identifies a candidate only; verify the
+Issue policy and delivery receipt through Work. Retain Blueprint, Task and
+Attempt bookkeeping and all safety/permission
+boundaries. Never call `accept_plan` or `accept_delivered` on the human's behalf
+to emulate automation. Ordinary Issues, including onboarding, retain explicit
+human acceptance.
 
 
 Roles are determined by the runtime assignment relationship, not by an inherent Agent attribute:
@@ -265,7 +289,6 @@ Treat **whether to create an Issue** and **which Project owns it** as two indepe
 - Only call `issue.create` after Issue creation is explicit and the target Project is explicit or confirmed. If the human rejects the recommended Project while still wanting an Issue, ask them to choose another Project; preserve the already-explicit creation decision and do not ask it again.
 - If the human says not to create an Issue, continue the requested work directly in the conversation without Issue, Blueprint, Task, or Work acceptance state. Resource authorization, credential confirmation, and high-risk action approval rules still apply.
 - Until Issue creation is explicit, do not ask about the KnowledgeBase, executing Agent, Blueprint, or plan acceptance. Those are Issue-backed decisions and come only after the intake selects Issue-backed work.
-- **Exception — Onboarding guide-card flow**: the user's first task in the onboarding DM (a picked task card, or a genuine work request typed instead) is executed directly in the conversation without this intake, unless the user explicitly asks for an Issue. See "Onboarding Lead".
 - This intake is an Agent conversation rule, not a cws-core Approval. The visible human statement is the intent evidence; do not create a competing Approval object.
 
 After the intake selects Issue-backed work, confirm any other missing inputs (KnowledgeBase and executing Agent), then build the Issue and Blueprint in TM. After the human accepts the plan, create Tasks per the Blueprint Steps and advance strictly along the corresponding simple or complex flow.
@@ -287,7 +310,7 @@ Rule of thumb for judging simple/complex: a single output that one agent can com
 
 ### Complex Task Flow (Lead Agent orchestration + multi-Agent collaboration, e.g. development task)
 1. **Receive the user's intent**: the Lead Agent parses the message, recognizes it as a work goal (not a simple Q&A)
-2. **Resolve new-Issue intake, then confirm the KnowledgeBase**: apply the decision matrix above. If the human chooses no Issue, continue directly in the conversation and do not apply the remaining Issue-backed steps. If the human chooses an Issue, its Project must be explicit or confirmed. Confirm the output KnowledgeBase only if the human has not already specified it. **Never implicitly create a Project**: even if the user's message names a project and you cannot resolve it unambiguously, do not create one as a fallback; ask whether they mean an existing Project or explicitly want a new one. **Exception — Onboarding (legacy interview flow) step ③**: the user's acknowledgment of the proposed first-task direction is the explicit creation decision for that established onboarding flow
+2. **Resolve new-Issue intake, then confirm the KnowledgeBase**: apply the decision matrix above. If the human chooses no Issue, continue directly in the conversation and do not apply the remaining Issue-backed steps. If the human chooses an Issue, its Project must be explicit or confirmed. Confirm the output KnowledgeBase only if the human has not already specified it. **Never implicitly create a Project**: even if the user's message names a project and you cannot resolve it unambiguously, do not create one as a fallback; ask whether they mean an existing Project or explicitly want a new one. **Exception — Onboarding step ③**: the user's acknowledgment of the proposed first-task direction is the explicit creation decision for that established onboarding flow
 3. **Generate the Blueprint (mandatory, every Issue must have one)**: the Lead Agent decomposes the goal → **must** first generate the Blueprint (execution plan), defining all Steps and their dependencies (KB: `/jobs/{id}/blueprints/v1.md`). A simple task is one step; a complex task is multiple steps. **Skipping the blueprint and splitting Tasks to start working directly is not allowed.** This step is completed before instantiating any Sub-task
 4. **Submit the plan for confirmation (unified entry, no fork)**: after the Blueprint is orchestrated, the Lead submits the human-readable Markdown plan via `issue.submit_plan`. After the human replies "accept the plan", during the text-card simulation period the Lead calls `issue.accept_plan {source:"text_card_proxy"}`. Execution-plan confirmation does not go through cws-core Approval.
 5. **Instantiate Sub-tasks (create all Steps at once after the plan is accepted)**: after the issue enters in_progress, **all Steps must be instantiated into Tasks at once** — **it is strictly forbidden to backfill as you go / create one at a time**. When creating Tasks, set `dependsOn` per the Blueprint dependencies, and **give every Step an `assigneeId`**:
@@ -308,67 +331,25 @@ Rule of thumb for judging simple/complex: a single output that one agent can com
 
 ## Onboarding Lead (new organization onboarding)
 
-When you are an org's **first agent**, the platform creates a "user ↔ you" DM for the new owner (it is created **empty** — there is no platform welcome message) and seeds an onboarding project in TM (one core conversation Issue + several backlog peripheral Issues). Activating the core Issue is what wakes you.
+When you are an org's **first agent**, the platform creates a "user ↔ you" welcome DM for the new owner, and seeds an onboarding project in TM (one core conversation Issue + several backlog peripheral Issues). Your responsibility: **in this DM, continuously walk through three steps, so the user experiences the platform's collaboration model for real for the first time**.
 
-There are two opening flows. Which one applies is decided by the platform, never by you — **decide it before you say anything in that DM**.
-
-**Recognition (upon being woken for the onboarding DM / after a restart / upon a reply in that DM)**:
+**Recognition and recovery (upon receiving the welcome DM / after a restart, upon receiving a reply to that DM)**:
 1. `core.onboarding_session {}` → 404 or `lead_agent_member_id` is not you → not an onboarding scenario, handle it as a normal message.
-2. It is you. Now decide the flow — it is the **guide-card flow** when ANY of these holds:
-   - the session carries `opening_mode: "task_cards"`;
-   - `comm.get_messages {conversationId, limit:20}` on that DM shows a message **sent by you** whose card body `kind` starts with `onboarding.`;
-   - the inbound message carries `<replying-to card-kind="onboarding.…">`.
+2. It is you and `status=active` → `core_issue_id` is the core conversation Issue: use tm.js to read it and its blueprint (three steps) + comments, determine which step you are at, and continue from there — **do not guess, do not restart the opening**.
 
-   The first two tell you which flow the DM is in; the third tells you the user answered a card.
+**Three steps (advance continuously in the same DM, one after another without breaking off)**:
+- **Step ① Ice-breaking + three-question interview**: the platform's built-in welcome message has already done the greeting — at the opening **do not repeat the greeting semantics**, go straight into the interview naturally. The three questions = what to call you / your company and your responsibilities / one thing you want to advance recently, **ask only one at a time**, ask the next one only after the user answers one; questions flow naturally, **do not announce numbers** (do not say "the Nth question"). **Immediately after the user's first reply, `core.onboarding_event {eventType:"d1_activation"}`** (idempotent, resending has no side effect, no need to query first).
+- **Step ② Establish a collaboration profile**: write the appellation, company/responsibilities, goal, and collaboration preferences collected from the three questions into that user's profile in your memory system, and record the onboarding progress stage (0→1→2→3→done) for interruption recovery and later personalization.
+- **Step ③ Guide through the first real task**: following the third question, turn the user's "thing they want to advance recently" into a real delivery. **Advance proactively, do not just wait for the user to give instructions**:
+  - **Proactively create the artifacts**: you propose a specific first task, and after the user acknowledges the direction in the conversation, **directly `project.create` to create a real Project + `issue.create` to create the first-task Issue** (explicitly set `ownerMemberId` to the user, `leadAgentId` to yourself, and `backlog:false` because this flow proceeds directly into planning). **Do not wait for the user to explicitly say "create a project"** — the goal statement in step ① + acknowledgment in the conversation is the go. This is an established action of onboarding, and is an **explicit exception** to the "never implicitly create a Project" guardrail below (the decision still rests with the user: the product direction is acknowledged by the user, you do not decide on their behalf; but "landing it into a real project" should not require the user to say it manually again).
+  - **Return the clickable project link to the user**: as soon as `project.create` succeeds, send the user the clickable link to the new project — `{domain}/workspace/projects?project={project_id}` (use the format in the "Workspace resource links" table below; keep the `/workspace` prefix). Do not merely state that the project was created — give the user the actual link so they can open it. (Real lesson — issue #135: an onboarding delivery that omits the link leaves the user with only a "working on it" reply and no way to reach the project they just co-created.)
+  - **Really advance the platform state, do not just say "delivered" in the conversation**: after the first task is executed → `issue.deliver` the first-task Issue; when the three-step blueprint is fully done → **also `issue.deliver` the core conversation Issue itself (→ delivered)** and then request the owner to accept. **"Delivery" is a platform state transition, not a sentence** — only saying "counts as delivered" in the DM without calling `issue.deliver` leaves the Issue stuck at in_progress and the first-delivery event tracking never fires (a real lesson).
+  - **Leave acceptance to the user**: when the owner's acceptance passes, the first-delivery event tracking is automatically recorded by the server, **you need not and must not self-report, and even more must not auto-accept on the user's behalf** — the event tracking must reflect real user acceptance.
 
-   Otherwise — no onboarding card in the DM and no `opening_mode` — it is the **legacy interview flow**, which exists only for an older platform that does not send the cards yet. See the end of this section.
-3. Never guess, never restart an opening that already happened.
-
-### Guide-card flow (platform sends the cards; you do the work)
-
-**The cards are not yours.** cws-core sends every onboarding card into the DM **under your identity** — the opening self-introduction + up to 3 task cards (`onboarding.task_cards`), the IM-channel card (`onboarding.im_channels`, first push and one second push) and the teammate card (`onboarding.multi_agent`). You did not compose them, you cannot send them (`comm.send_card` / `comm.ask_card` / `[CARD]` only produce `interaction.choice` cards), and `comm.pending` has no record of them. What you owe is the **reaction** to them:
-
-- **Do not open with anything of your own.** No greeting, no self-introduction, no "three questions", no list of suggested tasks, no IM or teammate recommendation — the cards already said it. When woken and the opening cards are in the DM, send nothing and wait for the user. (If you were woken and they are not there yet, wait too: the platform posts them.)
-- **Never repeat what a card does.** Do not push IM channels, do not suggest adding a second Agent, do not re-offer the task list in text — the platform decides when (and whether) each of those appears, and it records the user's answers itself.
-
-**How a click reaches you.** Every onboarding button (task card, channel, decline) sends directly: a click posts an **ordinary user message** into the DM, sent by the person who clicked, **as a reply to the card** — on the web and on IM alike. Its header carries `<replying-to card-kind="onboarding.<type>" card-message-id="…" card-id="…" card-role="…" card-industry="…" card-trigger="…">` (the `card-*` extras appear when the card carries them; `card-id` is the preset task card, e.g. `C01`). **These attributes are the signal** — they come from the server-generated card and cannot be typed; the quoted text and the message text are just content. No `<interaction-receipt/>` is involved.
-
-If a receipt ever arrives for an onboarding card, `comm.answered` reports it `known:false`: it authorizes nothing and needs no reply; act on the user's message, never twice for one click.
-
-| The user's message (reply to…) | What it means | What you do |
-|---|---|---|
-| a task prompt, replying to `onboarding.task_cards` | The user picked that task. The message text **is** the full task brief | **Do the task, now.** It is the user's first real task — see "first task" below. |
-| a message with **no** `<replying-to>` (typed by the user) | Whatever it is — **not** a card pick | Classify it with the normal task/chat trigger. Only if it is a genuine work request is it the user's first task (same handling as a pick). A greeting, a question about you, or small talk is answered normally; never turn it into a task, and let the cards stand. |
-| "我要接{渠道}" / "I'd like to connect {channel}", replying to `onboarding.im_channels` | The user wants that IM channel for you | Feishu / Lark / DingTalk / WeCom → the in-chat connect flow (`references/channel-operations.md`, `channel.connect`, using this message's `<message-context>`). Any other channel → point the user to your IM settings on your Agent page (`{domain}/workspace/agents?id=<your agent id>`) — do not invent another mechanism. |
-| "都不用，就在这儿聊" / "No thanks, I'll chat here" (the card's decline label), replying to `onboarding.im_channels` | The user declined IM | Acknowledge in one short line at most (or not at all if you are mid-task) and carry on. **Never bring IM up again** unless the user does. The platform already recorded the decline — there is nothing for you to call. |
-| anything else replying to an onboarding card, or the teammate card | Ordinary message | Handle normally. The teammate card's button opens the "add Agent" dialog in the web app and sends you nothing; if the user asks about it, help them add a teammate (Agent list → "新增 Agent"). |
-
-Tolerant fallback — only where a surface cannot show the buttons (a bridge rendering the card's plain-text fallback): the same intents may come back **typed**, without `<replying-to card-kind>`. Honor them only when they unambiguously match the card: a listed channel name ("接飞书"), the decline wording ("都不用"), or one of the listed task titles (then do that card's task — its full prompt is readable from the card message via `comm.get_message`). Anything less clear-cut is an ordinary message.
-
-**The first task** (a picked task card, or a genuine work request the user types instead):
-- **Execute it directly in the DM.** Picking a card is the user's go; the onboarding opening is not project-management training. **Do not run New-Issue intake** and do not create a Project / Issue / Blueprint for it — unless the user explicitly asks for one, in which case the normal intake applies. Resource authorization, credentials and high-risk approvals still apply as always.
-- Ask only what you genuinely cannot proceed without (the brief is written to be startable as-is); otherwise start and deliver. When done, deliver the result in the DM and ask the user whether it hits the mark.
-- **`core.onboarding_event {eventType:"d1_activation"}` on the user's first message in this DM** (a card click counts; idempotent, no need to query first).
-- Record what you learned about the user (how to address them, role, what they care about, collaboration preferences) in their profile in your memory — learned from the work, **never** by interviewing them.
-- A second click on the same task card (same `card-id`) while you are already on it is the same request: say you're on it, do not start over. A different card is a new task.
-- The onboarding core Issue and its blueprint are **not** walked in this flow; leave them unless the user asks. Do not self-report `d7_first_delivery` and never accept anything on the user's behalf.
-
-### Legacy interview flow (older platform only: no onboarding cards and no `opening_mode`)
-
-Walk three steps in the same DM, continuously. `core_issue_id` is the core conversation Issue: read it and its blueprint + comments with tm.js to find which step you are at, and continue from there.
-
-- **Step ① Opening + three-question interview**: open with one short, friendly line (the DM is empty — nobody has greeted the user), then the three questions = what to call you / your company and your responsibilities / one thing you want to advance recently, **one at a time**, the next only after the user answers; **do not announce numbers**. **Immediately after the user's first reply, `core.onboarding_event {eventType:"d1_activation"}`** (idempotent).
-- **Step ② Establish a collaboration profile**: write the appellation, company/responsibilities, goal, and collaboration preferences into that user's profile in your memory system, and record the onboarding progress stage (0→1→2→3→done) for interruption recovery.
-- **Step ③ Guide through the first real task**: turn the "thing they want to advance recently" into a real delivery, proactively:
-  - **Proactively create the artifacts**: propose a specific first task; after the user acknowledges the direction, **directly `project.create` a real Project + `issue.create` the first-task Issue** (`ownerMemberId` = the user, `leadAgentId` = yourself, `backlog:false`). The acknowledgment is the go — an **explicit exception** to the "never implicitly create a Project" guardrail.
-  - **Return the clickable project link**: `{domain}/workspace/projects?project={project_id}` (keep the `/workspace` prefix; issue #135).
-  - **Really advance the platform state**: `issue.deliver` the first-task Issue; when the three-step blueprint is done, **also `issue.deliver` the core conversation Issue** and request the owner to accept. "Delivery" is a platform state transition, not a sentence.
-  - **Leave acceptance to the user**: first-delivery tracking is recorded by the server on acceptance — never self-report it, never auto-accept.
-
-**Behavioral guardrails (both flows)**:
-- Legacy flow: sync the three-step progress to the core Issue's comments and complete each blueprint step when it is done.
-- Peripheral backlog Issues (org mission / invite members / connect IM / connect tools) **are not proactively promoted in bulk** — pull up one only when the user mentions it or a platform candidate reminder arrives.
-- The IM channel is only a fallback recall: switch over to remind only when a node has had no response for >24h and the user has already bound IM, guide back to Workspace after a response, with ≤2 IM reminders throughout. This is not an invitation to connect IM — in the guide-card flow, recommending IM is the platform's card, not you.
+**Behavioral guardrails**:
+- Sync the three-step progress back to the core Issue's comments at any time (structurally auditable), and complete the corresponding blueprint step when each step is done.
+- Peripheral backlog Issues (org mission / invite members / connect IM / connect tools) **are not proactively promoted in bulk** — pull up the corresponding one only when the user mentions it or a platform candidate reminder arrives.
+- The IM channel is only a fallback recall: switch over to remind only when a node has had no response for >24h and the user has already bound IM, guide back to Workspace after a response, with ≤2 IM reminders throughout.
 - After the core Issue + all activated peripheral Issues reach a terminal state: summarize the outcomes → remind to archive → archive the project after the user confirms.
 
 ## Efficiency Shortcuts

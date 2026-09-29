@@ -204,7 +204,7 @@ function logRpcResponse(method, url, status, data, quietOnSuccess) {
   appendRpcLine(line);
 }
 
-async function doRequest(baseUrl, method, path, { body, query, extraHeaders, orgId, timeoutMs, quietOnSuccess } = {}) {
+async function doRequest(baseUrl, method, path, { body, query, extraHeaders, orgId, timeoutMs, quietOnSuccess, retryOn401 = true } = {}) {
   const url = buildUrl(baseUrl, path, query);
 
   // Single attempt: resolve token, send, parse response. Returned shape lets
@@ -246,7 +246,7 @@ async function doRequest(baseUrl, method, path, { body, query, extraHeaders, org
   // REFRESH_ON_401_WINDOW_MS so an outage or misconfigured request can't
   // storm /auth/refresh. invalidate() clears the in-memory token cache;
   // the retry's resolveToken() will mint a fresh JWT via /auth/agent/token.
-  if (attempt.res.status === 401) {
+  if (attempt.res.status === 401 && retryOn401) {
     const effectiveOrgId = orgId || resolveDefaultOrgId() || '';
     if (tryConsumeRefreshAttempt(effectiveOrgId)) {
       console.warn(
@@ -340,8 +340,8 @@ export const del   = (path)        => request('DELETE', path);
 // They resolve the JWT against that specific org's cache, so a multi-org
 // agent never accidentally calls cws-core with the wrong org's token.
 export const getForOrg   = (orgId, path, query, { timeoutMs } = {}) => request('GET', path, { query, orgId, timeoutMs });
-export const postForOrg  = (orgId, path, body, { timeoutMs, quietOnSuccess } = {}) =>
-  request('POST', path, { body, orgId, timeoutMs, quietOnSuccess });
+export const postForOrg  = (orgId, path, body, { timeoutMs, quietOnSuccess, retryOn401 } = {}) =>
+  request('POST', path, { body, orgId, timeoutMs, quietOnSuccess, retryOn401 });
 
 // Org-scoped GET that also attaches caller-supplied request headers — used when
 // a route needs a one-shot bearer that is NOT the org JWT (e.g. cws-connect's
@@ -350,7 +350,7 @@ export const postForOrg  = (orgId, path, body, { timeoutMs, quietOnSuccess } = {
 export const getForOrgWithHeaders = (orgId, path, extraHeaders, query) =>
   request('GET', path, { query, orgId, extraHeaders });
 export const patchForOrg = (orgId, path, body)  => request('PATCH',  path, { body,  orgId });
-export const putForOrg   = (orgId, path, body, { quietOnSuccess } = {}) => request('PUT', path, { body, orgId, quietOnSuccess });
+export const putForOrg   = (orgId, path, body, { quietOnSuccess, retryOn401 } = {}) => request('PUT', path, { body, orgId, quietOnSuccess, retryOn401 });
 export const delForOrg   = (orgId, path)        => request('DELETE', path, { orgId });
 
 /**

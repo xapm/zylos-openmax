@@ -44,3 +44,70 @@ export function automationConfiguration(params, sourceKind) {
   }
   return body;
 }
+
+export function automationAuthorizationPreview(params) {
+  if (!['timer', 'webhook'].includes(params.source_kind)) {
+    throw Object.assign(new Error('source_kind must be timer or webhook'), { status: 400 });
+  }
+  if (!['create', 'update'].includes(params.operation)) {
+    throw Object.assign(new Error('operation must be create or update'), { status: 400 });
+  }
+  const target = params.target_binding_id ?? '';
+  const version = params.expected_version ?? 0;
+  if (typeof target !== 'string' || !Number.isSafeInteger(version)
+    || (params.operation === 'create' && (target !== '' || version !== 0))
+    || (params.operation === 'update' && (!target.trim() || version < 1))) {
+    throw Object.assign(new Error('preview requires create without a target/version or update with a target and positive expected_version'), { status: 400 });
+  }
+  return {
+    source_kind: params.source_kind,
+    operation: params.operation,
+    target_binding_id: target,
+    expected_version: version,
+    configuration: automationConfiguration(params, params.source_kind),
+  };
+}
+
+export function automationAuthorizationProposal(params) {
+  if (typeof params.request_id !== 'string'
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(params.request_id)
+    || params.request_id === '00000000-0000-0000-0000-000000000000') {
+    throw Object.assign(new Error('request_id must be a UUID for this exact proposal revision'), { status: 400 });
+  }
+  const plan = automationAuthorizationPreview(params);
+  if (plan.source_kind === 'timer'
+    && (typeof plan.configuration.timezone !== 'string' || !plan.configuration.timezone.trim())) {
+    throw Object.assign(new Error('choose an explicit timezone before confirming the schedule'), { status: 400 });
+  }
+  if (plan.operation === 'create') {
+    delete plan.target_binding_id;
+    delete plan.expected_version;
+  }
+  return { ...plan, request_id: params.request_id };
+}
+
+export function automationMutation(params, sourceKind, operation = 'create') {
+  const { authorization_proposal_message_id: proposalID,
+    authorization_confirmation_message_id: confirmationID,
+    expected_version: expectedVersion, id, ...configurationParams } = params;
+  const body = { ...automationConfiguration(configurationParams, sourceKind) };
+  if ((operation === 'update' || proposalID !== undefined || confirmationID !== undefined)
+    && (proposalID === undefined || confirmationID === undefined)) {
+    throw Object.assign(new Error(`${operation} requires both authorization_proposal_message_id and authorization_confirmation_message_id`), { status: 400 });
+  }
+  for (const field of ['authorization_proposal_message_id', 'authorization_confirmation_message_id']) {
+    if (params[field] !== undefined) {
+      if (typeof params[field] !== 'string' || params[field].length > 128 || !/^[1-9][0-9]*$/.test(params[field])) {
+        throw Object.assign(new Error(`${field} must be a canonical decimal message ID string`), { status: 400 });
+      }
+      body[field] = params[field];
+    }
+  }
+  if (operation === 'update') {
+    if (typeof id !== 'string' || !id.trim() || !Number.isSafeInteger(expectedVersion) || expectedVersion < 1) {
+      throw Object.assign(new Error('update requires id and a positive expected_version'), { status: 400 });
+    }
+    body.expected_version = expectedVersion;
+  }
+  return body;
+}

@@ -1,5 +1,11 @@
 # TM Operations Guide
 
+For server-read `automation_policy: "silent"`, follow
+[Automation Delivery](automation-delivery.md) instead of this guide's ordinary
+human plan/delivery acceptance steps. Structured delivery persists the result;
+the server owns automatic completion and responsible-Agent DM notification.
+Never proxy acceptance to simulate that policy.
+
 **Purpose**: Manage the Task Management service workflow — `Project → Issue → Blueprint → Task → Attempt`. The Blueprint is the source of truth for the plan; simple tasks also use a one-step Blueprint, while complex tasks use a multi-step / dependency Blueprint. All commands go through the cws-core BFF down to cws-work.
 
 **When to load this document**:
@@ -65,7 +71,7 @@ When the CLI fails, it outputs `{"error":"...","status":<httpStatus>}` to stderr
 | 400 | Invalid parameters | Check parameters and retry |
 | 404 | Resource does not exist or no read permission | Switch to search / ask the Lead |
 | 409 | State conflict / already exists | Re-read the latest state before deciding |
-| 504 | Backend timeout | Back off and retry |
+| 504 | Backend timeout | For outcome-unknown writes, first follow command-specific read/reconcile instructions; never blindly replay the write. Back off and retry only reads or writes with explicitly supported idempotent retry. |
 
 ## Command Listing
 
@@ -96,7 +102,8 @@ The write path uses the flat path `/issues/{id}`, not `/projects/{pid}/issues/{i
 | ✅ | `issue.activate` | backlog → in_progress; decides whether to wake the Lead based on source | `{id, source?}` | `POST /issues/{id}/activate` |
 | ✅ | `issue.submit_plan` | Lead submits the execution plan to the human for confirmation, writes an Issue comment, state → pending_plan; the new flow must include `blueprintId` | `{id, planText, blueprintId, source?, cardMessageId?}` | `POST /issues/{id}/submit-plan` |
 | ✅ | `issue.accept_plan` | Human accepts the execution plan; during the text-card simulation period the Lead clicks on their behalf, defaulting to `source=text_card_proxy`; state → in_progress | `{id, source?}` | `POST /issues/{id}/accept-plan` — `source` accepts `im` / `explicit` / `text_card_proxy`; default `text_card_proxy` |
-| ✅ | `issue.deliver` | in_progress → delivered | `{id}` | `POST /issues/{id}/deliver` |
+| ✅ | `issue.deliver` | Ordinary: in_progress → delivered; trusted automation: persist result and complete under server policy | `{id, summary?, outcome?, artifacts?, idempotencyKey?}` | `POST /issues/{id}/deliver`; structured result requires summary/outcome/key; artifacts are `{title,url}` |
+| ✅ | `issue.create_revision` | Create a linked revision of a trusted automation result after a human DM request | `{id, description, originMessageId, idempotencyKey}` | `POST /issues/{id}/revisions`; server verifies lineage and human message, inherits policy |
 | ✅ | `issue.resume` | After human feedback, continue the conversation, re-plan, or rework; pending_plan/delivered → in_progress | `{id, reason?, source?}` | `POST /issues/{id}/resume` |
 | ✅ | `issue.accept_delivered` | Owner accepts the delivery; during the text-card simulation period the Lead clicks on their behalf, defaulting to `source=text_card_proxy`; delivered → accepted | `{id, source?}` | `POST /issues/{id}/accept-delivered` — `source` accepts `im` / `explicit` / `text_card_proxy`; default `text_card_proxy` |
 | ✅ | `issue.reassign_owner` | Change the issue owner (ownerMemberId); archived objects cannot be changed | `{id, newOwnerMemberId (or 'ownerMemberId')}` | `POST /issues/{id}/reassign-owner` |
@@ -158,7 +165,49 @@ Conversations on an Issue / Task, plan explanations, state-change explanations, 
 
 For explicit `automation-create-request` form handoffs, follow
 [Automation Creation](automation-creation.md) before generic Issue intake.
-`event-binding.create` and `webhook.create` accept `{org, source_kind, configuration}`.
+`event-binding.create` and `webhook.create` accept `{org, source_kind, configuration,
+authorization_proposal_message_id, authorization_confirmation_message_id}`.
+Agent calls require the real proposal and quoted human-confirmation IDs.
+Use `automation.authorization_propose {org,request_id,source_kind,operation,configuration,
+target_binding_id?,expected_version?}` with a UUID for this exact plan revision.
+Final timer proposals require an explicit nonblank IANA timezone; resolve missing
+or ambiguous timezones without silently defaulting to UTC or the machine timezone.
+The server sends one readable final plan to the verified DM. The CLI unwraps its
+`data` envelope and returns top-level `proposal_message_id`, `conversation_id`,
+and `proposal_text`.
+Do not resend the text, expose raw JSON or internal IDs, or ask for a second
+confirmation. Verify the returned message and obtain the human's single quoted
+confirmation before writing. The legacy `automation.authorization_preview`
+command is retired (the new server returns 410); never send its output to the human or use it as a
+fallback. If the new endpoint is unavailable, stop without creating anything.
+Only the identical proposal request ID and configuration may be explicitly
+retried to recover the same server-sent message after an uncertain proposal send.
+A changed plan requires a new request ID and fresh confirmation. This proposal
+idempotency does not authorize retrying an uncertain automation mutation.
+
+For an old unregistered proposal rejected with 403 after the Core upgrade,
+explain that the updated confirmation flow cannot accept the earlier plan;
+do not blame the human or label their confirmation invalid. First reconcile any
+prior uncertain create/update; a later 403 does not resolve that earlier write.
+Only after a known unregistered-proposal rejection and no unresolved writes,
+request a fresh server-sent readable plan with a new request ID, read it back,
+and obtain a new single quoted human confirmation. Never reuse old proposal or
+confirmation IDs or fall back to raw preview output. A proposal-store outage is
+503, not that 403: explain temporary unavailability, retain the existing context,
+and wait for recovery after reconciling uncertain writes; never blindly retry a
+mutation or replace proof while a write is unresolved. See Automation Creation
+for the full recovery procedure, including a previously successful operation.
+
+Required rollout order: successfully apply and verify migration 110, then deploy
+compatible Core and verify proposal-store and readable-proposal health, then
+release the compatible plugin. Stop if a prerequisite fails; health verification
+includes durable proposal registration and readback, not just process liveness.
+Existing pending legacy confirmations are invalidated at Core cutover and need
+the recovery above. Use a maintenance window if needed for the incompatible
+interval; do not promise zero downtime or let an old plugin continue sending
+legacy preview plans against the new Core. This guidance is not live deployment
+or test-automation authorization.
+
 `source_kind` must match the command (`timer` / `webhook`). The configuration
 accepts only the listed create REST fields; unknown fields are rejected.
 Timers preserve `schedule_kind`, `timezone`, `cron_expr`,
@@ -166,18 +215,26 @@ Timers preserve `schedule_kind`, `timezone`, `cron_expr`,
 and `spec`. Webhooks preserve `lead_member_id`, `owner_member_id`, `spec` and
 `event_filter`. Use `webhook.get {org,id}` to read a webhook configuration.
 The webhook creation result contains a secret `webhook_url`; never put it in
-public output or persistent memory. The CLI sends no create idempotency key.
+public output or persistent memory. The verified confirmation is atomically
+consumed as mutation proof; exact replay returns the original binding without
+rotating or recovering webhook secrets. This is a backend capability, not a
+retry instruction. The CLI does not send an idempotency key for automation
+create/update. Legacy create without proof has no proof-backed replay guarantee.
+Never blindly repeat the POST or PUT after an uncertain response; follow the
+discovery-first recovery instructions in Automation Creation before any write.
 `event-binding.list` includes both source kinds; fetch webhook filters with
 `webhook.get` using candidate IDs from that list. `event-binding.delete` also
 soft-deletes webhook bindings, but requires explicit human cleanup authorization.
 
-### Event Binding (4 commands)
+### Event Binding
 
 Scheduled task = `EventBinding(sourceKind=timer)`: when the time comes the platform creates an Issue and dispatches it to the lead (you), and you simply "receive a new Issue" without being aware that you were woken by cron.
 
 | Status | Command | Description | Parameters | Endpoint |
 | --- | --- | --- | --- | --- |
-| ✅ | `event-binding.create` | Create a scheduled task (create-by-agent main path) | `{cronExpr, leadMemberId, ownerMemberId, projectId, title, description?}` | `POST /event-bindings` |
+| ✅ | `event-binding.create` | Create a scheduled task with verified human confirmation | `{org,source_kind:"timer",configuration,authorization_proposal_message_id,authorization_confirmation_message_id}` | `POST /event-bindings` |
+| ✅ | `event-binding.update` | Replace a timer configuration with fresh confirmation | Create fields plus `{id,expected_version}` | `PUT /event-bindings/{id}` |
+| ✅ | `webhook.update` | Replace a webhook configuration with fresh confirmation | Create fields with `source_kind:"webhook"` plus `{id,expected_version}` | `PUT /webhooks/{id}` |
 | ✅ | `event-binding.list` | List the scheduled tasks of this org | `{}` | `GET /event-bindings` |
 | ✅ | `event-binding.get` | Get scheduled task details (view nextTriggerAt) | `{id}` | `GET /event-bindings/{id}` |
 | ✅ | `event-binding.delete` | Delete a scheduled task (stops future triggers, does not affect already-generated Issues) | `{id}` | `DELETE /event-bindings/{id}` |
@@ -187,6 +244,8 @@ create-by-agent guardrails (enforced by cws-work, violations error out directly)
 - `leadMemberId` must = **your own member id** (an agent can only set itself as lead)
 - `ownerMemberId` must = **the member id of that human in the conversation**, and cannot be yourself (owner is the governance responsible party = human)
 - `cronExpr` has 5 fields (minute hour day month weekday)
+- Core must verify the exact final proposal and its quoted human confirmation;
+  direct Agent writes to Work cannot bypass this verification.
 
 ## Typical Usage Scenarios
 
@@ -320,8 +379,12 @@ When a human says in a DM "help me set up a scheduled task", you (the selected l
 #    - how often to run → convert to a 5-field cron (state the timezone assumption clearly)
 #    - which project it belongs to
 #    - what to do when the time comes → title / description, ask for as much context as possible
-# 1) Restate and confirm, then create: leadMemberId=yourself, ownerMemberId=the human in the conversation
+# 1) Have automation.authorization_propose send one readable plan and obtain its quoted human confirmation.
+# 2) Create with those actual message IDs; never use placeholders as proof.
 node src/cli/tm.js event-binding.create '{
+  "org":"<verified organization>",
+  "authorization_proposal_message_id":"<actual proposal message ID>",
+  "authorization_confirmation_message_id":"<actual human reply ID>",
   "cronExpr":"0 9 * * 1",
   "leadMemberId":"<your own member id>",
   "ownerMemberId":"<the conversation human's member id>",
@@ -329,7 +392,7 @@ node src/cli/tm.js event-binding.create '{
   "title":"Weekly cleanup of expired artifacts",
   "description":"Clean up temporary artifacts older than 7 days and output a cleanup report"
 }'
-# 2) Report the result (binding id + nextTriggerAt)
+# 3) Report the task name, actual state and next trigger time; keep the binding ID private.
 ```
 
 Key points:

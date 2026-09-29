@@ -26,7 +26,7 @@
 
 import { getForOrg, postForOrg, patchForOrg, putForOrg, delForOrg, apiPath } from '../lib/client.js';
 import { resolveDefaultOrgId } from '../lib/config.js';
-import { automationConfiguration } from '../lib/automation-configuration.js';
+import { automationAuthorizationPreview, automationAuthorizationProposal, automationMutation } from '../lib/automation-configuration.js';
 
 const [command, ...rest] = process.argv.slice(2);
 const params = rest.length ? JSON.parse(rest.join(' ')) : {};
@@ -56,9 +56,9 @@ function requireOrgId() {
 // Org-scoped shadows of the bare verbs: each call carries the operating org's
 // JWT. Resolved lazily per call so `help` / usage never require an org.
 const get   = (path, query) => getForOrg(requireOrgId(), path, query);
-const post  = (path, body)  => postForOrg(requireOrgId(), path, body);
+const post  = (path, body, options) => postForOrg(requireOrgId(), path, body, options);
 const patch = (path, body)  => patchForOrg(requireOrgId(), path, body);
-const put   = (path, body)  => putForOrg(requireOrgId(), path, body);
+const put   = (path, body, options) => putForOrg(requireOrgId(), path, body, options);
 const del   = (path)        => delForOrg(requireOrgId(), path);
 
 // Build the standard PageParams query block from user-supplied camelCase.
@@ -94,6 +94,11 @@ function requireParams(commandName, names) {
   if (missing.length > 0) {
     throw new Error(`${commandName} requires ${missing.join(', ')}`);
   }
+}
+
+function requireTextParams(commandName, names) {
+  const invalid = names.filter(name => typeof params[name] !== 'string' || !params[name].trim());
+  if (invalid.length) throw new Error(`${commandName} requires non-empty text: ${invalid.join(', ')}`);
 }
 
 const COMMANDS = {
@@ -215,7 +220,33 @@ const COMMANDS = {
     apiPath(`/issues/${params.id}/accept-plan`),
     { source: params.source ?? 'text_card_proxy' },
   ),
-  'issue.deliver':         () => post(apiPath(`/issues/${params.id}/deliver`)),
+  'issue.deliver': () => {
+    requireParams('issue.deliver', ['id']);
+    const structured = ['summary', 'outcome', 'artifacts', 'idempotencyKey'].some(key => Object.hasOwn(params, key));
+    if (!structured) return post(apiPath(`/issues/${params.id}/deliver`));
+    requireTextParams('issue.deliver', ['summary', 'outcome', 'idempotencyKey']);
+    if (!['success', 'partial', 'failed'].includes(params.outcome)) {
+      throw new Error('issue.deliver outcome must be success, partial, or failed');
+    }
+    const artifacts = params.artifacts ?? [];
+    if (!Array.isArray(artifacts) || artifacts.some(item => !item || typeof item.title !== 'string' || !item.title.trim() || typeof item.url !== 'string' || !item.url.trim())) {
+      throw new Error('issue.deliver artifacts must be an array of {title, url}');
+    }
+    return post(apiPath(`/issues/${params.id}/deliver`), {
+      summary: params.summary,
+      outcome: params.outcome,
+      artifacts: artifacts.map(({ title, url }) => ({ title, url })),
+      idempotency_key: params.idempotencyKey,
+    }, { retryOn401: false });
+  },
+  'issue.create_revision': () => {
+    requireTextParams('issue.create_revision', ['id', 'description', 'originMessageId', 'idempotencyKey']);
+    return post(apiPath(`/issues/${params.id}/revisions`), {
+      description: params.description,
+      origin_message_id: params.originMessageId,
+      idempotency_key: params.idempotencyKey,
+    }, { retryOn401: false });
+  },
   'issue.resume':          () => post(
     apiPath(`/issues/${params.id}/resume`),
     {
@@ -415,9 +446,13 @@ const COMMANDS = {
   //  否则被 cws-work 护栏拒（lead≠自己 / owner 缺失或=自己）。见 SKILL.md。
   // =========================================================================
 
-  'event-binding.create': () => post(apiPath('/event-bindings'), automationConfiguration(params, 'timer')),
+  'automation.authorization_preview': () => post(apiPath('/automation-authorizations/preview'), automationAuthorizationPreview(params)),
+  'automation.authorization_propose': () => post(apiPath('/automation-authorizations/proposals'), automationAuthorizationProposal(params), { retryOn401: false }),
+  'event-binding.create': () => post(apiPath('/event-bindings'), automationMutation(params, 'timer'), { retryOn401: false }),
+  'event-binding.update': () => put(apiPath(`/event-bindings/${encodeURIComponent(params.id)}`), automationMutation(params, 'timer', 'update'), { retryOn401: false }),
 
-  'webhook.create': () => post(apiPath('/webhooks'), automationConfiguration(params, 'webhook')),
+  'webhook.create': () => post(apiPath('/webhooks'), automationMutation(params, 'webhook'), { retryOn401: false }),
+  'webhook.update': () => put(apiPath(`/webhooks/${encodeURIComponent(params.id)}`), automationMutation(params, 'webhook', 'update'), { retryOn401: false }),
   'webhook.get': () => get(apiPath(`/webhooks/${encodeURIComponent(params.id)}`)),
 
   'event-binding.list': () => get(apiPath('/event-bindings')),
@@ -457,7 +492,8 @@ ISSUE  (all ✅ on contract-v2 — write paths use /issues/{id}, NOT /projects/{
   issue.activate         {id, source?}                                        # source: lead_chat|ui|event_binding|system
   issue.submit_plan      {id, planText, blueprintId, source?, cardMessageId?}
   issue.accept_plan      {id, source?}                                        # source: im|explicit|text_card_proxy; default text_card_proxy
-  issue.deliver          {id}
+  issue.deliver          {id, summary?, outcome?, artifacts?, idempotencyKey?}  # structured result requires summary/outcome/key; outcome: success|partial|failed
+  issue.create_revision {id, description, originMessageId, idempotencyKey}      # linked automation revision; server verifies human message
   issue.resume           {id, reason?, source?}                               # human feedback → in_progress
   issue.accept_delivered {id, source?}                                        # source: im|explicit|text_card_proxy; default text_card_proxy
   issue.reassign_owner   {id, newOwnerMemberId (or 'ownerMemberId')}          # change issue owner
@@ -493,11 +529,15 @@ ATTEMPT  (all ✅ on contract-v2)
                           blockedOnApprovalRequestIds?}
 
 EVENT BINDING  (定时任务 / create-by-agent)
-  event-binding.create   {org, source_kind:"timer", configuration} # supported REST body; cron/once/interval + timezone
+  automation.authorization_propose {org, request_id, source_kind, operation, configuration, target_binding_id?, expected_version?} # server sends one readable plan
+  automation.authorization_preview {org, source_kind, operation, configuration, target_binding_id?, expected_version?} # retired; new server returns 410; never use as fallback
+  event-binding.create   {org, source_kind:"timer", configuration, authorization_proposal_message_id?, authorization_confirmation_message_id?}
+  event-binding.update   {org, id, expected_version, source_kind:"timer", configuration, authorization_proposal_message_id, authorization_confirmation_message_id}
                          Legacy: {cronExpr, leadMemberId, ownerMemberId, projectId,
                           title, description?}                                   # agent: leadMemberId=自己, ownerMemberId=对话人类
   event-binding.list     {}                                                     # 本 org 的定时任务
-  webhook.create         {org, source_kind:"webhook", configuration} # {lead_member_id, owner_member_id, spec, event_filter?}
+  webhook.create         {org, source_kind:"webhook", configuration, authorization_proposal_message_id?, authorization_confirmation_message_id?}
+  webhook.update         {org, id, expected_version, source_kind:"webhook", configuration, authorization_proposal_message_id, authorization_confirmation_message_id}
   webhook.get            {org, id}
   event-binding.get      {id}
   event-binding.delete   {id}                                                   # 停止后续触发, 不影响已生成的 Issue

@@ -3,6 +3,213 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 const reference = readFileSync(new URL('../../references/automation-creation.md', import.meta.url), 'utf8');
+const delivery = readFileSync(new URL('../../references/automation-delivery.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
+const operations = readFileSync(new URL('../../references/tm-operations.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
+
+// These guards protect the shipped Agent instructions, not live Agent behavior.
+function assertScheduleClarificationContract(source) {
+  const handoff = source.split('## Handoff contract')[1]?.split('## Resolving a draft timer schedule')[0]?.replace(/\s+/g, ' ');
+  const resolution = source.split('## Resolving a draft timer schedule')[1]?.split('## Conversation workflow')[0]?.replace(/\s+/g, ' ');
+  const confirmation = source.split('4. Show the final plan')[1]?.split('5. After')[0]?.replace(/\s+/g, ' ');
+  for (const [scope, text, instructions] of [
+    ['draft handoff', handoff, [
+      'values may be absent when the picker is untouched or incomplete; `timezone` is retained.',
+      'This does not relax the complete configuration required by authorization proposal creation or the actual create API.',
+      'It contains only explicit inputs from the active schedule mode, including partial selections.',
+    ]],
+    ['time resolution', resolution, [
+      'With no explicit picker schedule, parse a complete time in `spec.description` using the retained user timezone.',
+      'Never invent Monday 09:00, a one-hour interval, or any other default schedule.',
+      "A deliberately selected template's prefilled schedule counts as explicit user input.",
+      'When both give the same schedule, ask no redundant time question.',
+      'Only genuinely conflicting explicit picker/template and description values require a choice.',
+      'Compatible partial inputs can complete each other;',
+      "If neither source gives a complete schedule, ask only for the missing pieces in the user's timezone.",
+      'Each option must name its actual local time and timezone and whether it is one-time or recurring',
+      'Use `[CARD]` through the exact routed C4 reply path, or `comm.ask_card` for a proactive question in the verified DM',
+      '`askedOf` to the verified human member ID',
+      "accept only an `actionable` answer for this request's current revision",
+      'Ignore stale or duplicate receipts and unauthorized actors.',
+      'A failed card send leaves the conflict unresolved;',
+      'A clarification card choice only resolves schedule input; it is not final authorization to create.',
+      'Do not use a card receipt as an authorization confirmation ID.',
+      'instruction checks, not live Agent evidence',
+    ]],
+    ['final authorization', confirmation, [
+      'human-readable local time plus timezone and one-time or recurring schedule',
+      '`tm.js automation.authorization_propose`',
+      'The server sends the readable final plan itself',
+      'Do not resend `proposal_text`',
+      'or send a second plan, protocol explanation, raw JSON, IDs, hashes, or receipts to the human.',
+      'never fall back',
+      'Ask the human to quote that exact proposal',
+      'Generic unquoted assent, card receipts, or assent with additional changes cannot authorize this operation.',
+    ]],
+  ]) {
+    assert.ok(text, `missing ${scope} section`);
+    for (const instruction of instructions) {
+      assert.ok(text.toLowerCase().includes(instruction.toLowerCase()), `missing ${scope} safeguard: ${instruction}`);
+    }
+  }
+}
+
+test('draft timer guidance resolves missing and conflicting inputs without bypassing authorization', () => {
+  assertScheduleClarificationContract(reference);
+});
+
+test('readable proposal instructions preserve server binding and uncertain-send recovery', () => {
+  const text = reference.replace(/\s+/g, ' ');
+  for (const instruction of [
+    'Verify the returned conversation is the original verified DM;',
+    'verify the selected Agent is its sender',
+    'its text matches the returned readable plan.',
+    'never fall back to sending legacy `automation.authorization_preview` output',
+    'Never generate a new request ID to retry an unknown outcome,',
+    'A changed configuration requires a new proposal request ID and fresh human confirmation;',
+    'Proposal idempotency does not authorize retrying timer/webhook mutations.',
+    'Record the returned binding ID privately.',
+  ]) assert.ok(text.toLowerCase().includes(instruction.toLowerCase()), instruction);
+});
+
+const upgradeRecoveryGuards = [
+  ['old-plan explanation', /earlier plan can no longer be accepted/, /updated confirmation flow cannot accept the earlier plan/],
+  ['no human blame', /Do not blame the human or describe their reply as invalid/, /do not blame the human or label their confirmation invalid/],
+  ['prior uncertainty survives rejection', /A later 403 does not resolve an earlier uncertain write/, /a later 403 does not resolve that earlier write/],
+  ['fresh plan only after reconciliation', /Only after a known rejection of the unregistered proposal and no unresolved writes, call `automation\.authorization_propose` with a new request ID/, /Only after a known unregistered-proposal rejection and no unresolved writes, request a fresh server-sent readable plan with a new request ID/],
+  ['fresh quoted confirmation', /Read back the new server-sent readable plan and obtain a new single quoted human confirmation before writing/, /read it back, and obtain a new single quoted human confirmation/],
+  ['no old proof reuse', /Never reuse the old proposal or confirmation IDs/, /Never reuse old proposal or confirmation IDs/],
+  ['no raw fallback', /or fall back to raw `automation\.authorization_preview` output/, /or fall back to raw preview output/],
+  ['store outage classification', /A proposal-store outage returns 503, not the unregistered-proposal 403/, /A proposal-store outage is 503, not that 403/],
+  ['no mutation retry on outage', /do not invalidate the human's reply, substitute a new proposal, or blindly retry a create\/update/, /never blindly retry a mutation or replace proof while a write is unresolved/],
+];
+
+const rolloutGuards = [
+  ['migration before Core before plugin', /successfully apply and verify migration 110, then deploy (?:the )?compatible Core and verify proposal-store and readable-proposal health, then release the compatible plugin/],
+  ['durable health check', /includes? durable proposal registration and readback, not just process liveness/],
+  ['pending legacy invalidation', /Existing pending legacy confirmations are invalidated/],
+  ['maintenance window', /maintenance window if needed/],
+  ['no zero downtime promise', /do not promise zero downtime/],
+];
+
+function upgradeSections(source, kind) {
+  if (kind === 'creation') return {
+    recovery: source.split('### Previously sent plans after an upgrade')[1]?.split('### Coordinated rollout')[0],
+    rollout: source.split('### Coordinated rollout')[1]?.split('## Enforcement boundary')[0],
+  };
+  return {
+    recovery: source.split('For an old unregistered proposal')[1]?.split('Required rollout order:')[0],
+    rollout: source.split('Required rollout order:')[1]?.split('`source_kind` must match')[0],
+  };
+}
+
+function assertUpgradeRecovery(source, kind) {
+  const sections = upgradeSections(source, kind);
+  for (const [section, guards] of [['recovery', upgradeRecoveryGuards], ['rollout', rolloutGuards]]) {
+    assert.ok(sections[section], `missing ${kind} ${section} section`);
+    const text = sections[section].replace(/\s+/g, ' ');
+    for (const [name, creationPattern, operationsPattern] of guards) {
+      const pattern = kind === 'operations' && operationsPattern ? operationsPattern : creationPattern;
+      assert.match(text, pattern, `missing ${kind} safeguard: ${name}`);
+    }
+  }
+}
+
+for (const [kind, source] of [['creation', reference], ['operations', operations]]) {
+  test(`${kind} upgrade recovery distinguishes old proof from outage and gates replacement on reconciliation`, () => {
+    assertUpgradeRecovery(source, kind);
+  });
+
+  test(`${kind} upgrade guards reject removed recovery steps and reversed deployment order`, () => {
+    const text = source.replace(/\s+/g, ' ');
+    for (const [name, creationPattern, operationsPattern] of [...upgradeRecoveryGuards, ...rolloutGuards]) {
+      const pattern = kind === 'operations' && operationsPattern ? operationsPattern : creationPattern;
+      assert.match(text, pattern, `mutation must target existing ${name}`);
+      assert.throws(() => assertUpgradeRecovery(text.replace(pattern, ''), kind), /missing .* safeguard/);
+    }
+    const reversed = text.replace(rolloutGuards[0][1],
+      'release the compatible plugin, then deploy compatible Core, then apply migration 110');
+    assert.throws(() => assertUpgradeRecovery(reversed, kind), /migration before Core before plugin/);
+  });
+}
+
+test('schedule guards reject deletion of missing-time and card-authorization safeguards', () => {
+  for (const instruction of [
+    /or send a second plan, protocol explanation, raw JSON, IDs, hashes, or receipts\s+to the human\./,
+    /If neither source gives a complete schedule, ask only for the missing pieces\s+in the user's timezone\./,
+    /A clarification card choice only resolves schedule input; it is not final\s+authorization to create\./,
+    /Generic unquoted assent, card receipts,\s+or assent with additional changes cannot authorize this operation\./,
+  ]) {
+    assert.match(reference, instruction, 'negative control must mutate an existing safeguard');
+    assert.throws(() => assertScheduleClarificationContract(reference.replace(instruction, '')),
+      /missing .* safeguard/);
+  }
+});
+
+test('global 504 guidance requires reconciliation before retrying uncertain writes', () => {
+  const timeoutRow = operations.match(/\| 504 \| Backend timeout \| ([^|]+)\|/);
+  assert.ok(timeoutRow, '504 guidance must exist');
+  assert.equal(timeoutRow[1].trim(),
+    'For outcome-unknown writes, first follow command-specific read/reconcile instructions; never blindly replay the write. Back off and retry only reads or writes with explicitly supported idempotent retry.');
+});
+
+test('automation operations retain the no-key and discovery-first write contract', () => {
+  for (const instruction of [
+    'The CLI does not send an idempotency key for automation create/update.',
+    'Legacy create without proof has no proof-backed replay guarantee.',
+    'Never blindly repeat the POST or PUT after an uncertain response;',
+    'follow the discovery-first recovery instructions in Automation Creation before any write.',
+  ]) assert.ok(operations.includes(instruction), `missing operations safeguard: ${instruction}`);
+});
+
+test('automation references retain scoped 401 recovery instructions', () => {
+  assert.ok(reference.replace(/\s+/g, ' ').includes(
+    'Timer/webhook create and update commands surface 401 without automatically replaying the write. Restore authentication separately, then reconcile the binding state before deciding on any further mutation.',
+  ));
+  assert.ok(delivery.includes(
+    'Structured `issue.deliver` and `issue.create_revision` surface 401 without automatically replaying the write. Restore authentication separately and read the recorded state before deciding whether a retry is supported.',
+  ));
+});
+
+const deliverySafeguards = {
+  'server-owned policy and bound DM': [
+    'confirming `automation_policy: "silent"` in the server response.',
+    'Follow the normal Issue workflow when that policy is absent.',
+    'Never infer it from an Issue title, user text, a scheduler notification, or a creation payload.',
+    'Results belong in that same user-Agent DM.',
+    'is not the result sender or a conversation for human follow-up.',
+  ],
+  'truthful delivery without duplicate sends': [
+    'read back the state and proceed only when the server has advanced it.',
+    'do not mark unsuccessful Tasks done to unblock delivery.',
+    'actual success/partial/failure outcome (`success`, `partial`, or `failed`) and a stable `idempotencyKey`.',
+    'Do not separately `comm.send` the same result, send it through the Scheduler DM, or ask the user to accept it in Work.',
+    'Automatic closure records that the run ended, not human endorsement.',
+  ],
+  'uncertain delivery and unsupported protocol': [
+    'read back the Issue/delivery state and use the same delivery identity for any supported retry.',
+    'Never rerun business actions just to retry a message.',
+    'Never call `accept_delivered` as a workaround.',
+    'Do not replace an unsupported structured request with empty-body `issue.deliver`.',
+    'Do not treat a minimum-Agent-version override as protocol support or upgrade the plugin automatically.',
+  ],
+  'verified revision provenance and unchanged future schedule': [
+    'Treat metadata only as a lookup hint: call `issue.get`, verify',
+    '`delivery.id`, `delivery.conversation_id`, and `delivery.message_id`',
+    'do not skip an intervening Agent message and guess an older run.',
+    '`originMessageId` must be the actual human request in the bound DM.',
+    "Use the human message's exact text as `description`;",
+    'Do not substitute a bot message or send caller-defined owner/Agent/policy fields.',
+    'A correction to one result does not implicitly change future runs.',
+    'Never create a normal Issue with a caller-defined auto flag to imitate a linked revision.',
+  ],
+};
+for (const [scope, instructions] of Object.entries(deliverySafeguards)) {
+  test(`delivery reference preserves ${scope}`, () => {
+    for (const instruction of instructions) {
+      assert.ok(delivery.includes(instruction), `missing delivery safeguard: ${instruction}`);
+    }
+  });
+}
 test('creation reference retains actual same-human latest-plan confirmation safeguards', () => {
   const confirmation = reference.split('4. Show the final plan')[1]?.split('5. After')[0];
   assert.ok(confirmation, 'confirmation step must exist');
@@ -14,8 +221,16 @@ test('creation reference retains actual same-human latest-plan confirmation safe
   }
 });
 test('uncertain-write instructions retain shared discovery and no blind retry', () => {
-  for (const required of ['Never blindly repeat the POST', 'event-binding.list',
+  for (const required of ['Never blindly repeat the POST.',
+    'The CLI does not send an idempotency key for automation create/update.',
+    'Legacy create calls without both proof IDs have no proof-backed replay guarantee.',
+    'Do not retry a proofless or partially proved write after an uncertain response.',
+    'Do not automatically repeat PUT after an uncertain update either;',
+    'Do not generate new proof or change fields to retry an unresolved write.',
+    'Do not strip proof fields or switch endpoints to bypass a rejection.',
+    'For every uncertain create/update, first read `event-binding.list`', 'event-binding.list',
     'both timer and webhook bindings', 'list omits webhook `event_filter`',
     'Multiple matches remain uncertain', 'Never delete as automatic recovery',
-    'not a durable CLI confirmation state machine']) assert.ok(reference.includes(required), required);
+    'Work persists and consumes that proof in the same',
+    'The CLI does not itself grant authorization']) assert.ok(reference.includes(required), required);
 });

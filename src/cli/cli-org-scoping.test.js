@@ -71,6 +71,8 @@ function run(home, cliName, command, params, env = {}) {
 for (const c of [
   { cli: 'tm.js',   command: 'project.list',              params: {} },
   { cli: 'tm.js',   command: 'issue.list',                params: {} },
+  { cli: 'tm.js',   command: 'issue.deliver',             params: { id: 'i1', summary: 'Result', outcome: 'success', idempotencyKey: 'd1' } },
+  { cli: 'tm.js',   command: 'issue.create_revision',     params: { id: 'i1', description: 'Revision', originMessageId: 'm1', idempotencyKey: 'r1' } },
   { cli: 'tm.js',   command: 'task.get',                  params: { id: 't1' } },
   { cli: 'kb.js',   command: 'kb.list',                   params: {} },
   { cli: 'kb.js',   command: 'kb.get',                    params: { kbId: 'k1' } },

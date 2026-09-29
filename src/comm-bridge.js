@@ -1164,16 +1164,7 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
              qStructured.body?.text
           || (typeof q.message?.content === 'string' ? q.message.content : '')
           || q.message?.fallback_text
-          // A card's prose lives in body.blocks[], not body.text — without this
-          // arm a reply to a card quotes nothing and the agent cannot see which
-          // card (e.g. which onboarding task card) the reply was made from.
-          || formatStructuredForModel(q)
           || '';
-        // Only a card body (schema + kind) yields a card-kind attribute; plain
-        // messages never carry one.
-        const qCardKind = (qStructured.body && typeof qStructured.body === 'object'
-          && typeof qStructured.body.kind === 'string' && qStructured.body.schema)
-          ? qStructured.body.kind : '';
         // Quoted media: a quoted image/file with no caption yields empty text,
         // which would drop the whole quote. Label it ([image]/[file: name]) and
         // download the referenced attachment, appending `---- <kind>: <path>` so
@@ -1212,19 +1203,7 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
              q.message?.sender_display_name
           || (await fetchMemberName(orgConfig.org_id, qSenderId))
           || qSenderId;
-        if (qText) {
-          quotedContent = { sender: qSender, text: qText };
-          if (qCardKind) {
-            quotedContent.cardKind = qCardKind;
-            quotedContent.messageId = String(quotedMsgId);
-            // Onboarding cards carry their metadata in context.extra (a string
-            // map written by cws-core: card_id / role / industry / trigger).
-            const qExtra = qStructured.body.context?.extra;
-            if (qExtra && typeof qExtra === 'object' && !Array.isArray(qExtra)) {
-              quotedContent.cardExtra = qExtra;
-            }
-          }
-        }
+        if (qText) quotedContent = { sender: qSender, text: qText };
       }
     }
 

@@ -80,6 +80,8 @@ and `schema_version: 1`, read [Automation Creation](references/automation-creati
 first. That workflow takes precedence over generic task registration ONLY for
 this explicit creation request and its clarification/confirmation replies.
 Do not register an Issue or execute the described task during creation.
+Use the server-sent readable final plan and a single human confirmation; never
+post raw authorization JSON, internal IDs, or a second technical proposal.
 Other messages use the usual intake. For later triggered Issues, first read
 the Issue's authoritative lifecycle policy as described below.
 

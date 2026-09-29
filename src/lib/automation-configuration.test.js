@@ -1,8 +1,29 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { automationAuthorizationPreview, automationConfiguration, automationMutation } from './automation-configuration.js';
+import { automationAuthorizationPreview, automationAuthorizationProposal, automationConfiguration, automationMutation } from './automation-configuration.js';
 
 const base = { lead_member_id: 'agent', owner_member_id: 'human', spec: { project_id: 'project', title: 'Task' } };
+test('readable proposal binds its request UUID to the unchanged final configuration and scope', () => {
+  const request_id = '01000000-0000-4000-8000-000000000001';
+  const configuration = { ...base, timezone: 'Asia/Singapore' };
+  const params = { org: 'org', source_kind: 'timer', operation: 'update', target_binding_id: 'binding', expected_version: 2, configuration, request_id };
+  assert.deepEqual(automationAuthorizationProposal(params), {
+    source_kind: 'timer', operation: 'update', target_binding_id: 'binding', expected_version: 2, configuration, request_id,
+  });
+  assert.deepEqual(automationAuthorizationProposal({ ...params, operation: 'create', target_binding_id: '', expected_version: 0 }), {
+    source_kind: 'timer', operation: 'create', configuration, request_id,
+  });
+  for (const value of [undefined, null, 42, '', 'some-key', '00000000-0000-0000-0000-000000000000', ` ${request_id}`, request_id.replaceAll('-', '')]) {
+    assert.throws(() => automationAuthorizationProposal({ ...params, request_id: value }), /request_id must be a UUID/);
+  }
+  assert.throws(() => automationAuthorizationProposal({ ...params, operation: 'delete' }), /operation/);
+  assert.throws(() => automationAuthorizationProposal({ ...params, expected_version: 0 }), /preview requires/);
+  assert.throws(() => automationAuthorizationProposal({ ...params, configuration: { ...base, request_id } }), /unsupported/);
+  for (const timezone of [undefined, null, '', '   ', 0]) {
+    assert.throws(() => automationAuthorizationProposal({ ...params, configuration: { ...base, timezone } }), /explicit timezone/);
+  }
+  assert.equal(automationAuthorizationProposal({ ...params, source_kind: 'webhook', configuration: base }).configuration, base);
+});
 for (const kind of ['timer', 'webhook']) {
   test(`${kind} rejects missing or mismatched route discriminator`, () => {
     assert.throws(() => automationConfiguration({ configuration: base }, kind), /source_kind is required/);

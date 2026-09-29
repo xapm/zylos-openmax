@@ -26,7 +26,7 @@
 
 import { getForOrg, postForOrg, patchForOrg, putForOrg, delForOrg, apiPath } from '../lib/client.js';
 import { resolveDefaultOrgId } from '../lib/config.js';
-import { automationAuthorizationPreview, automationMutation } from '../lib/automation-configuration.js';
+import { automationAuthorizationPreview, automationAuthorizationProposal, automationMutation } from '../lib/automation-configuration.js';
 
 const [command, ...rest] = process.argv.slice(2);
 const params = rest.length ? JSON.parse(rest.join(' ')) : {};
@@ -447,6 +447,7 @@ const COMMANDS = {
   // =========================================================================
 
   'automation.authorization_preview': () => post(apiPath('/automation-authorizations/preview'), automationAuthorizationPreview(params)),
+  'automation.authorization_propose': () => post(apiPath('/automation-authorizations/proposals'), automationAuthorizationProposal(params), { retryOn401: false }),
   'event-binding.create': () => post(apiPath('/event-bindings'), automationMutation(params, 'timer'), { retryOn401: false }),
   'event-binding.update': () => put(apiPath(`/event-bindings/${encodeURIComponent(params.id)}`), automationMutation(params, 'timer', 'update'), { retryOn401: false }),
 
@@ -528,7 +529,8 @@ ATTEMPT  (all ✅ on contract-v2)
                           blockedOnApprovalRequestIds?}
 
 EVENT BINDING  (定时任务 / create-by-agent)
-  automation.authorization_preview {org, source_kind, operation, configuration, target_binding_id?, expected_version?}
+  automation.authorization_propose {org, request_id, source_kind, operation, configuration, target_binding_id?, expected_version?} # server sends one readable plan
+  automation.authorization_preview {org, source_kind, operation, configuration, target_binding_id?, expected_version?} # retired; new server returns 410; never use as fallback
   event-binding.create   {org, source_kind:"timer", configuration, authorization_proposal_message_id?, authorization_confirmation_message_id?}
   event-binding.update   {org, id, expected_version, source_kind:"timer", configuration, authorization_proposal_message_id, authorization_confirmation_message_id}
                          Legacy: {cronExpr, leadMemberId, ownerMemberId, projectId,

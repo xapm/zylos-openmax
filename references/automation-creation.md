@@ -37,7 +37,7 @@ not silently discarded. A timer handoff is a draft: `schedule_kind` and schedule
 values may be absent when the picker is untouched or incomplete; `timezone`
 is retained. Missing schedule fields are not a malformed handoff and must not
 be filled from UI defaults. This does not relax the complete configuration
-required by authorization preview or the actual create API. For `timer`, preserve
+required by authorization proposal creation or the actual create API. For `timer`, preserve
 `schedule_kind` (`cron`, `once`, `interval`), `timezone`, and its applicable
 `cron_expr`, `run_at`, `interval_seconds`, `anchor_at`. Timestamps are instants;
 do not reinterpret them in the machine timezone or convert intervals to cron.
@@ -85,8 +85,8 @@ Apply these rules during step 3, after verifying the human and organization:
   leaves the conflict unresolved; do not silently choose a schedule.
 - A clarification card choice only resolves schedule input; it is not final
   authorization to create. After resolving the draft, follow step 4 unchanged:
-  obtain the canonical authorization preview and the verified human's quoted
-  confirmation. Do not use a card receipt as an authorization confirmation ID.
+  ask the server to send the final readable plan and obtain the verified human's
+  quoted confirmation. Do not use a card receipt as an authorization confirmation ID.
 
 Reference acceptance scenarios (instruction checks, not live Agent evidence):
 
@@ -98,7 +98,7 @@ Reference acceptance scenarios (instruction checks, not live Agent evidence):
 | Neither description nor picker supplies time; user timezone Asia/Singapore | Ask for the missing schedule in Asia/Singapore; no invented default. |
 | Once mode with an explicit date but no time; description gives no time | Keep the date and ask only for the time in the user timezone. |
 | Explicit template has a complete schedule; description gives no time | Keep the template schedule. |
-| Current schedule clarification card is answered | Revise the draft, then preview and request quoted confirmation; no create from the click. |
+| Current schedule clarification card is answered | Revise the draft, then have the server send one readable plan for quoted confirmation; no create from the click. |
 
 ## Conversation workflow
 
@@ -132,18 +132,38 @@ Reference acceptance scenarios (instruction checks, not live Agent evidence):
    Ask only for missing or ambiguous information. Do not ask again for fields
    already supplied. Preserve clarified task instructions in `spec.description`;
    do not merely leave information required at execution time in the DM. For a
-   draft timer, apply the schedule-resolution rules above before previewing.
-4. Show the final plan in the same DM: task, project, human owner, agent, trigger
+   draft timer, apply the schedule-resolution rules above before proposing.
+4. Show the final plan once in the same DM through the server: task, project, human owner, agent, trigger
    (human-readable local time plus timezone and one-time or recurring schedule,
    including its date or frequency, or webhook condition), inputs,
    work and output. Explain relevant unresolved prerequisites. Request explicit
    confirmation of this plan before any create call, even if no questions were
-   needed. First call `tm.js automation.authorization_preview` with
-   `{org,source_kind,operation:"create",configuration}`. Send the returned
-   `data.proposal_text` verbatim as its own Agent message in this DM, recording
-   the actual returned message ID. Do not reconstruct, summarize, append to, or
-   edit this authorization message. A separate readable explanation is fine.
-   Ask the human to quote that exact proposal and reply `confirm` or `确认`
+   needed. Call `tm.js automation.authorization_propose` with
+   `{org,request_id,source_kind,operation:"create",configuration}`. A final timer
+   proposal requires an explicit nonblank IANA timezone verified with the human's
+   inputs. Resolve missing or ambiguous timezones before proposing; never default
+   to UTC or the machine timezone. Draft handoffs may remain incomplete, but the
+   final proposal cannot. The server validates the timezone before sending.
+   Use a UUID
+   `request_id` dedicated to this exact final plan revision; record it and the
+   complete configuration before calling. It is separate from the form handoff's
+   correlation ID. The server sends the readable final plan itself, with the
+   confirmation instruction. The CLI unwraps the server's `data` envelope and
+   returns top-level `proposal_message_id`, `conversation_id`, and `proposal_text`.
+   Do not resend `proposal_text`
+   or send a second plan, protocol explanation, raw JSON, IDs, hashes, or receipts
+   to the human. Keep authorization metadata in tool arguments and private context.
+   Verify the returned conversation is the original verified DM; fetch the exact
+   proposal with `comm.get_message` and verify the selected Agent is its sender
+   and its text matches the returned readable plan. On missing or mismatched
+   readback, stop and reconcile; do not create or replace the proposal blindly.
+   If this API is unavailable, stop and explain that plan confirmation is
+   temporarily unavailable. Never fall back to sending legacy
+   `automation.authorization_preview` output or constructing an authorization
+   message yourself.
+   Ask the human to quote that exact proposal only if they need clarification
+   about the server's instruction; do not send another confirmation request.
+   The single quoted reply must be `confirm` or `确认`
    (`确认创建` is also accepted for creation). Both messages must be no more
    than 24 hours old and unedited. Generic unquoted assent, card receipts,
    or assent with additional changes cannot authorize this operation.
@@ -181,8 +201,9 @@ Reference acceptance scenarios (instruction checks, not live Agent evidence):
    Use `event-binding.get` for timer or `webhook.get` for webhook when needed.
    A mismatch or unreadable result is not verified success: report uncertainty,
    never automatically recreate or delete the binding.
-   Record and report the returned binding ID, actual state and timer's next
-   trigger time if returned. Build the existing Automation page link with
+   Record the returned binding ID privately. Report the task name, actual state
+   and timer's next trigger time if returned in readable local time with timezone;
+   do not expose binding IDs or protocol fields. Build the existing Automation page link with
    `core.frontend_url {"org":"<verified org_id>","path":"/automation"}`
    (the existing automation list; there is no detail route). This local helper
    does not select an organization in the browser; name the verified organization
@@ -194,6 +215,16 @@ Reference acceptance scenarios (instruction checks, not live Agent evidence):
 
 ## Failure and duplicate handling
 
+- Proposal creation sends a message, so the CLI disables automatic 401 replay.
+  Recover authentication separately. For timeout, connection loss, 5xx, or a
+  missing proposal receipt, recover the recorded exact proposal configuration and
+  `request_id`. The server deduplicates this proposal operation: an explicit retry
+  may use only that same request ID and identical scope/configuration to recover
+  the same proposal. Never generate a new request ID to retry an unknown outcome,
+  post the plan yourself, or convert a proposal retry into a binding write.
+  A changed configuration requires a new proposal request ID and fresh human
+  confirmation; the server rejects changed content under the old request ID.
+  Proposal idempotency does not authorize retrying timer/webhook mutations.
 - Timer/webhook create and update commands surface 401 without automatically
   replaying the write. Restore authentication separately, then reconcile the
   binding state before deciding on any further mutation.
@@ -245,7 +276,8 @@ plans, duplicate delivery and uncertain writes.
 ## Updating an existing automation
 
 Read the current binding first and retain its actual version. Follow the same
-proposal and confirmation process, with preview `operation:"update"`,
+server-sent readable proposal and single confirmation process, with
+`automation.authorization_propose`, a new proposal `request_id`, `operation:"update"`,
 `target_binding_id` set to the actual binding ID, and `expected_version` set to
 the read version. The human must quote the new proposal and reply `confirm`,
 `确认`, or `确认更新`. Call `event-binding.update` or `webhook.update` with

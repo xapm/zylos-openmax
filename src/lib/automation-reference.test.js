@@ -14,7 +14,7 @@ function assertScheduleClarificationContract(source) {
   for (const [scope, text, instructions] of [
     ['draft handoff', handoff, [
       'values may be absent when the picker is untouched or incomplete; `timezone` is retained.',
-      'This does not relax the complete configuration required by authorization preview or the actual create API.',
+      'This does not relax the complete configuration required by authorization proposal creation or the actual create API.',
       'It contains only explicit inputs from the active schedule mode, including partial selections.',
     ]],
     ['time resolution', resolution, [
@@ -37,15 +37,18 @@ function assertScheduleClarificationContract(source) {
     ]],
     ['final authorization', confirmation, [
       'human-readable local time plus timezone and one-time or recurring schedule',
-      '`tm.js automation.authorization_preview`',
-      'Send the returned `data.proposal_text` verbatim as its own Agent message',
+      '`tm.js automation.authorization_propose`',
+      'The server sends the readable final plan itself',
+      'Do not resend `proposal_text`',
+      'or send a second plan, protocol explanation, raw JSON, IDs, hashes, or receipts to the human.',
+      'never fall back',
       'Ask the human to quote that exact proposal',
       'Generic unquoted assent, card receipts, or assent with additional changes cannot authorize this operation.',
     ]],
   ]) {
     assert.ok(text, `missing ${scope} section`);
     for (const instruction of instructions) {
-      assert.ok(text.includes(instruction), `missing ${scope} safeguard: ${instruction}`);
+      assert.ok(text.toLowerCase().includes(instruction.toLowerCase()), `missing ${scope} safeguard: ${instruction}`);
     }
   }
 }
@@ -54,8 +57,23 @@ test('draft timer guidance resolves missing and conflicting inputs without bypas
   assertScheduleClarificationContract(reference);
 });
 
+test('readable proposal instructions preserve server binding and uncertain-send recovery', () => {
+  const text = reference.replace(/\s+/g, ' ');
+  for (const instruction of [
+    'Verify the returned conversation is the original verified DM;',
+    'verify the selected Agent is its sender',
+    'its text matches the returned readable plan.',
+    'never fall back to sending legacy `automation.authorization_preview` output',
+    'Never generate a new request ID to retry an unknown outcome,',
+    'A changed configuration requires a new proposal request ID and fresh human confirmation;',
+    'Proposal idempotency does not authorize retrying timer/webhook mutations.',
+    'Record the returned binding ID privately.',
+  ]) assert.ok(text.toLowerCase().includes(instruction.toLowerCase()), instruction);
+});
+
 test('schedule guards reject deletion of missing-time and card-authorization safeguards', () => {
   for (const instruction of [
+    /or send a second plan, protocol explanation, raw JSON, IDs, hashes, or receipts\s+to the human\./,
     /If neither source gives a complete schedule, ask only for the missing pieces\s+in the user's timezone\./,
     /A clarification card choice only resolves schedule input; it is not final\s+authorization to create\./,
     /Generic unquoted assent, card receipts,\s+or assent with additional changes cannot authorize this operation\./,

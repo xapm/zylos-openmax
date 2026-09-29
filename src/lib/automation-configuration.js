@@ -68,6 +68,24 @@ export function automationAuthorizationPreview(params) {
   };
 }
 
+export function automationAuthorizationProposal(params) {
+  if (typeof params.request_id !== 'string'
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(params.request_id)
+    || params.request_id === '00000000-0000-0000-0000-000000000000') {
+    throw Object.assign(new Error('request_id must be a UUID for this exact proposal revision'), { status: 400 });
+  }
+  const plan = automationAuthorizationPreview(params);
+  if (plan.source_kind === 'timer'
+    && (typeof plan.configuration.timezone !== 'string' || !plan.configuration.timezone.trim())) {
+    throw Object.assign(new Error('choose an explicit timezone before confirming the schedule'), { status: 400 });
+  }
+  if (plan.operation === 'create') {
+    delete plan.target_binding_id;
+    delete plan.expected_version;
+  }
+  return { ...plan, request_id: params.request_id };
+}
+
 export function automationMutation(params, sourceKind, operation = 'create') {
   const { authorization_proposal_message_id: proposalID,
     authorization_confirmation_message_id: confirmationID,

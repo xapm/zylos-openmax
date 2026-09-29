@@ -55,18 +55,17 @@ import {
   looksLikeMarkdown,
   parseMediaPrefix,
   newClientMsgId,
-  splitMessage,
 } from '../src/lib/message.js';
 import { uploadMedia } from '../src/cli/as.js';
 import { parseCardMessage, sendCardMessage } from '../src/lib/card-message.js';
 import {
   resolveMentions,
-  buildMentions,
   needsRosterHydration,
   recordRoster,
   rosterFetchedRecently,
   markRosterFetched,
 } from '../src/lib/mention.js';
+import { planOutboundChunks } from '../src/lib/outbound-chunks.js';
 import { lookupConvOrg, registerConvOrg } from '../src/lib/conv-org.js';
 import { RUNTIME_DIR } from '../src/lib/session.js';
 
@@ -161,17 +160,16 @@ async function sendText(ep, text) {
   // participant-name matcher highlights them (cws-fe issue #6 covers the
   // AGENT_TEXT render side). No-op when no known participant matches.
   text = resolveMentions(text, convId);
-  const chunks = splitMessage(text);
+  // Mentions are resolved once against the whole text and attached to every
+  // chunk (workspace-backlog#350, see src/lib/outbound-chunks.js). Without
+  // them agent-sent @-mentions never wake their target: cws-comm only stores
+  // mentions it's explicitly given, it does not parse them out of the text
+  // itself (see src/lib/mention.js).
+  const chunks = planOutboundChunks(text, convId);
   const results = [];
   for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
+    const { text: chunk, mentions } = chunks[i];
     const contentType = looksLikeMarkdown(chunk) ? 'markdown' : 'text';
-    // Resolve this chunk's own `@name` tokens to a structured mentions[]
-    // entry (cws-core MentionInput[]) against known conversation
-    // participants. Without this, agent-sent @-mentions never wake their
-    // target: cws-comm only stores mentions it's explicitly given, it does
-    // not parse them out of the text itself (see src/lib/mention.js).
-    const mentions = buildMentions(chunk, convId);
     // cws-core SendMessageRequest body (current schema):
     //   { client_msg_id, type, content: {content_type, body, attachments}, parent_id?, mentions? }
     // type is the message-level enum (AGENT_TEXT for agent outbound text /

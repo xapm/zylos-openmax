@@ -6,6 +6,70 @@ import test from 'node:test';
 
 const cliPath = fileURLToPath(new URL('./tm.js', import.meta.url));
 
+const readableProposal = {
+  request_id: '01000000-0000-4000-8000-000000000001', source_kind: 'timer', operation: 'create',
+  configuration: { lead_member_id: 'agent', owner_member_id: 'human', spec: { project_id: 'project', title: 'Task' }, schedule_kind: 'cron', cron_expr: '0 9 * * *', timezone: 'Asia/Singapore' },
+};
+test('readable proposal forwards stable request identity and canonical configuration to server only', async () => {
+  const request = await captureRequest('automation.authorization_propose', { org: 'org-automation', ...readableProposal });
+  assert.equal(request.method, 'POST');
+  assert.equal(request.url, '/api/v1/automation-authorizations/proposals');
+  assert.deepEqual(request.body, readableProposal);
+  const replay = await captureRequest('automation.authorization_propose', { org: 'org-automation', ...readableProposal });
+  assert.deepEqual(replay.body, request.body);
+});
+
+test('readable proposal rejects invalid request identity or missing timer timezone before HTTP', async () => {
+  let requests = 0;
+  const server = createServer((req, res) => { requests++; req.resume(); res.end('{}'); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const cases = [
+      ...[undefined, '', 'invalid', '00000000-0000-0000-0000-000000000000'].map(request_id => [{ ...readableProposal, request_id }, /request_id must be a UUID/]),
+      ...[undefined, null, '', '   '].map(timezone => [{ ...readableProposal, configuration: { ...readableProposal.configuration, timezone } }, /explicit timezone/]),
+    ];
+    for (const [proposal, errorMessage] of cases) {
+      const result = await new Promise(resolve => execFile(process.execPath, [cliPath, 'automation.authorization_propose', JSON.stringify({
+        org: 'org-automation', ...proposal,
+      })], {
+        env: { ...process.env, COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: 'test', COCO_USER_TOKEN: '', COCO_RPC_LOG: '0' }, timeout: 5000,
+      }, (error, stdout, stderr) => resolve({ error, stderr })));
+      assert.ok(result.error);
+      assert.match(result.stderr, errorMessage);
+    }
+    assert.equal(requests, 0);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('successful readable proposal returns the server receipt without a second message send', async () => {
+  const requests = [];
+  const response = { data: {
+    proposal_message_id: '1790220732844', conversation_id: 'owner-agent-dm',
+    proposal_text: 'Daily report at 09:00 Asia/Singapore. Reply to this message to confirm.',
+  }, request_id: 'server-request', server_time: '2026-09-29T00:00:00Z' };
+  const server = createServer((req, res) => {
+    requests.push({ method: req.method, url: req.url });
+    req.resume();
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(response));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const result = await new Promise(resolve => execFile(process.execPath, [cliPath, 'automation.authorization_propose', JSON.stringify({
+      org: 'org-automation', ...readableProposal,
+    })], {
+      env: { ...process.env, COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: 'test', COCO_USER_TOKEN: '', COCO_RPC_LOG: '0' }, timeout: 5000,
+    }, (error, stdout, stderr) => resolve({ error, stdout, stderr })));
+    assert.ifError(result.error);
+    assert.deepEqual(JSON.parse(result.stdout), response.data);
+    assert.deepEqual(requests, [{ method: 'POST', url: '/api/v1/automation-authorizations/proposals' }]);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 test('authorization preview forwards final configuration and update scope', async () => {
   const configuration = { lead_member_id: 'agent', owner_member_id: 'human', spec: { project_id: 'project', title: 'Task' }, cron_expr: '0 9 * * *' };
   const request = await captureRequest('automation.authorization_preview', {
@@ -66,6 +130,7 @@ test('ordinary delivery preserves the empty-body acceptance workflow', async () 
 
 const authorizationProof = { authorization_proposal_message_id: '1790220732844', authorization_confirmation_message_id: '1790220732845' };
 for (const [command, params, retry] of [
+  ['automation.authorization_propose', readableProposal, false],
   ...['event-binding', 'webhook'].flatMap(prefix => {
     const source_kind = prefix === 'event-binding' ? 'timer' : 'webhook';
     const configuration = { lead_member_id: 'agent', owner_member_id: 'human', spec: { project_id: 'project', title: 'Task' } };
@@ -107,6 +172,7 @@ for (const [command, params, retry] of [
 }
 
 for (const [command, params] of [
+  ['automation.authorization_propose', readableProposal],
   ['issue.deliver', { summary: 'Recorded result', outcome: 'success', idempotencyKey: 'delivery-1' }],
   ['issue.create_revision', { description: 'Correct result', originMessageId: 'human-1', idempotencyKey: 'revision-1' }],
 ]) {

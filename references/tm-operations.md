@@ -168,9 +168,46 @@ For explicit `automation-create-request` form handoffs, follow
 `event-binding.create` and `webhook.create` accept `{org, source_kind, configuration,
 authorization_proposal_message_id, authorization_confirmation_message_id}`.
 Agent calls require the real proposal and quoted human-confirmation IDs.
-Use `automation.authorization_preview {org,source_kind,operation,configuration,
-target_binding_id?,expected_version?}` to render the exact final proposal; send
-its `data.proposal_text` verbatim and obtain a quoted confirmation before writing.
+Use `automation.authorization_propose {org,request_id,source_kind,operation,configuration,
+target_binding_id?,expected_version?}` with a UUID for this exact plan revision.
+Final timer proposals require an explicit nonblank IANA timezone; resolve missing
+or ambiguous timezones without silently defaulting to UTC or the machine timezone.
+The server sends one readable final plan to the verified DM. The CLI unwraps its
+`data` envelope and returns top-level `proposal_message_id`, `conversation_id`,
+and `proposal_text`.
+Do not resend the text, expose raw JSON or internal IDs, or ask for a second
+confirmation. Verify the returned message and obtain the human's single quoted
+confirmation before writing. The legacy `automation.authorization_preview`
+command is retired (the new server returns 410); never send its output to the human or use it as a
+fallback. If the new endpoint is unavailable, stop without creating anything.
+Only the identical proposal request ID and configuration may be explicitly
+retried to recover the same server-sent message after an uncertain proposal send.
+A changed plan requires a new request ID and fresh confirmation. This proposal
+idempotency does not authorize retrying an uncertain automation mutation.
+
+For an old unregistered proposal rejected with 403 after the Core upgrade,
+explain that the updated confirmation flow cannot accept the earlier plan;
+do not blame the human or label their confirmation invalid. First reconcile any
+prior uncertain create/update; a later 403 does not resolve that earlier write.
+Only after a known unregistered-proposal rejection and no unresolved writes,
+request a fresh server-sent readable plan with a new request ID, read it back,
+and obtain a new single quoted human confirmation. Never reuse old proposal or
+confirmation IDs or fall back to raw preview output. A proposal-store outage is
+503, not that 403: explain temporary unavailability, retain the existing context,
+and wait for recovery after reconciling uncertain writes; never blindly retry a
+mutation or replace proof while a write is unresolved. See Automation Creation
+for the full recovery procedure, including a previously successful operation.
+
+Required rollout order: successfully apply and verify migration 110, then deploy
+compatible Core and verify proposal-store and readable-proposal health, then
+release the compatible plugin. Stop if a prerequisite fails; health verification
+includes durable proposal registration and readback, not just process liveness.
+Existing pending legacy confirmations are invalidated at Core cutover and need
+the recovery above. Use a maintenance window if needed for the incompatible
+interval; do not promise zero downtime or let an old plugin continue sending
+legacy preview plans against the new Core. This guidance is not live deployment
+or test-automation authorization.
+
 `source_kind` must match the command (`timer` / `webhook`). The configuration
 accepts only the listed create REST fields; unknown fields are rejected.
 Timers preserve `schedule_kind`, `timezone`, `cron_expr`,
@@ -342,7 +379,7 @@ When a human says in a DM "help me set up a scheduled task", you (the selected l
 #    - how often to run → convert to a 5-field cron (state the timezone assumption clearly)
 #    - which project it belongs to
 #    - what to do when the time comes → title / description, ask for as much context as possible
-# 1) Obtain server-rendered proposal and quoted human confirmation as described above.
+# 1) Have automation.authorization_propose send one readable plan and obtain its quoted human confirmation.
 # 2) Create with those actual message IDs; never use placeholders as proof.
 node src/cli/tm.js event-binding.create '{
   "org":"<verified organization>",
@@ -355,7 +392,7 @@ node src/cli/tm.js event-binding.create '{
   "title":"Weekly cleanup of expired artifacts",
   "description":"Clean up temporary artifacts older than 7 days and output a cleanup report"
 }'
-# 3) Report the result (binding id + nextTriggerAt)
+# 3) Report the task name, actual state and next trigger time; keep the binding ID private.
 ```
 
 Key points:

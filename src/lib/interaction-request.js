@@ -60,7 +60,7 @@ function requireText(value, field) {
  * Whitelists for the same reason as above: the key that needs refusing is the
  * one nobody thought of.
  */
-const OPTION_KEYS = new Set(['label', 'text', 'style', 'confirm']);
+const OPTION_KEYS = new Set(['label', 'text', 'style', 'confirm', 'behavior', 'decline', 'icon']);
 const CONFIRM_KEYS = new Set(['text', 'label']);
 
 function rejectUnknownKeys(obj, allowed, path, carries) {
@@ -94,7 +94,7 @@ function normalizeOption(option, index) {
   if (option.id !== undefined) {
     throw new InteractionRequestError(`${at}.id`, 'cannot be set: cws-comm generates option ids and returns them as action_ids');
   }
-  rejectUnknownKeys(option, OPTION_KEYS, at, 'an option carries `label` (or the `text` alias), `style` and `confirm`');
+  rejectUnknownKeys(option, OPTION_KEYS, at, 'an option carries `label` (or the `text` alias), `style`, `confirm`, and on an onboarding card `behavior`, `decline` and `icon`');
   const label = requireText(option.label ?? option.text, `${at}.label`);
   const out = { label };
   if (option.style !== undefined) out.style = String(option.style);
@@ -107,7 +107,45 @@ function normalizeOption(option, index) {
   // wording on the safe button too: "leave it running" ends up asking the
   // reader to confirm that the service will go down.
   if (option.confirm !== undefined) out.confirm = normalizeConfirm(option.confirm, `${at}.confirm`);
+  // The onboarding guide-card fields. Passed through as given: which values
+  // exist, and which card kinds admit each, is cws-comm's ruling (see the
+  // no-local-caps note at the top of this file), and it refuses the rest with
+  // the field named.
+  if (option.behavior !== undefined) out.behavior = String(option.behavior);
+  if (option.decline !== undefined) out.decline = option.decline;
+  if (option.icon !== undefined) out.icon = String(option.icon);
   return out;
+}
+
+/**
+ * Behaviors that do something other than answer. An option answers unless it
+ * declares one of these; an unknown behavior counts as answering here only so
+ * that cws-comm, not this check, is what refuses it.
+ */
+const NON_ANSWER_BEHAVIORS = new Set(['open_create_agent']);
+
+function isAnsweringOption(option) {
+  return !NON_ANSWER_BEHAVIORS.has(option.behavior);
+}
+
+/**
+ * Refuse, for the two entries that RECORD a question, a card nobody can answer.
+ *
+ * `comm.ask_card` and `[CARD]` write a pending question that waits for a
+ * receipt. A card whose every option opens a dialog instead of answering —
+ * the onboarding partner card — never produces one: cws-comm refuses to settle
+ * such a button. The record would then sit in `comm.pending` for good, looking
+ * like a person who has not replied yet. `comm.send_card` records nothing and
+ * is the verb for that card.
+ */
+export function assertAnswerable(body, verb) {
+  const options = body?.choice?.options || [];
+  if (options.some(isAnsweringOption)) return;
+  throw new InteractionRequestError(
+    'options',
+    `${verb} records a question awaiting an answer, but no option on this card answers one — every option opens something instead. `
+      + 'Send it with comm.send_card, which records nothing',
+  );
 }
 
 /** A single text block, the shape `text` collapses into when no blocks are given. */
@@ -134,15 +172,16 @@ function textBlock(text) {
  * One flat set covers both callers because `comm.ask_card` strips its own three
  * arguments (`kind`, `askedOf`, `meta`) before calling — and must keep doing so.
  * `kind` in particular means something different to each verb, and this builder
- * has to keep refusing it: the old card API's `kind` has no field on the
- * interaction-requests endpoint. If a future verb needs to pass an argument
- * through instead of stripping it, split this into a per-caller set rather than
- * widening the shared one, or the widened key becomes silently droppable again
- * for the other verb.
+ * has to keep refusing it: to the two recording entries it is what the question
+ * is for, and the card family the endpoint does accept is taken as `cardKind`
+ * instead, so one word never carries both meanings. If a future verb needs to
+ * pass an argument through instead of stripping it, split this into a
+ * per-caller set rather than widening the shared one, or the widened key
+ * becomes silently droppable again for the other verb.
  */
 const KNOWN_PARAMS = new Set([
   // card fields
-  'title', 'summary', 'text', 'blocks', 'options', 'confirm', 'clientMsgId',
+  'title', 'summary', 'text', 'blocks', 'options', 'confirm', 'clientMsgId', 'cardKind',
   // CLI arguments that ride along on the same params object
   'conversationId', 'org', 'orgSlug', 'orgId', 'org_id',
 ]);
@@ -165,6 +204,16 @@ const BLOCK_TYPES = new Set([
 function rejectUnknownParams(params) {
   for (const key of Object.keys(params)) {
     if (KNOWN_PARAMS.has(key)) continue;
+    if (key === 'kind') {
+      // The endpoint DOES have a kind now, so the generic "no field for it"
+      // below would be false here; the caller almost certainly meant the card
+      // family.
+      throw new InteractionRequestError(
+        key,
+        'is not a card field: the card family (interaction.choice / onboarding.task / onboarding.channel / '
+          + 'onboarding.partner) is `cardKind`, and `kind` is comm.ask_card\'s name for what the question is for',
+      );
+    }
     const hint = BLOCK_TYPES.has(key)
       ? ` — \`${key}\` is a BLOCK type, not a top-level field: pass it inside \`blocks\`, `
         + `e.g. {"blocks":[{"type":"text","text":"…"},{"type":"${key}", …}]}`
@@ -225,6 +274,11 @@ export function buildChoiceRequest(params = {}) {
   const options = params.options.map(normalizeOption);
 
   const choice = { title, summary, blocks, options };
+  // `cardKind`, not `kind`: comm.ask_card and `[CARD]` already use `kind` for
+  // what the question is for, and strip it before calling here. Reusing the
+  // name would give one word two meanings on the same payload. The value is
+  // cws-comm's to judge; it refuses one outside its closed set by name.
+  if (params.cardKind !== undefined) choice.kind = String(params.cardKind);
   if (params.confirm !== undefined) {
     choice.confirm = normalizeConfirm(params.confirm, 'confirm');
   }

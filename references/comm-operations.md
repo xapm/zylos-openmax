@@ -334,9 +334,9 @@ Each of these is refused with the offending field named, not dropped:
 | an option `id` | cws-comm generates ids and returns them as `action_ids`. A dropped `id` would leave you matching the answer against something the server never saw |
 | zero options | the protocol has no interaction type for a card with nothing to choose |
 | `replyTo` / `mentions` | the endpoint has no field for either. A reply-to that vanished looks exactly like one that was never asked for |
-| `kind` / `fallbackText` | arguments of the retired card API; the interaction-requests endpoint has no field for either. (`comm.ask_card` has its own `kind` — see below — which that verb consumes itself) |
-| **any other top-level key** | the accepted set is closed: `title` `summary` `text` \| `blocks` `options` `confirm` `clientMsgId`, plus the CLI's own `conversationId` and `org`. Anything else is a caller who thinks they sent something — a top-level `fields` is the case that cost a card its content |
-| **any other key inside an option** | an option's set is closed too: `label` (or the `text` alias), `style`, `confirm`. `confirm_text` or a misspelled `style` would otherwise build, send and render — minus the second confirmation step, or minus the primary button, with nothing said |
+| `kind` / `fallbackText` | arguments of the retired card API. The card family is `cardKind` (see "Onboarding guide cards" below); `kind` stays refused so that it keeps a single meaning — `comm.ask_card`'s "what the question is for", which that verb consumes itself |
+| **any other top-level key** | the accepted set is closed: `title` `summary` `text` \| `blocks` `options` `confirm` `clientMsgId` `cardKind`, plus the CLI's own `conversationId` and `org`. Anything else is a caller who thinks they sent something — a top-level `fields` is the case that cost a card its content |
+| **any other key inside an option** | an option's set is closed too: `label` (or the `text` alias), `style`, `confirm`, and for onboarding cards `behavior`, `decline`, `icon`. `confirm_text` or a misspelled `style` would otherwise build, send and render — minus the second confirmation step, or minus the primary button, with nothing said |
 | **any other key inside a `confirm`** | a confirm carries `text` and an optional `label`, and nothing else |
 
 Business parameters — an operation, a URL, a handler, an amount — have no field
@@ -351,6 +351,58 @@ holds all of it and names the offending field when something violates it. This
 CLI deliberately does **not** restate those rules. A second copy drifts, and it
 drifts toward the stricter side — a local cap tighter than the server's makes a
 range the server accepts unreachable, with an error that blames you for it.
+
+### Onboarding guide cards (`cardKind`)
+
+Three onboarding cards have their own family, and the client renders each one
+with its own component: `onboarding.task`, `onboarding.channel` and
+`onboarding.partner`. Pick one with **`cardKind`**. Without it the card is a plain
+choice card (`interaction.choice`). It is `cardKind` rather than `kind` because
+`comm.ask_card` and `[CARD]` already use `kind` for what the question is for.
+
+Three option fields exist only for these cards:
+
+| Option field | What it does | Where cws-comm accepts it |
+|---|---|---|
+| `decline: true` | marks the "none of these" option. You cannot name its id (cws-comm generates ids), so cws-comm records the generated id in the card for the client — the client never guesses it from position | onboarding kinds; at most one per card; only on an option that answers |
+| `icon` | an icon **slug** such as `lark` — lowercase letters, digits, `_` and `-`, starting with a letter or digit, at most 32 — never a URL. The client resolves it, and renders a neutral placeholder for a slug it does not know | onboarding kinds |
+| `behavior: "open_create_agent"` | the button opens the client's "add agent" dialog. It answers nothing and sends nothing, and it takes no target — there is nothing to point it anywhere else | `onboarding.partner` only |
+
+cws-comm currently allows up to 16 options on `onboarding.channel` and 5 on every
+other kind. That is the server's rule, not this CLI's: an over-count is refused
+by cws-comm with the field named.
+
+```bash
+node src/cli/comm.js comm.send_card '{
+  "conversationId": "<uuid>",
+  "cardKind": "onboarding.channel",
+  "title": "把我接到你常用的地方",
+  "summary": "Onboarding · 渠道",
+  "text": "选一个你最常用的渠道。",
+  "options": [{"label": "飞书", "icon": "lark"}, {"label": "企业微信", "icon": "wecom"}, {"label": "都不用", "decline": true}]
+}'
+```
+
+🔴 **The partner card goes through `comm.send_card`, never `comm.ask_card` or
+`[CARD]`.** Its only button opens a dialog; cws-comm refuses to record a click on
+it as an answer, so no receipt ever comes back. The two recording entries would
+leave a pending question that waits forever, so they refuse a card on which no
+option answers — before anything is sent.
+
+```bash
+node src/cli/comm.js comm.send_card '{
+  "conversationId": "<uuid>",
+  "cardKind": "onboarding.partner",
+  "title": "找一位搭档",
+  "summary": "Onboarding · 搭档",
+  "text": "再加一位 agent,分担工作。",
+  "options": [{"label": "加入一位搭档", "behavior": "open_create_agent"}]
+}'
+```
+
+As with every other field, the values are cws-comm's to judge: an unknown
+`cardKind`, `behavior` or icon shape, or `decline` on a plain card, is refused by
+the server with the field named, not here.
 
 ### Asking a question you intend to act on
 

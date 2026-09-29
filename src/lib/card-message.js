@@ -28,7 +28,7 @@
  */
 
 import { post, apiPath } from './client.js';
-import { buildChoiceRequest } from './interaction-request.js';
+import { assertAnswerable, buildChoiceRequest } from './interaction-request.js';
 import { recordPendingQuestion } from './pending-question.js';
 
 export const CARD_PREFIX = '[CARD]';
@@ -132,6 +132,7 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
   const nowIso = deps.now ? deps.now() : new Date().toISOString();
 
   const request = buildChoiceRequest(parsed.card);
+  assertAnswerable(request, '[CARD]');
   const res = await postFn(apiPath(`/conversations/${conversationId}/interaction-requests`), request);
 
   const actionIds = res?.action_ids || res?.data?.action_ids;

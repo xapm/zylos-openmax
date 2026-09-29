@@ -250,3 +250,48 @@ test('send_card refuses a card with no options', async () => {
   assert.match(failure.error, /^options: /);
   assert.equal(failure.status, undefined, 'no HTTP round trip happened');
 });
+
+test('🔴 send_card carries the onboarding guide-card fields to the wire', async () => {
+  const request = await captureRequest('comm.send_card', {
+    conversationId: 'cv-card-g1', title: '选择渠道', summary: '把 agent 接到你常用的地方',
+    text: '选一个渠道。', cardKind: 'onboarding.channel',
+    options: [{ label: '飞书', icon: 'lark' }, { label: '都不用', decline: true }],
+  });
+  assert.equal(request.body.choice.kind, 'onboarding.channel');
+  assert.deepEqual(request.body.choice.options, [
+    { label: '飞书', icon: 'lark' },
+    { label: '都不用', decline: true },
+  ]);
+});
+
+test('send_card sends a partner card whose only button opens the dialog', async () => {
+  const request = await captureRequest('comm.send_card', {
+    conversationId: 'cv-card-g2', title: '找个搭档', summary: '再加一位 agent',
+    text: '加入一位搭档,分担工作。', cardKind: 'onboarding.partner',
+    options: [{ label: '加入一位搭档', behavior: 'open_create_agent' }],
+  });
+  assert.equal(request.body.choice.kind, 'onboarding.partner');
+  assert.equal(request.body.choice.options[0].behavior, 'open_create_agent');
+});
+
+test('🔴 ask_card refuses a card no one can answer, before anything is sent', async () => {
+  // It would record a pending question that never receives a receipt.
+  const failure = await captureFailure('comm.ask_card', {
+    conversationId: 'cv-card-g3', title: '找个搭档', summary: '再加一位 agent',
+    text: '加入一位搭档。', cardKind: 'onboarding.partner',
+    options: [{ label: '加入一位搭档', behavior: 'open_create_agent' }],
+    kind: 'onboarding-partner', askedOf: 'm-owner',
+  });
+  assert.match(failure.error, /^options: /);
+  assert.match(failure.error, /comm\.send_card/);
+  assert.equal(failure.status, undefined, 'no HTTP round trip happened');
+});
+
+test('ask_card keeps its own `kind` separate from the card family', async () => {
+  const request = await captureRequest('comm.ask_card', {
+    conversationId: 'cv-card-g4', title: '选择渠道', summary: 's', text: 'body',
+    cardKind: 'onboarding.channel', options: ['飞书', { label: '都不用', decline: true }],
+    kind: 'channel-choice', askedOf: 'm-owner',
+  }, { allowFailure: true });
+  assert.equal(request.body.choice.kind, 'onboarding.channel');
+});

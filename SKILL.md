@@ -202,7 +202,9 @@ question over Lark, Telegram or WeChat stays plain text exactly as before. See
   ]
   ```
 
-  `blocks` and `text` are alternatives — `text` is shorthand for a single text block, so a card passing `blocks` must not also pass `text` (passing both is refused, not silently resolved). The keys inside an option (`label` / `style` / `confirm`) and inside a `confirm` (`text` / `label`) are closed sets as well: a misspelled one is refused rather than dropped. Block types: `text` · `markdown` · `fields` · `divider` · `image` · `quote` · `artifact_list`. See `references/comm-operations.md`.
+  `blocks` and `text` are alternatives — `text` is shorthand for a single text block, so a card passing `blocks` must not also pass `text` (passing both is refused, not silently resolved). The keys inside an option (`label` / `style` / `confirm`, plus `behavior` / `decline` / `icon` on onboarding cards) and inside a `confirm` (`text` / `label`) are closed sets as well: a misspelled one is refused rather than dropped. Block types: `text` · `markdown` · `fields` · `divider` · `image` · `quote` · `artifact_list`. See `references/comm-operations.md`.
+
+  **Onboarding guide cards** (task / channel / partner) are picked with `cardKind` — `onboarding.task` · `onboarding.channel` · `onboarding.partner` — never `kind`, which is `comm.ask_card`'s "what the question is for". The partner card's only button (`behavior: "open_create_agent"`) opens the add-agent dialog and answers nothing, so send it with `comm.send_card`: `comm.ask_card` and `[CARD]` refuse a card no option answers. `decline`, `icon` and the 16-option channel card: see `references/comm-operations.md` ("Onboarding guide cards").
 
   Use `comm.ask_card` rather than `comm.send_card` for any question you intend to **act** on. It sends the card and records what was asked in one call; a card sent without that record produces an answer that arrives decodable and meaningless, because the receipt names only the card. Pass `kind` (what the question is for) and `askedOf` (the member whose answer counts).
 

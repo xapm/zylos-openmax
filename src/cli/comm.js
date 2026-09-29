@@ -26,7 +26,7 @@
 import { randomUUID } from 'crypto';
 import { getForOrg, postForOrg, delForOrg, apiPath } from '../lib/client.js';
 import { looksLikeMarkdown } from '../lib/message.js';
-import { buildChoiceRequest } from '../lib/interaction-request.js';
+import { assertAnswerable, buildChoiceRequest } from '../lib/interaction-request.js';
 import { formatLocalTime } from '../lib/local-time.js';
 import {
   clearPendingQuestion,
@@ -489,13 +489,15 @@ const COMMANDS = {
     }
     // Strip this verb's own arguments before building the request. `kind`,
     // `askedOf` and `meta` describe the QUESTION, not the card, and the card
-    // builder refuses every field the endpoint has no place for — including a
-    // `kind`, which the old card API used for something else entirely. Passing
-    // them through made this verb throw on its own required argument.
+    // builder refuses all three — `kind` included, because the card family is
+    // `cardKind` there. Passing them through made this verb throw on its own
+    // required argument.
     const { kind, askedOf, meta, ...cardParams } = params;
+    const request = buildChoiceRequest(cardParams);
+    assertAnswerable(request, 'comm.ask_card');
     const res = await post(
       apiPath(`/conversations/${params.conversationId}/interaction-requests`),
-      buildChoiceRequest(cardParams),
+      request,
     );
     const actionIds = res?.action_ids || res?.data?.action_ids;
     const messageId = res?.message_id || res?.data?.message_id;
@@ -676,7 +678,7 @@ Messages
   comm.send                 {conversationId, content, replyTo?, clientMsgId?, mentions?}
                             # content: string | {text|body, markdown?} | {type,body} | [{type,body}]
                             # mentions auto-resolved from @name in text if omitted (array of member_id or {type,member_id})
-  comm.ask_card             {conversationId, title, summary, options, kind, askedOf, text?|blocks?, confirm?, meta?}
+  comm.ask_card             {conversationId, title, summary, options, kind, askedOf, text?|blocks?, confirm?, cardKind?, meta?}
                             # send a choice card AND record what was asked, so the later receipt
                             #   can be decoded. Prefer this over comm.send_card for any question
                             #   you intend to act on
@@ -707,7 +709,17 @@ Messages
                             #   expired / actionable. Decides nothing, executes nothing
   comm.pending              {}                                   # questions still awaiting an answer
   comm.pending_clear        {cardMessageId}                       # forget one that has been dealt with
-  comm.send_card            {conversationId, title, summary, text?|blocks?, options, confirm?, clientMsgId?}
+  comm.send_card            {conversationId, title, summary, text?|blocks?, options, confirm?, cardKind?, clientMsgId?}
+                            # cardKind picks an onboarding card family: onboarding.task |
+                            #   onboarding.channel | onboarding.partner (omitted = plain choice card).
+                            #   NOT "kind" — that is ask_card's "what the question is for"
+                            # onboarding options may also carry: decline:true ("none of these";
+                            #   cws-comm records its generated id for the client), icon:"<slug>"
+                            #   (never a URL), behavior:"open_create_agent" (partner card only:
+                            #   opens the add-agent dialog, answers nothing). channel card: up to 16
+                            #   options. See references/comm-operations.md "Onboarding guide cards"
+                            # a partner card MUST go through send_card: ask_card and [CARD] refuse a
+                            #   card on which no option answers, since no receipt would ever arrive
                             # BODY: "text" is shorthand for one paragraph; anything richer passes
                             #   "blocks" INSTEAD (pass one or the other, never both):
                             #     "blocks": [

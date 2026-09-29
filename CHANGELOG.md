@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Onboarding guide cards can be sent.** cws-comm (`!529`) and cws-core (`!769`) now accept a card family and three option fields, and every card entry here carries them: `comm.send_card`, `comm.ask_card` and `[CARD]`. The family is **`cardKind`** — `onboarding.task`, `onboarding.channel` or `onboarding.partner`; omitted, the card stays a plain choice card. It is not `kind`, because `comm.ask_card` and `[CARD]` already use `kind` for what the question is for and strip it before building the card; a top-level `kind` is still refused, and the refusal now names `cardKind`. An option may carry `decline: true` (the "none of these" option; cws-comm records its generated id for the client), `icon` (a slug, never a URL) and `behavior: "open_create_agent"` (the partner card's button, which opens the add-agent dialog). As with every other field, the values are passed through and cws-comm refuses what it does not accept, with the field named.
+
+### Changed
+
+- **`comm.ask_card` and `[CARD]` refuse a card on which no option answers.** Both record a pending question that waits for a receipt. The partner card's only button opens a dialog, and cws-comm refuses to record a click on it as an answer, so that record would wait forever and read in `comm.pending` like a person who has not replied. The refusal happens before anything is sent and points at `comm.send_card`, which records nothing. A card with at least one answering option is unaffected.
+
 ## [2.22.0] - 2026-09-28
 
 ### Added

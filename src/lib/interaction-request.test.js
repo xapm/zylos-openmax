@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { buildChoiceRequest, InteractionRequestError } from './interaction-request.js';
+import { assertAnswerable, buildChoiceRequest, InteractionRequestError } from './interaction-request.js';
 
 const base = {
   conversationId: 'c1',
@@ -403,4 +403,86 @@ test('every key an option and a confirm DO accept still builds', () => {
     { label: '先不停' },
   ]);
   assert.deepEqual(body.choice.confirm, { text: '卡片级', label: '继续' });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Onboarding guide cards (cws-comm !529, cws-core !769)
+//
+// cws-comm now accepts a card family (`kind` on the choice) and three option
+// fields. They are named `cardKind` here because `kind` already means "what the
+// question is for" to comm.ask_card and `[CARD]`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('🔴 cardKind reaches the wire as choice.kind', () => {
+  const body = buildChoiceRequest({ ...base, cardKind: 'onboarding.channel', options: ['飞书'] });
+  assert.equal(body.choice.kind, 'onboarding.channel');
+  assert.equal('cardKind' in body.choice, false);
+});
+
+test('no cardKind, no kind on the wire — the server default stays the server\'s', () => {
+  const body = buildChoiceRequest({ ...base, options: ['Yes'] });
+  assert.equal('kind' in body.choice, false);
+});
+
+test('🔴 a top-level `kind` is still refused, and the refusal names cardKind', () => {
+  // It stays refused because comm.ask_card strips its own `kind` before
+  // calling; accepting it here would make a forgotten strip send the
+  // question's purpose as the card family.
+  const err = refusal(() => buildChoiceRequest({ ...base, options: ['Y'], kind: 'onboarding.channel' }));
+  assert.equal(err.field, 'kind');
+  assert.match(err.message, /cardKind/);
+});
+
+test('🔴 behavior, decline and icon on an option reach the wire', () => {
+  const body = buildChoiceRequest({
+    ...base,
+    cardKind: 'onboarding.channel',
+    options: [
+      { label: '飞书', icon: 'lark' },
+      { label: '都不用', decline: true },
+      { label: '加入', behavior: 'open_create_agent' },
+    ],
+  });
+  assert.deepEqual(body.choice.options, [
+    { label: '飞书', icon: 'lark' },
+    { label: '都不用', decline: true },
+    { label: '加入', behavior: 'open_create_agent' },
+  ]);
+});
+
+test('🔴 no local ruling on guide-card values — cws-comm holds those rules', () => {
+  // Unknown values and a 16th option must reach the server, which refuses what
+  // it does not accept with the field named.
+  const options = Array.from({ length: 16 }, (_, i) => ({ label: `c${i}`, icon: 'https://x/y.png' }));
+  options[0] = { label: 'x', behavior: 'open_url', decline: 'yes' };
+  const body = buildChoiceRequest({ ...base, cardKind: 'onboarding.other', options });
+  assert.equal(body.choice.kind, 'onboarding.other');
+  assert.equal(body.choice.options.length, 16);
+  assert.deepEqual(body.choice.options[0], { label: 'x', behavior: 'open_url', decline: 'yes' });
+  assert.equal(body.choice.options[1].icon, 'https://x/y.png');
+});
+
+test('an option without the new fields gains none of them', () => {
+  const body = buildChoiceRequest({ ...base, options: [{ label: 'Yes' }] });
+  assert.deepEqual(body.choice.options, [{ label: 'Yes' }]);
+});
+
+test('🔴 assertAnswerable refuses a card on which no option answers', () => {
+  const body = buildChoiceRequest({
+    ...base, cardKind: 'onboarding.partner',
+    options: [{ label: '加入一位搭档', behavior: 'open_create_agent' }],
+  });
+  const err = refusal(() => assertAnswerable(body, 'comm.ask_card'));
+  assert.equal(err.field, 'options');
+  assert.match(err.message, /comm\.send_card/);
+});
+
+test('assertAnswerable passes a card with at least one answering option', () => {
+  for (const options of [
+    ['Yes'],
+    [{ label: 'a', behavior: 'answer' }],
+    [{ label: 'a', behavior: 'open_create_agent' }, { label: 'b' }],
+  ]) {
+    assert.doesNotThrow(() => assertAnswerable(buildChoiceRequest({ ...base, options }), 'comm.ask_card'));
+  }
 });

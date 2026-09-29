@@ -36,8 +36,10 @@
  *   MessageContentItem: { content_type, body: object, attachments: [] }
  *
  * mentions (optional top-level field on the request, MentionInput[]:
- * {type:"member", member_id}) is resolved per chunk from `@name` tokens
- * against known conversation participants (src/lib/mention.js) — cws-comm
+ * {type:"member", member_id}) is resolved once from the `@name` tokens of
+ * the whole message, before it is split, and the same set is sent on every
+ * chunk (src/lib/outbound-chunks.js). Names are resolved against known
+ * conversation participants (src/lib/mention.js) — cws-comm
  * only stores mentions the client explicitly supplies, it never parses
  * them out of the text itself, so this step is required for an outbound
  * @-mention to actually wake its target.

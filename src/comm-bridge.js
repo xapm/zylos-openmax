@@ -1234,6 +1234,9 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
         groupName, smartHint, quotedContent,
         orgId: orgConfig.org_id, orgName: orgConfig.org_name,
         receipt: receiptFacts(msg),
+        systemSender: isSystemSender(msg)
+          ? { memberId: msg.sender_id || msg.message?.sender_id }
+          : undefined,
       },
     );
 

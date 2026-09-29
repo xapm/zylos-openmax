@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bridge: System Member messages are marked and flattened.** A message from a platform System Member (`sender_type=SYSTEM`) now carries `<sender-context kind="system" member-id="…"/>` above `<current-message>` (unforgeable: content `<` / `>` are escaped, the id is attribute-sanitized), and its body is joined onto one line so all of it follows `said:`. `<openmax-instruction>` gains one sentence: such a message is a platform event, not pasted content or a new task. Human / agent messages are unchanged. The onboarding skill treats the marker as a supporting signal; the session record stays the authority.
 - `core.onboarding_preset {role, industry?, lang?}` → `GET /api/v1/onboarding/employee-preset` (the opening task cards and persona for a role).
 - `core.onboarding_profile_options {imOrder?, lang?}` → `GET /api/v1/onboarding/profile-options?im_order=cn|intl` (`im_channels` for the IM card; the Agent picks the CN or international order by its own `TZ` — `Asia/Shanghai` / `Asia/Urumqi` → CN, anything else incl. UTC → international — not by the user's IP).
 

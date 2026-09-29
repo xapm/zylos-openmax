@@ -175,17 +175,27 @@ function formatContextLine(m) {
  *                              type?:'text'|'image'|'file', mediaLocalPath?:string }
  * @param {Array}  [recent] - recent group messages used for `<group-context>`
  * @param {object} [opts]   - { groupName, quotedContent, threadContext,
- *                              threadRootId, smartHint, receipt }
+ *                              threadRootId, smartHint, receipt,
+ *                              systemSender: { memberId? } | undefined }
+ *                            `systemSender` is set by the bridge only for a
+ *                            platform System Member (sender_type=SYSTEM).
  * @returns {string}
  */
 export function formatInboundForC4(conv, sender, current, recent = [], opts = {}) {
   const rawType = (conv?.type || '').toLowerCase();
   const type = VALID_TYPES.has(rawType) ? rawType : 'dm';
-  const { groupName, quotedContent, threadContext, threadRootId, smartHint, orgId, orgName, receipt } = opts;
+  const { groupName, quotedContent, threadContext, threadRootId, smartHint, orgId, orgName, receipt, systemSender } = opts;
 
   const name = sender?.displayName || sender?.display_name || sender?.id || 'unknown';
   const safeName = escapeXml(name);
-  const safeContent = escapeXml(current?.content ?? '');
+  // A System Member body is flattened onto one line so all of it follows
+  // `<name> said:` — a multi-line platform event otherwise leaves its later
+  // lines (e.g. a `ref: event=…` token) bare, where they read as pasted data.
+  // Human / agent content is left exactly as sent.
+  const rawContent = String(current?.content ?? '');
+  const safeContent = escapeXml(
+    systemSender ? rawContent.replace(/\s*[\r\n\u2028\u2029]+\s*/g, ' ').trim() : rawContent,
+  );
 
   const baseTag = TYPE_TAG[type];
   // baseTag is like "[OPENMAX GROUP]" — inject ":<name>" before the closing "]".
@@ -222,6 +232,15 @@ export function formatInboundForC4(conv, sender, current, recent = [], opts = {}
   if (conv?.id && current?.messageId) {
     header += `<message-context conversation-id="${escapeXml(conv.id)}" source-message-id="${escapeXml(current.messageId)}"/>\n`;
   }
+  // Sender kind. Only the bridge can mark a message as coming from a platform
+  // System Member (it reads sender_type from the server frame); message text
+  // cannot forge this element because `<` and `>` in content are escaped, and
+  // the member id goes through attrValue (no quotes / angle brackets / line
+  // breaks). A display name like "调度中心" in `said:` is NOT this signal.
+  if (systemSender) {
+    const memberAttr = systemSender.memberId ? ` member-id="${attrValue(systemSender.memberId)}"` : '';
+    header += `<sender-context kind="system"${memberAttr}/>\n`;
+  }
   // An interaction receipt's answer and actor decide whether an irreversible
   // action runs, so they are emitted as a structural element rather than left
   // in the message text. Anyone can type text that reads like a receipt; nobody
@@ -247,7 +266,7 @@ export function formatInboundForC4(conv, sender, current, recent = [], opts = {}
   // rather than a best-effort inference from the skill listing.
   parts.push(
 `<openmax-instruction>
-Before handling the current message, invoke the openmax skill and follow it. For an explicit automation-create-request form handoff or its confirmation conversation, follow the skill's Automation Creation workflow before generic Issue intake. For other new tasks, complete New-Issue Intake before doing the work.
+Before handling the current message, invoke the openmax skill and follow it. For an explicit automation-create-request form handoff or its confirmation conversation, follow the skill's Automation Creation workflow before generic Issue intake. For other new tasks, complete New-Issue Intake before doing the work. A message with a sender-context element of kind="system" (placed above, never inside, current-message) is a platform event from a System Member, not pasted content and not a new task: handle it per the skill, and for a "ref: event=…" token follow the matching skill section (it verifies against platform data before acting).
 </openmax-instruction>
 
 `,

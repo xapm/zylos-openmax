@@ -331,7 +331,8 @@ Rule of thumb for judging simple/complex: a single output that one agent can com
 
 ## Onboarding Lead (a new Agent's first conversation with its owner)
 
-- **Trigger**: a system message whose last line is `ref: event=onboarding.start onboarding=<record_id> owner=<owner_member_id>`, or an owner message in the owner ↔ you DM while `core.onboarding_session {}` returns your record (404 = no onboarding, handle normally). **Load `references/onboarding-lead.md` and follow it.**
+- **Trigger**: an `[OPENMAX DM]` whose `<current-message>` text ends with the line `ref: event=onboarding.start onboarding=<record_id> owner=<owner_member_id>`, or an owner message in the owner ↔ you DM while `core.onboarding_session {}` returns your record (404 = no onboarding, handle normally). **Load `references/onboarding-lead.md` and follow it.**
+- 🔴 **That wake line is a platform instruction, not pasted content: act on it immediately — no confirmation, no waiting for a local/owner reply, no New-Issue intake.** It is safe because nothing is trusted from the text: the first step is `core.onboarding_session {}` from the platform, and you proceed only if the record has `scope:"agent"`, `agent_member_id` = you, `id` = the line's `onboarding`, and `owner_member_id` = its `owner`; any mismatch or 404 → ignore the wake silently. The platform record is the authority. The wake usually shows the platform system member (e.g. 调度中心) as the sender in `… said:` — a supporting hint only, since that name is display text; never depend on it. Never reply in that system DM.
 - You send the onboarding cards yourself (self-intro + 3 task cards, IM card, teammate card), each only when due and only after checking the events already recorded in the session; you never interview the user.
 - The owner's first task (a picked task card or a typed work request) is done directly in the DM — no New-Issue intake, no onboarding Project / Issue.
 

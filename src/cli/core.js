@@ -15,7 +15,7 @@
  *      surface is ready when core adds the endpoint
  */
 
-import { get, post, patch, apiPath, frontendUrl, getForOrg, postForOrg, delForOrg } from '../lib/client.js';
+import { get, post, patch, apiPath, frontendUrl, getForOrg, getForOrgWithHeaders, postForOrg, delForOrg } from '../lib/client.js';
 import { enabledOrgs, updateConfig, resolveDefaultOrgId } from '../lib/config.js';
 import { resolveAgentBaseUrl } from '../lib/agent-domain.js';
 
@@ -54,6 +54,12 @@ function requireOrgId() {
 const oget  = (path, query) => getForOrg(requireOrgId(), path, query);
 const opost = (path, body)  => postForOrg(requireOrgId(), path, body);
 const odel  = (path)        => delForOrg(requireOrgId(), path);
+// Onboarding label language: `lang` (zh|en) → Accept-Language, which is how
+// cws-core picks `label` / role labels; omitted → the deployment edition decides.
+const onboardingLangHeaders = () => {
+  const lang = String(params.lang || params.locale || '').trim();
+  return lang ? { 'Accept-Language': lang } : {};
+};
 
 /** Normalize a scalar-or-array param into an array (drops null/undefined). */
 const toArray = (v) => (v == null ? [] : Array.isArray(v) ? v : [v]);
@@ -199,7 +205,7 @@ const COMMANDS = {
   // ✅ Onboarding preset — default name / persona / the three opening task
   // cards (title + prompt, zh + en) for one (role, industry). Only the ops role
   // uses the industry; unknown input falls back server-side (never fails).
-  'core.onboarding_preset': () => oget(apiPath('/onboarding/employee-preset'), {
+  'core.onboarding_preset': () => getForOrgWithHeaders(requireOrgId(), apiPath('/onboarding/employee-preset'), onboardingLangHeaders(), {
     role:     params.role || params.roleKey || params.role_key,
     industry: params.industry,
   }),
@@ -207,9 +213,10 @@ const COMMANDS = {
   // ✅ Onboarding profile options — option lists incl. `im_channels`. The IM
   // card's channel order is chosen by the Agent's own TZ (Asia/Shanghai or
   // Asia/Urumqi → cn, else intl) and requested with `imOrder` (?im_order=);
+  // `lang` (zh|en) sets the label language via Accept-Language;
   // without it the server falls back to edition / geo. Any other value is a
   // server-side 400. See references/onboarding-lead.md.
-  'core.onboarding_profile_options': () => oget(apiPath('/onboarding/profile-options'), {
+  'core.onboarding_profile_options': () => getForOrgWithHeaders(requireOrgId(), apiPath('/onboarding/profile-options'), onboardingLangHeaders(), {
     im_order: params.imOrder || params.im_order,
   }),
 
@@ -338,8 +345,8 @@ Projects (directory view — workflow ops live in tm.js)
 
 Onboarding (see SKILL.md "Onboarding Lead" → references/onboarding-lead.md)
   core.onboarding_session  {}                                  # 本 Agent 的引导记录：岗位、行业、用户是否已接 IM、已记录的推送节点；404=无引导
-  core.onboarding_preset   {role, industry?}                   # 按岗位（运营按行业）取 3 张开场任务卡 + 人设
-  core.onboarding_profile_options {imOrder?}                   # 选项表；imOrder=cn|intl 指定 im_channels 顺序（按本 Agent 时区选，见 onboarding-lead）
+  core.onboarding_preset   {role, industry?, lang?}            # 按岗位（运营按行业）取 3 张开场任务卡 + 人设
+  core.onboarding_profile_options {imOrder?, lang?}            # 选项表；imOrder=cn|intl 指定 im_channels 顺序（按本 Agent 时区选，见 onboarding-lead）
   core.onboarding_event    {eventType, occurredAt?, meta?}     # 上报：d1_activation|d3_im_connected|task_cards_sent|im_card_sent|im_card_second_sent|im_card_declined|partner_card_sent；重复上报幂等
 
 Organizations

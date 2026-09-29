@@ -188,19 +188,27 @@ const COMMANDS = {
   }),
   'core.platform_agent_delete': () => odel(apiPath(`/platform-agents/${params.memberId}`)),
 
-  // ✅ Onboarding session — the org's onboarding lifecycle record. A Lead
-  // agent woken by the welcome DM reads this to locate the onboarding
-  // structure: `core_issue_id` is the guided-conversation Issue to drive
-  // (read it + its blueprint via tm.js), `project_id` the onboarding project.
-  // 404 = this org never started onboarding.
+  // ✅ Onboarding session — the calling Agent's own onboarding record: owner,
+  // preset role (role_key / role_custom), org industry, status, and the push
+  // events already recorded (task / IM / teammate cards, IM decline) that the
+  // Agent checks before sending any onboarding card. 404 = no onboarding for
+  // this Agent. See references/onboarding-lead.md.
   'core.onboarding_session': () => oget(apiPath('/onboarding/session')),
 
-  // ✅ Onboarding funnel event report. Caller must be the in-flight session's
-  // lead agent. Self-reportable types: d1_activation (user replied ≥1 round
-  // in the core-issue icebreaker), d3_im_connected (third-party IM linked).
-  // Duplicates are absorbed server-side (idempotent 200, recorded=false) —
-  // safe to fire without checking first. d7_first_delivery is server-observed
-  // on issue accept and cannot be self-reported.
+  // ✅ Onboarding preset — default name / persona / the three opening task
+  // cards (title + prompt, zh + en) for one (role, industry). Only the ops role
+  // uses the industry; unknown input falls back server-side (never fails).
+  'core.onboarding_preset': () => oget(apiPath('/onboarding/employee-preset'), {
+    role:     params.role || params.roleKey || params.role_key,
+    industry: params.industry,
+  }),
+
+  // ✅ Onboarding event report. Self-reportable types: d1_activation (owner's
+  // first message in the onboarding DM), d3_im_connected (IM channel linked),
+  // and the push records task_cards_sent / im_card_sent / im_card_second_sent /
+  // im_card_declined / partner_card_sent. Duplicates are absorbed server-side
+  // (idempotent 200, recorded=false) — safe to fire without checking first.
+  // d7_first_delivery is server-observed and cannot be self-reported.
   'core.onboarding_event': () => opost(apiPath('/onboarding/events'), {
     event_type:  params.eventType || params.event_type,
     occurred_at: params.occurredAt || params.occurred_at,
@@ -318,9 +326,10 @@ Platform agents (lifecycle)
 Projects (directory view — workflow ops live in tm.js)
   core.project_list        {status?, page?, pageSize?, orderBy?}    # default status=active (pass status:"archived" for archived); pageSize legacy alias: limit
 
-Onboarding (Lead agent — see SKILL.md "Onboarding Lead" section)
-  core.onboarding_session  {}                                  # org 的 onboarding 会话；core_issue_id=核心对话 Issue，404=从未开始
-  core.onboarding_event    {eventType, occurredAt?, meta?}     # 漏斗埋点上报（d1_activation|d3_im_connected）；重复上报幂等，放心发
+Onboarding (see SKILL.md "Onboarding Lead" → references/onboarding-lead.md)
+  core.onboarding_session  {}                                  # 本 Agent 的引导记录：岗位、行业、已记录的推送节点；404=无引导
+  core.onboarding_preset   {role, industry?}                   # 按岗位（运营按行业）取 3 张开场任务卡 + 人设
+  core.onboarding_event    {eventType, occurredAt?, meta?}     # 上报：d1_activation|d3_im_connected|task_cards_sent|im_card_sent|im_card_second_sent|im_card_declined|partner_card_sent；重复上报幂等
 
 Organizations
   core.org_list            {orderBy?}

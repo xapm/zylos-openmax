@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Onboarding: the Agent sends the guide cards; the three-question interview is gone.** SKILL.md "Onboarding Lead" is now three trigger lines; the flow moved to the on-demand `references/onboarding-lead.md`. On the `ref: event=onboarding.start` wake the Agent reads its own `core.onboarding_session`, fetches its preset task cards, sends a self-introduction + 3 task cards and reports `task_cards_sent`; the first task is done directly in the DM (no New-Issue intake, no onboarding Project / Issue); the IM card (first push after the first task, second push at ≥20 DM messages), the teammate card (≥50 messages, org with exactly one Agent) and the 「都不用」 decline are each gated on the events already recorded and reported as `im_card_sent` / `im_card_second_sent` / `partner_card_sent` / `im_card_declined`. The card send entry and the decline callback are cws-comm's and are left as marked placeholders until they exist.
+
+### Added
+
+- `core.onboarding_preset {role, industry?}` → `GET /api/v1/onboarding/employee-preset` (the opening task cards and persona for a role).
+
 ## [2.22.0] - 2026-09-28
 
 ### Added

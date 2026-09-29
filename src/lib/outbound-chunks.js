@@ -11,8 +11,8 @@
  * the same reason.
  *
  * Consequence: a broadcast sentinel (`@所有人` / `@所有Agent`) anywhere in the
- * text now applies to every chunk, and each mentioned member is notified once
- * per chunk.
+ * text now applies to every chunk, and every chunk carries a mention of each
+ * mentioned member.
  */
 
 import { splitMessage } from './message.js';

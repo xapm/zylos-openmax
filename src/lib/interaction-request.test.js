@@ -486,3 +486,15 @@ test('assertAnswerable passes a card with at least one answering option', () => 
     assert.doesNotThrow(() => assertAnswerable(buildChoiceRequest({ ...base, options }), 'comm.ask_card'));
   }
 });
+
+test('🔴 guide-card values reach the wire with their type intact, never coerced', () => {
+  // String(false) is "false" — a valid icon slug — so coercing here would turn
+  // a wrongly typed value into a legal one the server then accepts.
+  for (const v of [false, null, '', 0, { a: 1 }]) {
+    const body = buildChoiceRequest({
+      ...base, cardKind: v, options: [{ label: 'x', behavior: v, icon: v, decline: v }],
+    });
+    assert.deepEqual(body.choice.kind, v, `cardKind ${JSON.stringify(v)}`);
+    assert.deepEqual(body.choice.options[0], { label: 'x', behavior: v, icon: v, decline: v }, JSON.stringify(v));
+  }
+});

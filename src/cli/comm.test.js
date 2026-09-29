@@ -295,3 +295,20 @@ test('ask_card keeps its own `kind` separate from the card family', async () => 
   }, { allowFailure: true });
   assert.equal(request.body.choice.kind, 'onboarding.channel');
 });
+
+test('🔴 guide-card values keep their JSON type on the wire, through both CLI verbs', async () => {
+  for (const [command, extra] of [
+    ['comm.send_card', {}],
+    ['comm.ask_card', { kind: 'k', askedOf: 'm-owner' }],
+  ]) {
+    for (const v of [false, null, '']) {
+      const request = await captureRequest(command, {
+        conversationId: 'cv-card-t', title: 't', summary: 's', text: 'b',
+        cardKind: v, options: [{ label: 'x', behavior: v, icon: v, decline: v }, 'y'], ...extra,
+      }, { allowFailure: true });
+      const label = `${command} ${JSON.stringify(v)}`;
+      assert.deepEqual(request.body.choice.kind, v, label);
+      assert.deepEqual(request.body.choice.options[0], { label: 'x', behavior: v, icon: v, decline: v }, label);
+    }
+  }
+});

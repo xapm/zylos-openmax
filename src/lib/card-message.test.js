@@ -244,3 +244,16 @@ test('[CARD] carries cardKind and the option fields, and keeps its own kind apar
   assert.deepEqual(sent.choice.options, [{ label: '飞书', icon: 'lark' }, { label: '都不用', decline: true }]);
   assert.equal(parsed.kind, 'component-upgrade', 'the question kind stays the question\'s');
 });
+
+test('🔴 [CARD] keeps guide-card values\' JSON type on the wire', async () => {
+  for (const v of [false, null, '']) {
+    const parsed = parseCardMessage(asMessage(card({
+      cardKind: v, options: [{ label: 'x', behavior: v, icon: v, decline: v }, 'y'],
+    })));
+    const post = stubPost();
+    await sendCardMessage('cv-9', parsed, { post, recordQuestion() {} });
+    const sent = post.calls[0].body;
+    assert.deepEqual(sent.choice.kind, v, JSON.stringify(v));
+    assert.deepEqual(sent.choice.options[0], { label: 'x', behavior: v, icon: v, decline: v }, JSON.stringify(v));
+  }
+});

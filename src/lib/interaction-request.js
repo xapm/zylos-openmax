@@ -107,13 +107,14 @@ function normalizeOption(option, index) {
   // wording on the safe button too: "leave it running" ends up asking the
   // reader to confirm that the service will go down.
   if (option.confirm !== undefined) out.confirm = normalizeConfirm(option.confirm, `${at}.confirm`);
-  // The onboarding guide-card fields. Passed through as given: which values
-  // exist, and which card kinds admit each, is cws-comm's ruling (see the
-  // no-local-caps note at the top of this file), and it refuses the rest with
-  // the field named.
-  if (option.behavior !== undefined) out.behavior = String(option.behavior);
+  // The onboarding guide-card fields. Passed through as given — not coerced:
+  // String(false) is "false", which is a valid icon slug, so coercion would
+  // turn a wrongly typed value into a legal one the server then accepts.
+  // Which values exist, and which card kinds admit each, is cws-comm's ruling
+  // (see the no-local-caps note at the top of this file).
+  if (option.behavior !== undefined) out.behavior = option.behavior;
   if (option.decline !== undefined) out.decline = option.decline;
-  if (option.icon !== undefined) out.icon = String(option.icon);
+  if (option.icon !== undefined) out.icon = option.icon;
   return out;
 }
 
@@ -278,7 +279,7 @@ export function buildChoiceRequest(params = {}) {
   // what the question is for, and strip it before calling here. Reusing the
   // name would give one word two meanings on the same payload. The value is
   // cws-comm's to judge; it refuses one outside its closed set by name.
-  if (params.cardKind !== undefined) choice.kind = String(params.cardKind);
+  if (params.cardKind !== undefined) choice.kind = params.cardKind;
   if (params.confirm !== undefined) {
     choice.confirm = normalizeConfirm(params.confirm, 'confirm');
   }

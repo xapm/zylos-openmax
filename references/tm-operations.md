@@ -184,6 +184,30 @@ Only the identical proposal request ID and configuration may be explicitly
 retried to recover the same server-sent message after an uncertain proposal send.
 A changed plan requires a new request ID and fresh confirmation. This proposal
 idempotency does not authorize retrying an uncertain automation mutation.
+
+For an old unregistered proposal rejected with 403 after the Core upgrade,
+explain that the updated confirmation flow cannot accept the earlier plan;
+do not blame the human or label their confirmation invalid. First reconcile any
+prior uncertain create/update; a later 403 does not resolve that earlier write.
+Only after a known unregistered-proposal rejection and no unresolved writes,
+request a fresh server-sent readable plan with a new request ID, read it back,
+and obtain a new single quoted human confirmation. Never reuse old proposal or
+confirmation IDs or fall back to raw preview output. A proposal-store outage is
+503, not that 403: explain temporary unavailability, retain the existing context,
+and wait for recovery after reconciling uncertain writes; never blindly retry a
+mutation or replace proof while a write is unresolved. See Automation Creation
+for the full recovery procedure, including a previously successful operation.
+
+Required rollout order: successfully apply and verify migration 110, then deploy
+compatible Core and verify proposal-store and readable-proposal health, then
+release the compatible plugin. Stop if a prerequisite fails; health verification
+includes durable proposal registration and readback, not just process liveness.
+Existing pending legacy confirmations are invalidated at Core cutover and need
+the recovery above. Use a maintenance window if needed for the incompatible
+interval; do not promise zero downtime or let an old plugin continue sending
+legacy preview plans against the new Core. This guidance is not live deployment
+or test-automation authorization.
+
 `source_kind` must match the command (`timer` / `webhook`). The configuration
 accepts only the listed create REST fields; unknown fields are rejected.
 Timers preserve `schedule_kind`, `timezone`, `cron_expr`,

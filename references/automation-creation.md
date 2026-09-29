@@ -228,7 +228,9 @@ Reference acceptance scenarios (instruction checks, not live Agent evidence):
 - Timer/webhook create and update commands surface 401 without automatically
   replaying the write. Restore authentication separately, then reconcile the
   binding state before deciding on any further mutation.
-- A known validation or permission rejection is not success: report the precise
+- A known validation or permission rejection is not success. For an unregistered
+  old proposal rejected with 403 after the Core upgrade, follow the recovery below;
+  do not treat every 403 as that case. For other rejections, report the precise
   missing field/access and keep the proposal. Changes require confirmation again.
 - Network timeout, connection loss after submission, 5xx or an unparseable success
   response means the write outcome may be unknown. The form `request_id`
@@ -262,6 +264,47 @@ Reference acceptance scenarios (instruction checks, not live Agent evidence):
   requests a distinct automation and confirms its new plan.
 - Do not promise that clarification eliminates every possible future runtime
   wait; later execution follows its existing permissions and approval rules.
+
+### Previously sent plans after an upgrade
+
+An old plan sent before server registration was required can receive 403 when
+the human confirms it after the Core upgrade. Explain in plain language:
+"The confirmation flow has been updated, so the earlier plan can no longer be
+accepted. I will check whether the automation was already saved before sending
+you a new plan to confirm." Do not blame the human or describe their reply as
+invalid. Do not expose authorization IDs or protocol details in that explanation.
+
+First reconcile any prior uncertain create/update using the discovery and
+version checks above. A later 403 does not resolve an earlier uncertain write.
+If an earlier operation succeeded, return its verified result without another
+creation. While any write remains unresolved, do not issue replacement proof or
+retry the mutation. Only after a known rejection of the unregistered proposal
+and no unresolved writes, call `automation.authorization_propose` with a new
+request ID for the verified current configuration. Read back the new server-sent
+readable plan and obtain a new single quoted human confirmation before writing.
+Never reuse the old proposal or confirmation IDs, manufacture a confirmation,
+or fall back to raw `automation.authorization_preview` output.
+
+A proposal-store outage returns 503, not the unregistered-proposal 403. Explain
+that confirmation is temporarily unavailable; do not invalidate the human's
+reply, substitute a new proposal, or blindly retry a create/update. Reconcile
+any uncertain mutation first and wait for store health to recover. If only a
+proposal send is uncertain, use the same request ID and identical configuration
+under the proposal recovery rules above after recovery.
+
+### Coordinated rollout
+
+Required order: successfully apply and verify migration 110, then deploy the
+compatible Core and verify proposal-store and readable-proposal health, then
+release the compatible plugin. Stop the rollout if any prerequisite fails.
+Verification must include durable proposal registration and readback, not just
+process liveness. This is rollout guidance, not permission to deploy or create
+test automations in a live environment.
+
+Existing pending legacy confirmations are invalidated by the Core cutover and
+must follow the recovery above. Plan a maintenance window if needed to prevent
+new confirmations during the incompatible interval; do not promise zero downtime.
+An old plugin must not keep sending legacy preview plans against the new Core.
 
 ## Enforcement boundary
 

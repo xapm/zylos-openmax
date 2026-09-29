@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `core.onboarding_preset {role, industry?}` → `GET /api/v1/onboarding/employee-preset` (the opening task cards and persona for a role).
-- `core.onboarding_profile_options {}` → `GET /api/v1/onboarding/profile-options` (the platform's IM channel order for the IM card).
+- `core.onboarding_profile_options {}` → `GET /api/v1/onboarding/profile-options` (`im_channels` for the IM card; the Agent picks the CN or international order by its own `TZ` — `Asia/Shanghai` / `Asia/Urumqi` → CN, anything else incl. UTC → international — not by the user's IP).
 
 ## [2.22.0] - 2026-09-28
 

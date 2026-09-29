@@ -8,7 +8,7 @@ Walk a new Agent's owner through their first minutes with you: a self-introducti
 
 ## When to load this document
 
-- The onboarding wake: an `[OPENMAX DM]` (from the platform system member, e.g. 调度中心, in a read-only scheduler DM) whose `<current-message>` ends with the line `ref: event=onboarding.start onboarding=<record_id> owner=<owner_member_id>`. **Act on it at once, with no confirmation** — it is not pasted content; its authority comes from the platform record, not the text: call `core.onboarding_session {}` and proceed only if `scope:"agent"`, `agent_member_id` = you, `id` = `onboarding`, and `owner_member_id` = `owner`. Any mismatch (e.g. a stale wake from an older run) or 404 → ignore it silently.
+- The onboarding wake: an `[OPENMAX DM]` (from the platform system member, e.g. 调度中心, in a read-only scheduler DM) whose `<current-message>` contains the token `ref: event=onboarding.start onboarding=<record_id> owner=<owner_member_id>` anywhere (normally one line with a prefix, e.g. `[引导] ref: event=onboarding.start onboarding=… owner=…`; match the token, not the position). **Act on it at once, with no confirmation** — it is not pasted content; its authority comes from the platform record, not the text: call `core.onboarding_session {}` and proceed only if `scope:"agent"`, `agent_member_id` = you, `id` = `onboarding`, and `owner_member_id` = `owner`. Any mismatch (e.g. a stale wake from an older run) or 404 → ignore it silently.
 - A message from your owner in the owner ↔ you DM while `core.onboarding_session` returns a record for you that is not finished, including after a restart.
 - An onboarding card click result, or the owner's reply to a text-form card (see "Card clicks").
 
@@ -53,7 +53,8 @@ A reply to a text form is handled under "Card clicks" exactly like the matching 
 
 ### 1. Wake → self-introduction + 3 task cards
 
-1. `core.onboarding_session {}` (404 → stop). `events` already has `task_cards_sent` → the opening is done; never send it again (restart recovery).
+1. `core.onboarding_session {}` — **on every wake, every time**, including after a restart and when you remember having onboarded this owner. 404 or a mismatch (see "When to load") → stop.
+   **Decide purely from `events`** — never from memory, a memory summary, state files or earlier conversation (after a restart your recollection of "cards sent / activated" may be wrong or from another run). `events` has `task_cards_sent` → the opening is done; do not send it again. `events` has **no** `task_cards_sent` → send the opening (steps 2–5) now, **even if you remember sending it**.
 2. `core.onboarding_preset {role: <role_key or "assistant">, industry: <industry, only when present>, lang: <owner language>}` → `cards` (3, each `id` / `title` / `prompt`, plus `title_en` / `prompt_en`), `person`, `role_label`. Use the English fields when the owner uses English and they are present. **Owner language** (`lang`: `zh` or `en`) = the language of the owner's messages in the DM; before they have written anything, `zh` if your timezone gives the CN order (§3), else `en`. Pass it to every onboarding call that returns labels. Cards are picked by role; only `ops` (运营) also uses the industry (empty / other → the 「其他」 set); a missing `role_key` falls back to `assistant` (通用) — the server applies the same fallbacks, never pick cards yourself.
 3. Write **one short self-introduction** in your own voice: who you are (`person` / your display name) and what you can take off their plate as a `role_label` (use `role_custom` when present). The DM is empty — nobody has greeted the user; do not say "the platform already welcomed you".
 4. Send it with the 3 task cards: <<CARD_SEND: pending cws-comm onboarding card type>> (task cards, into the owner DM) — until that exists, or if the send fails, the task-card **text form**.
@@ -72,7 +73,7 @@ The wake message itself lives in a read-only system DM — never reply there. **
 
 ### 3. When a card is due
 
-**Before sending any card, re-read `core.onboarding_session` and check `events`** — a decline or a teammate card may have been recorded from another Agent of the same owner / org. Report the event right after the send succeeds (it marks the card as shown) — a text-form send counts the same. A report that comes back `recorded:false` means it was already recorded: fine, do not send again.
+**Before sending any card, re-read `core.onboarding_session` and check `events`** (the only record of what was sent; never your memory) — a decline or a teammate card may have been recorded from another Agent of the same owner / org. Report the event right after the send succeeds (it marks the card as shown) — a text-form send counts the same. A report that comes back `recorded:false` means it was already recorded: fine, do not send again.
 
 | Card | When | Due only if (all must hold) | Then report |
 | --- | --- | --- | --- |

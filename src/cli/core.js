@@ -203,6 +203,12 @@ const COMMANDS = {
     industry: params.industry,
   }),
 
+  // ✅ Onboarding profile options — option lists incl. `im_channels`, the IM
+  // channel order the platform resolves (edition / geo; an Agent call carries
+  // no user geo header, so the edition default applies). The IM card passes
+  // this order through as given.
+  'core.onboarding_profile_options': () => oget(apiPath('/onboarding/profile-options')),
+
   // ✅ Onboarding event report. Self-reportable types: d1_activation (owner's
   // first message in the onboarding DM), d3_im_connected (IM channel linked),
   // and the push records task_cards_sent / im_card_sent / im_card_second_sent /
@@ -327,8 +333,9 @@ Projects (directory view — workflow ops live in tm.js)
   core.project_list        {status?, page?, pageSize?, orderBy?}    # default status=active (pass status:"archived" for archived); pageSize legacy alias: limit
 
 Onboarding (see SKILL.md "Onboarding Lead" → references/onboarding-lead.md)
-  core.onboarding_session  {}                                  # 本 Agent 的引导记录：岗位、行业、已记录的推送节点；404=无引导
+  core.onboarding_session  {}                                  # 本 Agent 的引导记录：岗位、行业、用户是否已接 IM、已记录的推送节点；404=无引导
   core.onboarding_preset   {role, industry?}                   # 按岗位（运营按行业）取 3 张开场任务卡 + 人设
+  core.onboarding_profile_options {}                           # 选项表；im_channels = 平台给定的 IM 渠道顺序（IM 卡照用）
   core.onboarding_event    {eventType, occurredAt?, meta?}     # 上报：d1_activation|d3_im_connected|task_cards_sent|im_card_sent|im_card_second_sent|im_card_declined|partner_card_sent；重复上报幂等
 
 Organizations

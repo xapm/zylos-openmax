@@ -86,6 +86,7 @@ for (const c of [
   { cli: 'core.js', command: 'core.project_members',      params: { projectId: 'p1' } },
   { cli: 'core.js', command: 'core.invitation_list',      params: {} },
   { cli: 'core.js', command: 'core.onboarding_preset',    params: { role: 'ops' } },
+  { cli: 'core.js', command: 'core.onboarding_profile_options', params: {} },
   // The 4 previously-AMBIGUOUS commands, decided org-scoped:
   { cli: 'core.js', command: 'core.platform_agent_create', params: { displayName: 'A' } },
   { cli: 'core.js', command: 'core.platform_agent_delete', params: { memberId: 'm9' } },

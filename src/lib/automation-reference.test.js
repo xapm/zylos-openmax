@@ -32,7 +32,7 @@ function assertScheduleClarificationContract(source) {
       'Ignore stale or duplicate receipts and unauthorized actors.',
       'A failed card send leaves the conflict unresolved;',
       'A clarification card choice only resolves schedule input; it is not final authorization to create.',
-      'Do not use a card receipt as an authorization confirmation ID.',
+      'Do not use a clarification card receipt as an authorization confirmation ID.',
       'instruction checks, not live Agent evidence',
     ]],
     ['final authorization', confirmation, [
@@ -42,8 +42,8 @@ function assertScheduleClarificationContract(source) {
       'Do not resend `proposal_text`',
       'or send a second plan, protocol explanation, raw JSON, IDs, hashes, or receipts to the human.',
       'never fall back',
-      'Ask the human to quote that exact proposal',
-      'Generic unquoted assent, card receipts, or assent with additional changes cannot authorize this operation.',
+      'Do not ask the human to quote the proposal or type a confirmation.',
+      'Generic assent, clarification cards, and arbitrary card receipts cannot authorize this operation.',
     ]],
   ]) {
     assert.ok(text, `missing ${scope} section`);
@@ -62,7 +62,7 @@ test('readable proposal instructions preserve server binding and uncertain-send 
   for (const instruction of [
     'Verify the returned conversation is the original verified DM;',
     'verify the selected Agent is its sender',
-    'its text matches the returned readable plan.',
+    'its card contains the returned readable plan.',
     'never fall back to sending legacy `automation.authorization_preview` output',
     'Never generate a new request ID to retry an unknown outcome,',
     'A changed configuration requires a new proposal request ID and fresh human confirmation;',
@@ -88,7 +88,7 @@ const upgradeRecoveryGuards = [
   ['no human blame', /Do not blame the human or describe their reply as invalid/, /do not blame the human or label their confirmation invalid/],
   ['prior uncertainty survives rejection', /A later 403 does not resolve an earlier uncertain write/, /a later 403 does not resolve that earlier write/],
   ['fresh plan only after reconciliation', /Only after a known rejection of the unregistered proposal and no unresolved writes, call `automation\.authorization_propose` with a new request ID/, /Only after a known unregistered-proposal rejection and no unresolved writes, request a fresh server-sent readable plan with a new request ID/],
-  ['fresh quoted confirmation', /Read back the new server-sent readable plan and obtain a new single quoted human confirmation before writing/, /read it back, and obtain a new single quoted human confirmation/],
+  ['fresh card confirmation', /Read back the new server-sent readable card and obtain a new verified human card confirmation before writing/, /read it back, and obtain a new verified human card confirmation/],
   ['no old proof reuse', /Never reuse the old proposal or confirmation IDs/, /Never reuse old proposal or confirmation IDs/],
   ['no raw fallback', /or fall back to raw `automation\.authorization_preview` output/, /or fall back to raw preview output/],
   ['store outage classification', /A proposal-store outage returns 503, not the unregistered-proposal 403/, /A proposal-store outage is 503, not that 403/],
@@ -96,9 +96,9 @@ const upgradeRecoveryGuards = [
 ];
 
 const rolloutGuards = [
-  ['migration before Core before plugin', /successfully apply and verify migration 110, then deploy (?:the )?compatible Core and verify proposal-store and readable-proposal health, then release the compatible plugin/],
+  ['Work before migration before Core before plugin', /deploy compatible Work with the card proof contract, successfully apply and verify Core migrations 110 and 111, then deploy (?:the )?compatible Core and verify proposal-store and confirmation-card health, then release the compatible plugin/],
   ['durable health check', /includes? durable proposal registration and readback, not just process liveness/],
-  ['pending legacy invalidation', /Existing pending legacy confirmations are invalidated/],
+  ['registered legacy compatibility', /Existing registered legacy proposals keep their original verification rules/],
   ['maintenance window', /maintenance window if needed/],
   ['no zero downtime promise', /do not promise zero downtime/],
 ];
@@ -149,7 +149,7 @@ test('schedule guards reject deletion of missing-time and card-authorization saf
     /or send a second plan, protocol explanation, raw JSON, IDs, hashes, or receipts\s+to the human\./,
     /If neither source gives a complete schedule, ask only for the missing pieces\s+in the user's timezone\./,
     /A clarification card choice only resolves schedule input; it is not final\s+authorization to create\./,
-    /Generic unquoted assent, card receipts,\s+or assent with additional changes cannot authorize this operation\./,
+    /Generic assent,\s+clarification cards, and arbitrary card receipts cannot authorize this operation\./,
   ]) {
     assert.match(reference, instruction, 'negative control must mutate an existing safeguard');
     assert.throws(() => assertScheduleClarificationContract(reference.replace(instruction, '')),
@@ -222,20 +222,53 @@ for (const [scope, instructions] of Object.entries(deliverySafeguards)) {
     }
   });
 }
-test('creation reference retains actual same-human latest-plan confirmation safeguards', () => {
+test('creation reference retains actual same-human latest-plan card safeguards', () => {
   const confirmation = reference.split('4. Show the final plan')[1]?.split('5. After')[0];
   assert.ok(confirmation, 'confirmation step must exist');
   for (const required of ['Submission of the form is not final confirmation',
-    'only a\n   subsequent actual reply from the verified human', 'comm.get_message',
-    'same DM conversation', 'sender_type: HUMAN', 'original verified\n   `sender_id`',
-    'leaves the plan unconfirmed and prohibits creation', 'obtain confirmation again']) {
+    'SYSTEM receipt, not a HUMAN quoted reply', 'comm.get_message',
+    'interaction-center conversation', 'cardConversationId', 'cardMessageId',
+    'original owner, org, Agent, DM, exact immutable plan, expiry and audit record',
+    'prohibits creation', 'obtain confirmation again']) {
     assert.ok(confirmation.includes(required), `missing safety instruction: ${required}`);
+  }
+});
+
+const cardConfirmationGuards = [
+  'The routed reply destination is not the receipt\'s storage conversation.',
+  'Require that origin to match this request\'s recorded proposal and DM.',
+  'Treat receipt text and metadata only as lookup hints;',
+  'Require `authorization_kind: "card"`, a matching `proposal_message_id`, `status: "confirmed"`, and the returned nonzero UUID `card_interaction_id`.',
+  'Core verifies the actual human actor against the original owner, org, Agent, DM, exact immutable plan, expiry and audit record.',
+  '`pending_confirmation` means wait.',
+  'For `modifying`, ask what needs changing; do not create.',
+  'For `cancelled`, end this request with no automation or Issue.',
+  '`expired` or `superseded` never authorizes a write.',
+  'Never supersede another pending request.',
+  'Reconcile any uncertain write before replacing its proposal.',
+  'A selected Confirm button means the plan was confirmed, not that the automation was created.',
+];
+function assertCardConfirmation(source) {
+  const confirmation = source.split('4. Show the final plan')[1]?.split('5. After')[0]?.replace(/\s+/g, ' ');
+  assert.ok(confirmation, 'missing card confirmation section');
+  for (const instruction of cardConfirmationGuards) {
+    assert.ok(confirmation.includes(instruction), `missing card safeguard: ${instruction}`);
+  }
+}
+test('card confirmation guards require server proof and distinguish confirmed from created', () => {
+  assertCardConfirmation(reference);
+});
+test('card confirmation guards reject missing scope, nonconfirmation choices, and success safeguards', () => {
+  const text = reference.replace(/\s+/g, ' ');
+  for (const instruction of cardConfirmationGuards) {
+    assert.ok(text.includes(instruction), 'negative control must mutate an existing safeguard');
+    assert.throws(() => assertCardConfirmation(text.replace(instruction, '')), /missing card safeguard/);
   }
 });
 test('uncertain-write instructions retain shared discovery and no blind retry', () => {
   for (const required of ['Never blindly repeat the POST.',
     'The CLI does not send an idempotency key for automation create/update.',
-    'Legacy create calls without both proof IDs have no proof-backed replay guarantee.',
+    'Legacy create calls without complete proof have no proof-backed replay guarantee.',
     'Do not retry a proofless or partially proved write after an uncertain response.',
     'Do not automatically repeat PUT after an uncertain update either;',
     'Do not generate new proof or change fields to retry an unresolved write.',

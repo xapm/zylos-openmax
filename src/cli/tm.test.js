@@ -10,6 +10,72 @@ const readableProposal = {
   request_id: '01000000-0000-4000-8000-000000000001', source_kind: 'timer', operation: 'create',
   configuration: { lead_member_id: 'agent', owner_member_id: 'human', spec: { project_id: 'project', title: 'Task' }, schedule_kind: 'cron', cron_expr: '0 9 * * *', timezone: 'Asia/Singapore' },
 };
+const cardProof = {
+  authorization_proposal_message_id: '1790220732844',
+  authorization_card_interaction_id: '01000000-0000-4000-8000-000000000002',
+};
+
+test('replacement proposal preserves immutable replacement identity on explicit retry', async () => {
+  const proposal = { ...readableProposal, replaces_proposal_message_id: cardProof.authorization_proposal_message_id };
+  for (let retry = 0; retry < 2; retry++) {
+    const request = await captureRequest('automation.authorization_propose', { org: 'org-automation', ...proposal });
+    assert.equal(request.method, 'POST');
+    assert.deepEqual(request.body, proposal);
+  }
+});
+
+test('authorization status returns authoritative data without issuing a mutation', async () => {
+  const requests = [];
+  let status = 'pending_confirmation';
+  const response = () => ({ proposal_message_id: cardProof.authorization_proposal_message_id,
+    authorization_kind: 'card', status,
+    ...(status === 'confirmed' ? { card_interaction_id: cardProof.authorization_card_interaction_id } : {}) });
+  const server = createServer((req, res) => {
+    requests.push({ method: req.method, url: req.url });
+    req.resume();
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: response(), request_id: 'server-request', server_time: '2026-09-30T00:00:00Z' }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    for (status of ['pending_confirmation', 'confirmed', 'modifying', 'cancelled', 'expired', 'superseded']) {
+      const result = await new Promise(resolve => execFile(process.execPath, [cliPath, 'automation.authorization_status', JSON.stringify({
+        org: 'org-automation', proposal_message_id: cardProof.authorization_proposal_message_id,
+      })], {
+        env: { ...process.env, COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: 'test', COCO_USER_TOKEN: '', COCO_RPC_LOG: '0' }, timeout: 5000,
+      }, (error, stdout, stderr) => resolve({ error, stdout, stderr })));
+      assert.ifError(result.error);
+      assert.deepEqual(JSON.parse(result.stdout), response());
+    }
+    assert.deepEqual(requests, Array.from({ length: 6 }, () => ({ method: 'GET',
+      url: `/api/v1/automation-authorizations/proposals/${cardProof.authorization_proposal_message_id}` })));
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('status and replacement identifiers reject malformed input before HTTP', async () => {
+  let requests = 0;
+  const server = createServer((req, res) => { requests++; req.resume(); res.end('{}'); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    for (const value of ['', null, 123, '01', '../other', '1'.repeat(129)]) {
+      for (const [command, params] of [
+        ['automation.authorization_status', { proposal_message_id: value }],
+        ['automation.authorization_propose', { ...readableProposal, replaces_proposal_message_id: value }],
+      ]) {
+        const result = await new Promise(resolve => execFile(process.execPath, [cliPath, command, JSON.stringify({ org: 'org-automation', ...params })], {
+          env: { ...process.env, COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: 'test', COCO_USER_TOKEN: '', COCO_RPC_LOG: '0' }, timeout: 5000,
+        }, (error, stdout, stderr) => resolve({ error, stderr })));
+        assert.ok(result.error);
+        assert.match(result.stderr, /canonical decimal/);
+      }
+    }
+    assert.equal(requests, 0);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
 test('readable proposal forwards stable request identity and canonical configuration to server only', async () => {
   const request = await captureRequest('automation.authorization_propose', { org: 'org-automation', ...readableProposal });
   assert.equal(request.method, 'POST');
@@ -47,7 +113,7 @@ test('successful readable proposal returns the server receipt without a second m
   const requests = [];
   const response = { data: {
     proposal_message_id: '1790220732844', conversation_id: 'owner-agent-dm',
-    proposal_text: 'Daily report at 09:00 Asia/Singapore. Reply to this message to confirm.',
+    proposal_text: 'Daily report at 09:00 Asia/Singapore.',
   }, request_id: 'server-request', server_time: '2026-09-29T00:00:00Z' };
   const server = createServer((req, res) => {
     requests.push({ method: req.method, url: req.url });
@@ -82,6 +148,14 @@ test('authorization preview forwards final configuration and update scope', asyn
 
 for (const [kind, prefix, path] of [['timer', 'event-binding', 'event-bindings'], ['webhook', 'webhook', 'webhooks']]) {
   for (const operation of ['create', 'update']) {
+    test(`${kind} ${operation} forwards exclusive card proof without lifecycle claims`, async () => {
+      const configuration = { lead_member_id: 'agent', owner_member_id: 'human', spec: { project_id: 'project', title: 'Task' } };
+      const request = await captureRequest(`${prefix}.${operation}`, { org: 'org-automation', id: 'binding-1', expected_version: 3,
+        source_kind: kind, configuration, ...cardProof, status: 'created', authorization_kind: 'card' });
+      assert.equal(request.method, operation === 'create' ? 'POST' : 'PUT');
+      assert.equal(request.url, `/api/v1/${path}${operation === 'create' ? '' : '/binding-1'}`);
+      assert.deepEqual(request.body, { ...configuration, ...cardProof, ...(operation === 'update' ? { expected_version: 3 } : {}) });
+    });
     test(`${kind} ${operation} forwards proof and full replacement version`, async () => {
       const configuration = { lead_member_id: 'agent', owner_member_id: 'human', spec: { project_id: 'project', title: 'Task' } };
       const proof = { authorization_proposal_message_id: '1790220732844', authorization_confirmation_message_id: '1790220732845' };
@@ -102,6 +176,11 @@ for (const [kind, prefix, path] of [['timer', 'event-binding', 'event-bindings']
         cases.push([operation, { authorization_proposal_message_id: proof.authorization_proposal_message_id }]);
         cases.push([operation, { authorization_confirmation_message_id: proof.authorization_confirmation_message_id }]);
         for (const field of Object.keys(proof)) cases.push([operation, { ...proof, [field]: ' ' }]);
+        cases.push([operation, { ...proof, ...cardProof }]);
+        cases.push([operation, { authorization_card_interaction_id: cardProof.authorization_card_interaction_id }]);
+        for (const invalid of ['', null, 1, '1790220732845', '00000000-0000-0000-0000-000000000000']) {
+          cases.push([operation, { ...cardProof, authorization_card_interaction_id: invalid }]);
+        }
       }
       for (const [operation, authorization] of cases) {
         const result = await new Promise(resolve => execFile(process.execPath, [cliPath, `${prefix}.${operation}`, JSON.stringify({
@@ -112,7 +191,7 @@ for (const [kind, prefix, path] of [['timer', 'event-binding', 'event-bindings']
           env: { ...process.env, COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: 'test', COCO_USER_TOKEN: '', COCO_RPC_LOG: '0' }, timeout: 5000,
         }, (error, stdout, stderr) => resolve({ error, stderr })));
         assert.ok(result.error, `${prefix}.${operation} must reject ${JSON.stringify(authorization)}`);
-        assert.match(result.stderr, /requires both authorization|canonical decimal/);
+        assert.match(result.stderr, /requires both authorization|canonical decimal|canonical nonzero UUID/);
       }
       assert.equal(requests, 0);
     } finally {
@@ -137,6 +216,8 @@ for (const [command, params, retry] of [
     return [
       [`${prefix}.create`, { source_kind, configuration, ...authorizationProof }, false],
       [`${prefix}.update`, { source_kind, configuration, expected_version: 3, ...authorizationProof }, false],
+      [`${prefix}.create`, { source_kind, configuration, ...cardProof }, false],
+      [`${prefix}.update`, { source_kind, configuration, expected_version: 3, ...cardProof }, false],
       [`${prefix}.create`, { leadMemberId: 'agent', ownerMemberId: 'human', projectId: 'project', title: 'Legacy task' }, false],
     ];
   }),

@@ -83,17 +83,32 @@ export function automationAuthorizationProposal(params) {
     delete plan.target_binding_id;
     delete plan.expected_version;
   }
-  return { ...plan, request_id: params.request_id };
+  const replacement = params.replaces_proposal_message_id;
+  if (replacement !== undefined && (typeof replacement !== 'string'
+    || replacement.length > 128 || !/^[1-9][0-9]*$/.test(replacement))) {
+    throw Object.assign(new Error('replaces_proposal_message_id must be a canonical decimal message ID string'), { status: 400 });
+  }
+  return { ...plan, request_id: params.request_id,
+    ...(replacement === undefined ? {} : { replaces_proposal_message_id: replacement }) };
 }
 
 export function automationMutation(params, sourceKind, operation = 'create') {
   const { authorization_proposal_message_id: proposalID,
     authorization_confirmation_message_id: confirmationID,
+    authorization_card_interaction_id: interactionID,
     expected_version: expectedVersion, id, ...configurationParams } = params;
   const body = { ...automationConfiguration(configurationParams, sourceKind) };
-  if ((operation === 'update' || proposalID !== undefined || confirmationID !== undefined)
-    && (proposalID === undefined || confirmationID === undefined)) {
-    throw Object.assign(new Error(`${operation} requires both authorization_proposal_message_id and authorization_confirmation_message_id`), { status: 400 });
+  if ((operation === 'update' || proposalID !== undefined || confirmationID !== undefined || interactionID !== undefined)
+    && (proposalID === undefined || (confirmationID === undefined) === (interactionID === undefined))) {
+    throw Object.assign(new Error(`${operation} requires both authorization_proposal_message_id and exactly one confirmation message or card interaction ID`), { status: 400 });
+  }
+  if (interactionID !== undefined) {
+    if (typeof interactionID !== 'string'
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(interactionID)
+      || interactionID === '00000000-0000-0000-0000-000000000000') {
+      throw Object.assign(new Error('authorization_card_interaction_id must be a canonical nonzero UUID'), { status: 400 });
+    }
+    body.authorization_card_interaction_id = interactionID;
   }
   for (const field of ['authorization_proposal_message_id', 'authorization_confirmation_message_id']) {
     if (params[field] !== undefined) {

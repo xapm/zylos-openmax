@@ -3,6 +3,35 @@ import test from 'node:test';
 import { automationAuthorizationPreview, automationAuthorizationProposal, automationConfiguration, automationMutation } from './automation-configuration.js';
 
 const base = { lead_member_id: 'agent', owner_member_id: 'human', spec: { project_id: 'project', title: 'Task' } };
+const cardID = '01000000-0000-4000-8000-000000000002';
+
+for (const kind of ['timer', 'webhook']) {
+  test(`${kind} card consent is exclusive transport metadata for create and update`, () => {
+    const proof = { authorization_proposal_message_id: '1790220732844', authorization_card_interaction_id: cardID };
+    const params = { id: 'binding', expected_version: 2, source_kind: kind, configuration: base, ...proof };
+    for (const operation of ['create', 'update']) {
+      const result = automationMutation(params, kind, operation);
+      assert.equal(result.authorization_card_interaction_id, cardID);
+      assert.equal(result.authorization_confirmation_message_id, undefined);
+      assert.throws(() => automationMutation({ ...params, authorization_confirmation_message_id: '1790220732845' }, kind, operation), /exactly one/);
+      for (const value of ['', null, 1, '1790220732845', cardID.replaceAll('-', ''), '00000000-0000-0000-0000-000000000000']) {
+        assert.throws(() => automationMutation({ ...params, authorization_card_interaction_id: value }, kind, operation), /canonical nonzero UUID/);
+      }
+      assert.throws(() => automationMutation({ ...params, authorization_proposal_message_id: undefined }, kind, operation), /requires both/);
+    }
+    assert.throws(() => automationMutation({ source_kind: kind, configuration: { ...base, ...proof } }, kind), /unsupported/);
+  });
+}
+
+test('replacement names one previous proposal without altering the configuration', () => {
+  const params = { source_kind: 'timer', operation: 'create', request_id: cardID,
+    configuration: { ...base, timezone: 'Asia/Singapore' }, replaces_proposal_message_id: '1790220732844' };
+  assert.equal(automationAuthorizationProposal(params).replaces_proposal_message_id, '1790220732844');
+  assert.equal(automationAuthorizationProposal(params).configuration, params.configuration);
+  for (const value of ['', null, 1, '01', 'not-a-message']) {
+    assert.throws(() => automationAuthorizationProposal({ ...params, replaces_proposal_message_id: value }), /canonical decimal/);
+  }
+});
 test('readable proposal binds its request UUID to the unchanged final configuration and scope', () => {
   const request_id = '01000000-0000-4000-8000-000000000001';
   const configuration = { ...base, timezone: 'Asia/Singapore' };

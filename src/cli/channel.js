@@ -11,9 +11,12 @@
  *   node src/cli/channel.js channel.connect '{"channelType":"feishu","conversationId":"...","sourceMessageId":"..."}'
  *
  * The QR and session handle are consumed inside this process and never printed
- * to stdout (which is model-visible). The tool publishes a generic structured
- * confirmation card first. Only after explicit human approval does a detached,
- * bounded poller publish the QR and terminal result in the same conversation.
+ * to stdout (which is model-visible). For a typed request the tool publishes a
+ * generic structured confirmation card first; only after explicit human
+ * approval does a detached, bounded poller publish the QR and terminal result
+ * in the same conversation. When the source is a verified owner/admin click on
+ * the Agent's own channel card, Core treats that click as the approval and the
+ * poller publishes the QR directly, with no confirmation card.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -116,6 +119,24 @@ export function buildChannelConfirmationMessage(channelType, confirmationId, exp
     metadata: { openmax_channel_confirmation: display },
     fallback_text: `请在 OpenMAX 聊天中确认连接${channel.displayName}，确认后才会生成授权二维码。`,
   };
+}
+
+/**
+ * What a Start result asks the tool to do next.
+ * - needs_confirmation: a typed request; send the confirmation card and wait.
+ * - card_confirmed: Core accepted a verified card click as the consent and has
+ *   already started the provider session; the watcher reads the QR from the
+ *   confirmation endpoint. `starting` means a concurrent call for the same
+ *   card answer is still starting it.
+ */
+export function classifyChannelStart(result) {
+  const status = String(result?.status || '').trim().toLowerCase();
+  if (!UUID_RE.test(result?.confirmation_id || '') || !Number.isFinite(Date.parse(result?.expires_at))) {
+    throw new Error('channel connection service returned no human confirmation request; update Core and OpenMAX together');
+  }
+  if (status === 'awaiting_user_confirmation') return 'needs_confirmation';
+  if (status === 'awaiting_user_scan' || status === 'starting') return 'card_confirmed';
+  throw new Error('channel connection service returned no human confirmation request; update Core and OpenMAX together');
 }
 
 export async function waitForChannelConfirmation({ deadlineMs, poll, sleep, now = Date.now }) {
@@ -304,9 +325,7 @@ async function connect(input) {
   );
   const noQRResult = channelStartResultWithoutQR(plan.channelType, result);
   if (noQRResult) return noQRResult;
-  if (result?.status !== 'awaiting_user_confirmation' || !UUID_RE.test(result.confirmation_id) || !Number.isFinite(Date.parse(result.expires_at))) {
-    throw new Error('channel connection service returned no human confirmation request; update Core and OpenMAX together');
-  }
+  const startKind = classifyChannelStart(result);
 
   ensurePrivateDir();
   const token = randomUUID();
@@ -321,16 +340,21 @@ async function connect(input) {
     confirmationDeadlineMs: Math.min(Date.parse(result.expires_at), Date.now() + MAX_QR_SESSION_SEC * 1000) + 60_000,
   }), 'utf8');
 
-  try {
-    await postForOrg(
-      orgId,
-      apiPath(`/conversations/${plan.conversationId}/messages`),
-      buildChannelConfirmationMessage(plan.channelType, result.confirmation_id, result.expires_at),
-      { timeoutMs: 30_000, quietOnSuccess: true },
-    );
-  } catch (error) {
-    safeUnlink(statePath);
-    throw error;
+  // A verified owner/admin click on the Agent's own channel card was already
+  // the consent (Core confirmed it as the clicker), so there is no
+  // confirmation card to send: the watcher goes straight to the QR.
+  if (startKind === 'needs_confirmation') {
+    try {
+      await postForOrg(
+        orgId,
+        apiPath(`/conversations/${plan.conversationId}/messages`),
+        buildChannelConfirmationMessage(plan.channelType, result.confirmation_id, result.expires_at),
+        { timeoutMs: 30_000, quietOnSuccess: true },
+      );
+    } catch (error) {
+      safeUnlink(statePath);
+      throw error;
+    }
   }
 
   const child = spawn(process.execPath, [TOOL_SCRIPT, 'channel._watch', JSON.stringify({ token })], {
@@ -342,6 +366,15 @@ async function connect(input) {
 
   // stdout is read by the Agent. Deliberately exclude qr_png_base64,
   // session_handle, auth_url, and local file paths.
+  if (startKind === 'card_confirmed') {
+    return {
+      status: 'awaiting_user_scan',
+      channel_type: plan.channelType,
+      qr_sent_to_conversation: true,
+      confirmation_sent_to_conversation: false,
+      message: `${PLATFORM_CHANNELS[plan.channelType].displayName}授权二维码马上发到聊天里，请用手机扫码。`,
+    };
+  }
   return {
     status: 'awaiting_user_confirmation',
     channel_type: plan.channelType,

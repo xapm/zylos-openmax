@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   buildChannelConfirmationMessage,
+  classifyChannelStart,
   waitForChannelConfirmation,
   buildChannelQRMessage,
   channelStatusMessage,
@@ -271,4 +272,16 @@ test('retry classification is bounded to network and transient gateway failures'
   assert.equal(isRetryableChannelPollError({ status: 503 }), true);
   assert.equal(isRetryableChannelPollError({ status: 400 }), false);
   assert.equal(isRetryableChannelPollError({ status: 500 }), false);
+});
+
+test('a typed start waits for the confirmation card; a card-confirmed start goes straight to the QR watcher', () => {
+  const id = '11111111-1111-4111-8111-111111111111';
+  const expires = new Date(Date.now() + 60_000).toISOString();
+  assert.equal(classifyChannelStart({ status: 'awaiting_user_confirmation', confirmation_id: id, expires_at: expires }), 'needs_confirmation');
+  assert.equal(classifyChannelStart({ status: 'awaiting_user_scan', confirmation_id: id, expires_at: expires }), 'card_confirmed');
+  assert.equal(classifyChannelStart({ status: 'starting', confirmation_id: id, expires_at: expires }), 'card_confirmed');
+  // No confirmation record means no authority for the watcher's poll.
+  assert.throws(() => classifyChannelStart({ status: 'awaiting_user_scan', expires_at: expires }), /no human confirmation request/);
+  assert.throws(() => classifyChannelStart({ status: 'awaiting_user_scan', confirmation_id: id }), /no human confirmation request/);
+  assert.throws(() => classifyChannelStart({ status: 'ready', confirmation_id: id, expires_at: expires }), /no human confirmation request/);
 });

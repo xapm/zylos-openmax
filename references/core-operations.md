@@ -128,14 +128,16 @@ Write operations for projects such as CRUD / archive / members go through `tm.js
 
 A platform agent = an org-scoped bot member row; like a human member it occupies a `member_id`, and can be dispatched via `task.create` / added to conversations / write to KB.
 
-### Onboarding (Lead agent guides a new organization; for the behavioral side see SKILL.md "Onboarding Lead")
+### Onboarding (a new Agent's guided first conversation; for the behavioral side see `references/onboarding-lead.md`)
 
 | Status | Command | Description | Input | Real Endpoint |
 | --- | --- | --- | --- | --- |
-| ✅ | `core.onboarding_session` | The org's onboarding lifecycle record; `core_issue_id`=the core conversation Issue, `project_id`=the onboarding project; 404=never started | `{}` | `GET /api/v1/onboarding/session` |
-| ✅ | `core.onboarding_event` | Funnel event reporting; only callable by the lead agent of an in-progress session; duplicate reports are absorbed by the server's unique index (idempotent 200, `recorded=false`) | `{eventType, occurredAt?, meta?}` | `POST /api/v1/onboarding/events` |
+| ✅ | `core.onboarding_session` | The calling Agent's own onboarding record (`scope:"agent"`): `id`, `owner_member_id`, `agent_member_id`, `role_key` / `role_custom` (preset role set at Agent creation), `industry` (org; omitted when unset), `status`, `user_has_im_channel` / `owner_is_org_admin` (omitted = unknown), and `events` `[{event_type, occurred_at, agent_member_id?, meta?}]` (push records merged per Agent / user / org); 404 = no onboarding for this Agent | `{}` | `GET /api/v1/onboarding/session` |
+| ✅ | `core.onboarding_preset` | The three opening task cards (`id` / `code` / `title` / `prompt`, plus `title_en` / `prompt_en`) and the persona (`person`, `role_label`, default names) for one role; only `ops` uses `industry`; unknown / empty input falls back server-side; `lang` (`zh` / `en`, sent as `Accept-Language`) sets `role_label` | `{role, industry?, lang?}` | `GET /api/v1/onboarding/employee-preset` |
+| ✅ | `core.onboarding_profile_options` | Onboarding option lists; the IM card uses `im_channels`; which order (CN / international) is picked by the Agent's own `TZ` (`Asia/Shanghai` / `Asia/Urumqi` → CN, else international) and requested with `imOrder` (`cn` / `intl`; omitted → edition / geo); `lang` (`zh` / `en`, sent as `Accept-Language`) sets the `label` language — see `references/onboarding-lead.md` §3 | `{imOrder?, lang?}` | `GET /api/v1/onboarding/profile-options` |
+| ✅ | `core.onboarding_event` | Onboarding event reporting; duplicate reports are absorbed by the server's unique index (idempotent 200, `recorded=false`) | `{eventType, occurredAt?, meta?}` | `POST /api/v1/onboarding/events` |
 
-`eventType` only permits `d1_activation` (used at the core Issue ice-breaking stage when the user has replied ≥1 round) / `d3_im_connected` (third-party IM binding succeeded); `d7_first_delivery` is set automatically by the server when the core Issue is accepted, and self-reporting it will be rejected with 422. The startup self-report (`online-report`) is sent automatically by comm-bridge on startup and does not need to be called manually.
+Self-reportable `eventType`: `d1_activation` (owner's first message in the onboarding DM; a card click counts) / `d3_im_connected` (IM channel connected) / `task_cards_sent` / `im_card_sent` / `im_card_second_sent` / `im_card_declined` (owner-scoped: covers all their Agents) / `partner_card_sent` (org-scoped, once per org). `d7_first_delivery` is set by the server and self-reporting it is rejected with 422. The startup self-report (`online-report`) is sent automatically by comm-bridge on startup and does not need to be called manually.
 
 ## Typical Flow: Lead Decides and Dispatches
 

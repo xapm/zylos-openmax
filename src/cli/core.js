@@ -15,7 +15,7 @@
  *      surface is ready when core adds the endpoint
  */
 
-import { get, post, patch, apiPath, frontendUrl, getForOrg, postForOrg, delForOrg } from '../lib/client.js';
+import { get, post, patch, apiPath, frontendUrl, getForOrg, getForOrgWithHeaders, postForOrg, delForOrg } from '../lib/client.js';
 import { enabledOrgs, updateConfig, resolveDefaultOrgId } from '../lib/config.js';
 import { resolveAgentBaseUrl } from '../lib/agent-domain.js';
 
@@ -54,6 +54,12 @@ function requireOrgId() {
 const oget  = (path, query) => getForOrg(requireOrgId(), path, query);
 const opost = (path, body)  => postForOrg(requireOrgId(), path, body);
 const odel  = (path)        => delForOrg(requireOrgId(), path);
+// Onboarding label language: `lang` (zh|en) → Accept-Language, which is how
+// cws-core picks `label` / role labels; omitted → the deployment edition decides.
+const onboardingLangHeaders = () => {
+  const lang = String(params.lang || params.locale || '').trim();
+  return lang ? { 'Accept-Language': lang } : {};
+};
 
 /** Normalize a scalar-or-array param into an array (drops null/undefined). */
 const toArray = (v) => (v == null ? [] : Array.isArray(v) ? v : [v]);
@@ -188,19 +194,38 @@ const COMMANDS = {
   }),
   'core.platform_agent_delete': () => odel(apiPath(`/platform-agents/${params.memberId}`)),
 
-  // ✅ Onboarding session — the org's onboarding lifecycle record. A Lead
-  // agent woken by the welcome DM reads this to locate the onboarding
-  // structure: `core_issue_id` is the guided-conversation Issue to drive
-  // (read it + its blueprint via tm.js), `project_id` the onboarding project.
-  // 404 = this org never started onboarding.
+  // ✅ Onboarding session — the calling Agent's own onboarding record
+  // (scope:"agent"): owner, preset role (role_key / role_custom), org industry
+  // (omitted when unset), user_has_im_channel / owner_is_org_admin (omitted =
+  // unknown), and `events` [{event_type, occurred_at, agent_member_id?, meta?}]
+  // — the push records the Agent checks before sending any onboarding card.
+  // 404 = no onboarding for this Agent. See references/onboarding-lead.md.
   'core.onboarding_session': () => oget(apiPath('/onboarding/session')),
 
-  // ✅ Onboarding funnel event report. Caller must be the in-flight session's
-  // lead agent. Self-reportable types: d1_activation (user replied ≥1 round
-  // in the core-issue icebreaker), d3_im_connected (third-party IM linked).
-  // Duplicates are absorbed server-side (idempotent 200, recorded=false) —
-  // safe to fire without checking first. d7_first_delivery is server-observed
-  // on issue accept and cannot be self-reported.
+  // ✅ Onboarding preset — default name / persona / the three opening task
+  // cards (title + prompt, zh + en) for one (role, industry). Only the ops role
+  // uses the industry; unknown input falls back server-side (never fails).
+  'core.onboarding_preset': () => getForOrgWithHeaders(requireOrgId(), apiPath('/onboarding/employee-preset'), onboardingLangHeaders(), {
+    role:     params.role || params.roleKey || params.role_key,
+    industry: params.industry,
+  }),
+
+  // ✅ Onboarding profile options — option lists incl. `im_channels`. The IM
+  // card's channel order is chosen by the Agent's own TZ (Asia/Shanghai or
+  // Asia/Urumqi → cn, else intl) and requested with `imOrder` (?im_order=);
+  // `lang` (zh|en) sets the label language via Accept-Language;
+  // without it the server falls back to edition / geo. Any other value is a
+  // server-side 400. See references/onboarding-lead.md.
+  'core.onboarding_profile_options': () => getForOrgWithHeaders(requireOrgId(), apiPath('/onboarding/profile-options'), onboardingLangHeaders(), {
+    im_order: params.imOrder || params.im_order,
+  }),
+
+  // ✅ Onboarding event report. Self-reportable types: d1_activation (owner's
+  // first message in the onboarding DM), d3_im_connected (IM channel linked),
+  // and the push records task_cards_sent / im_card_sent / im_card_second_sent /
+  // im_card_declined / partner_card_sent. Duplicates are absorbed server-side
+  // (idempotent 200, recorded=false) — safe to fire without checking first.
+  // d7_first_delivery is server-observed and cannot be self-reported.
   'core.onboarding_event': () => opost(apiPath('/onboarding/events'), {
     event_type:  params.eventType || params.event_type,
     occurred_at: params.occurredAt || params.occurred_at,
@@ -318,9 +343,11 @@ Platform agents (lifecycle)
 Projects (directory view — workflow ops live in tm.js)
   core.project_list        {status?, page?, pageSize?, orderBy?}    # default status=active (pass status:"archived" for archived); pageSize legacy alias: limit
 
-Onboarding (Lead agent — see SKILL.md "Onboarding Lead" section)
-  core.onboarding_session  {}                                  # org 的 onboarding 会话；core_issue_id=核心对话 Issue，404=从未开始
-  core.onboarding_event    {eventType, occurredAt?, meta?}     # 漏斗埋点上报（d1_activation|d3_im_connected）；重复上报幂等，放心发
+Onboarding (see SKILL.md "Onboarding Lead" → references/onboarding-lead.md)
+  core.onboarding_session  {}                                  # 本 Agent 的引导记录：岗位、行业、用户是否已接 IM、已记录的推送节点；404=无引导
+  core.onboarding_preset   {role, industry?, lang?}            # 按岗位（运营按行业）取 3 张开场任务卡 + 人设
+  core.onboarding_profile_options {imOrder?, lang?}            # 选项表；imOrder=cn|intl 指定 im_channels 顺序（按本 Agent 时区选，见 onboarding-lead）
+  core.onboarding_event    {eventType, occurredAt?, meta?}     # 上报：d1_activation|d3_im_connected|task_cards_sent|im_card_sent|im_card_second_sent|im_card_declined|partner_card_sent；重复上报幂等
 
 Organizations
   core.org_list            {orderBy?}

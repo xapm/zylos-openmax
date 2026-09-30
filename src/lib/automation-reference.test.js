@@ -71,6 +71,18 @@ test('readable proposal instructions preserve server binding and uncertain-send 
   ]) assert.ok(text.toLowerCase().includes(instruction.toLowerCase()), instruction);
 });
 
+test('creation receipts omit list links and internal endpoints while preserving webhook setup', () => {
+  const receipt = reference.split('6. Before reporting success')[1]?.split('## Failure and duplicate handling')[0]?.replace(/\s+/g, ' ');
+  assert.ok(receipt, 'creation result instructions must exist');
+  assert.ok(receipt.includes('Do not include an Automation list link in the creation result.'));
+  assert.ok(receipt.includes('Do not call `core.frontend_url` for this receipt or construct a browser link from the backend/BFF address:'));
+  assert.doesNotMatch(receipt, /Build the existing Automation page link|"path"\s*:\s*"\/automation"/);
+  assert.ok(receipt.includes('Report the task name, actual state'));
+  assert.ok(receipt.includes("timer's next trigger time"));
+  assert.ok(receipt.includes('`webhook_url`: send it only in this verified requester\'s DM when required for setup'));
+  assert.ok(receipt.includes('Preserve the existing webhook setup flow.'));
+});
+
 const upgradeRecoveryGuards = [
   ['old-plan explanation', /earlier plan can no longer be accepted/, /updated confirmation flow cannot accept the earlier plan/],
   ['no human blame', /Do not blame the human or describe their reply as invalid/, /do not blame the human or label their confirmation invalid/],

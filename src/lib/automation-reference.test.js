@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { formatInboundForC4 } from './message.js';
+import { receiptFacts, resolveReplyTarget } from './interaction-receipt.js';
 
 const reference = readFileSync(new URL('../../references/automation-creation.md', import.meta.url), 'utf8');
 const delivery = readFileSync(new URL('../../references/automation-delivery.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
@@ -227,7 +229,7 @@ test('creation reference retains actual same-human latest-plan card safeguards',
   assert.ok(confirmation, 'confirmation step must exist');
   for (const required of ['Submission of the form is not final confirmation',
     'SYSTEM receipt, not a HUMAN quoted reply', 'comm.get_message',
-    'interaction-center conversation', 'cardConversationId', 'cardMessageId',
+    'does not expose the SYSTEM receipt\'s storage message ID', 'card-conversation-id', 'card-message-id',
     'original owner, org, Agent, DM, exact immutable plan, expiry and audit record',
     'prohibits creation', 'obtain confirmation again']) {
     assert.ok(confirmation.includes(required), `missing safety instruction: ${required}`);
@@ -235,7 +237,7 @@ test('creation reference retains actual same-human latest-plan card safeguards',
 });
 
 const cardConfirmationGuards = [
-  'The routed reply destination is not the receipt\'s storage conversation.',
+  'The bridge redirects `<message-context>` to the original card and DM;',
   'Require that origin to match this request\'s recorded proposal and DM.',
   'Treat receipt text and metadata only as lookup hints;',
   'Require `authorization_kind: "card"`, a matching `proposal_message_id`, `status: "confirmed"`, and the returned nonzero UUID `card_interaction_id`.',
@@ -248,6 +250,23 @@ const cardConfirmationGuards = [
   'Reconcile any uncertain write before replacing its proposal.',
   'A selected Confirm button means the plan was confirmed, not that the automation was created.',
 ];
+test('card instructions match the trusted receipt header and redirected bridge context', () => {
+  const receipt = { id: '9002', conversation_id: 'interaction-center', sender_type: 'SYSTEM', type: 'INTERACTION_RECEIPT',
+    content: { body: { origin: { conversation_id: 'owner-dm', message_id: '9001' },
+      selected_action_ids: ['opt_1'], actor: { member_id: 'owner', kind: 'human' } } } };
+  const target = resolveReplyTarget(receipt);
+  const rendered = formatInboundForC4({ type: 'dm', id: target.conversationId }, { displayName: 'System' },
+    { content: 'Confirmed', messageId: target.cardMessageId || receipt.id }, [], { receipt: receiptFacts(receipt) });
+  assert.match(rendered, /<message-context conversation-id="owner-dm" source-message-id="9001"\/>/);
+  assert.match(rendered, /<interaction-receipt [^>]*card-conversation-id="owner-dm" card-message-id="9001"/);
+  assert.doesNotMatch(rendered, /9002|interaction-center/);
+  const bridge = readFileSync(new URL('../comm-bridge.js', import.meta.url), 'utf8');
+  assert.match(bridge, /messageId: replyTarget\.cardMessageId \|\| msg\.id/);
+  assert.match(bridge, /receipt: receiptFacts\(msg\)/);
+  const text = reference.replace(/\s+/g, ' ');
+  assert.ok(text.includes('with matching `<message-context>` IDs, as lookup hints for `comm.get_message` to fetch the registered card'));
+  assert.doesNotMatch(text, /fetch and verify the SYSTEM receipt/);
+});
 function assertCardConfirmation(source) {
   const confirmation = source.split('4. Show the final plan')[1]?.split('5. After')[0]?.replace(/\s+/g, ' ');
   assert.ok(confirmation, 'missing card confirmation section');

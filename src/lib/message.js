@@ -247,7 +247,7 @@ export function formatInboundForC4(conv, sender, current, recent = [], opts = {}
   // rather than a best-effort inference from the skill listing.
   parts.push(
 `<openmax-instruction>
-Before handling the current message, invoke the openmax skill and follow it. For an explicit automation-create-request form handoff or its confirmation conversation, follow the skill's Automation Creation workflow before generic Issue intake. For other new tasks, complete New-Issue Intake before doing the work.
+Before handling the current message, invoke the openmax skill and follow it. For an explicit automation-update-request form handoff or its confirmation conversation, follow the skill's Automation Update workflow before generic Issue intake. For an explicit automation-create-request form handoff or its confirmation conversation, follow the skill's Automation Creation workflow before generic Issue intake. For other new tasks, complete New-Issue Intake before doing the work.
 </openmax-instruction>
 
 `,

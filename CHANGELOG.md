@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Onboarding: due IM / teammate cards were skipped silently.** A task-card receipt now explicitly starts the owner's first task (it is only exempt from New-Issue intake — the `<openmax-instruction>` sentence for System Member messages says so); the IM first push is due when any task starts while it is still due, not only "the first"; on every owner turn while the record is not finished the Agent re-reads `core.onboarding_session` and evaluates every card from `events`, never from memory; "do not suggest next steps" does not cover a due card; and a channel picked earlier without connecting no longer cancels the second push (only `im_card_declined` or `user_has_im_channel: true` do).
+- **Onboarding: due IM / teammate cards were skipped silently.** A task-card receipt now explicitly starts the owner's first task (it is only exempt from New-Issue intake — the `<openmax-instruction>` sentence for System Member messages says so) (so the IM first push goes out the moment that task starts); on every owner turn while the record is not finished the Agent re-reads `core.onboarding_session` and evaluates every card from `events`, never from memory; "do not suggest next steps" does not cover a due card; and a channel picked earlier without connecting no longer cancels the second push (only `im_card_declined` or `user_has_im_channel: true` do).
 
 ## [2.22.0] - 2026-09-28
 

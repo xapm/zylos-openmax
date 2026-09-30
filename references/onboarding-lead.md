@@ -91,7 +91,7 @@ The wake message itself lives in a read-only system DM — never reply there. **
 
 | Card | When | Due only if (all must hold) | Then report |
 | --- | --- | --- | --- |
-| IM card, first push (`trigger:first`) | when **any task starts** executing while this push is still due — not only the first task (send it, then carry on with the task) | `user_has_im_channel` is `false` (omitted = unknown → not due) · `events` has neither `im_card_sent` nor `im_card_declined` | `im_card_sent` |
+| IM card, first push (`trigger:first`) | the moment the **first task starts** executing — a task-card click or a typed work request (send it, then carry on with the task) | `user_has_im_channel` is `false` (omitted = unknown → not due) · `events` has neither `im_card_sent` nor `im_card_declined` | `im_card_sent` |
 | IM card, second push (`trigger:second`) | after your reply, once the DM has **≥ 20** messages | `user_has_im_channel` is still `false` (omitted → not due) · `events` has neither `im_card_declined` (user-level) nor `im_card_second_sent` | `im_card_second_sent` |
 | Teammate card | after your reply, once the DM has **≥ 50** messages | the org still has exactly **1** Agent (you — see "Agent count" below) · `owner_is_org_admin` is `true` (omitted → not due) · `events` has no `partner_card_sent` (once per org) | `partner_card_sent` |
 

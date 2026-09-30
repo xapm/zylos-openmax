@@ -147,6 +147,25 @@ test('authorization preview forwards final configuration and update scope', asyn
 });
 
 for (const [kind, prefix, path] of [['timer', 'event-binding', 'event-bindings'], ['webhook', 'webhook', 'webhooks']]) {
+  test(`${kind} update card proposal preserves target and version through mutation`, async () => {
+    const configuration = kind === 'timer' ? readableProposal.configuration : {
+      lead_member_id: 'agent', owner_member_id: 'human',
+      spec: { project_id: 'project', title: 'Changed task' }, event_filter: 'event.type == "new"',
+    };
+    const plan = { request_id: readableProposal.request_id, source_kind: kind,
+      operation: 'update', target_binding_id: 'binding-1', expected_version: 7, configuration };
+    const proposal = await captureRequest('automation.authorization_propose', { org: 'org-automation', ...plan });
+    assert.equal(proposal.url, '/api/v1/automation-authorizations/proposals');
+    assert.deepEqual(proposal.body, plan);
+    const update = await captureRequest(`${prefix}.update`, { org: 'org-automation',
+      id: plan.target_binding_id, expected_version: plan.expected_version,
+      source_kind: kind, configuration, ...cardProof });
+    assert.equal(update.method, 'PUT');
+    assert.equal(update.url, `/api/v1/${path}/binding-1`);
+    assert.deepEqual(update.body, { ...configuration, expected_version: 7, ...cardProof });
+    assert.equal(Object.hasOwn(update.body, 'webhook_url'), false);
+  });
+
   for (const operation of ['create', 'update']) {
     test(`${kind} ${operation} forwards exclusive card proof without lifecycle claims`, async () => {
       const configuration = { lead_member_id: 'agent', owner_member_id: 'human', spec: { project_id: 'project', title: 'Task' } };
@@ -350,6 +369,31 @@ test('wrong route and unsupported fields fail before HTTP submission', async () 
       }, (error, stdout, stderr) => resolve({ error, stderr })));
       assert.ok(result.error);
       assert.match(result.stderr, /source_kind must be webhook|unsupported/);
+    }
+    assert.equal(requests, 0);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('update proposals and writes reject unknown configuration without any HTTP fallback', async () => {
+  let requests = 0;
+  const server = createServer((req, res) => { requests++; req.resume(); res.end('{}'); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    for (const kind of ['timer', 'webhook']) {
+      for (const command of ['automation.authorization_propose', kind === 'timer' ? 'event-binding.update' : 'webhook.update']) {
+        const result = await new Promise(resolve => execFile(process.execPath, [cliPath, command, JSON.stringify({
+          org: 'org-automation', request_id: readableProposal.request_id, operation: 'update',
+          target_binding_id: 'binding-1', id: 'binding-1', expected_version: 7, source_kind: kind,
+          configuration: { lead_member_id: 'agent', owner_member_id: 'human', spec: { title: 'Task' },
+            unexpected_envelope_field: true }, ...cardProof,
+        })], {
+          env: { ...process.env, COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: 'test', COCO_USER_TOKEN: '', COCO_RPC_LOG: '0' }, timeout: 5000,
+        }, (error, stdout, stderr) => resolve({ error, stderr })));
+        assert.ok(result.error);
+        assert.match(result.stderr, /unsupported .* configuration field/);
+      }
     }
     assert.equal(requests, 0);
   } finally {

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.23.0] - 2026-09-30
+
+### Added
+
+- Route explicit automation edit-form handoffs to a dedicated update conversation before Issue intake. Verify the human, organization, current target and version; obtain a server-sent Confirm/Modify/Cancel card before updating the exact existing timer or webhook. Stale versions require a new plan and confirmation, and uncertain writes are reconciled without automatic replay.
+- Preserve webhook credentials and omit Automation list links from edit results. Update handoff eligibility requires a separately configured compatible plugin version; deploy this version before enabling that gate.
+
 ## [2.22.0] - 2026-09-28
 
 ### Added

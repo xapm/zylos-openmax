@@ -1,9 +1,9 @@
 ---
 name: openmax
-version: 2.22.0
+version: 2.23.0
 description: >-
   OpenMax Task Agent (Guided Autonomy). For any user message received via openmax,
-  you MUST load and follow this skill before handling the task: route explicit automation-create-request form handoffs to the creation workflow before generic Issue intake; otherwise first decide whether it is a task or a question/chat;
+  you MUST load and follow this skill before handling the task: route explicit automation-create-request and automation-update-request form handoffs to their respective workflows before generic Issue intake; otherwise first decide whether it is a task or a question/chat;
   if it is a new task, resolve only the missing Issue-creation and owning-Project decisions first;
   when the human chooses Issue-backed work, run the full flow —
   confirm the KnowledgeBase → register Issue→Task (whoever executes creates it, Issue owner=originator) → execute → ordinary Issues require owner acceptance; server-trusted automation Issues use automatic completion and responsible-Agent DM delivery,
@@ -74,6 +74,12 @@ dependencies:
 ## Role Model
 
 ### Automation creation form handoff (before Issue intake)
+
+For a human DM containing fenced JSON with `kind: "automation-update-request"`,
+read [Automation Update](references/automation-update.md) before generic Issue
+intake. Follow that workflow for this request and its clarification/confirmation
+replies. Unsupported schemas or invalid handoffs stop without writes or Issue
+registration. Editing an existing automation must never fall through to creation.
 
 For a human DM containing fenced JSON with `kind: "automation-create-request"`
 and `schema_version: 1`, read [Automation Creation](references/automation-creation.md)

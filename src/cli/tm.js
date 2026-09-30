@@ -448,6 +448,13 @@ const COMMANDS = {
 
   'automation.authorization_preview': () => post(apiPath('/automation-authorizations/preview'), automationAuthorizationPreview(params)),
   'automation.authorization_propose': () => post(apiPath('/automation-authorizations/proposals'), automationAuthorizationProposal(params), { retryOn401: false }),
+  'automation.authorization_status': () => {
+    if (typeof params.proposal_message_id !== 'string' || !/^[1-9][0-9]*$/.test(params.proposal_message_id)
+      || params.proposal_message_id.length > 128) {
+      throw Object.assign(new Error('proposal_message_id must be a canonical decimal message ID string'), { status: 400 });
+    }
+    return get(apiPath(`/automation-authorizations/proposals/${params.proposal_message_id}`));
+  },
   'event-binding.create': () => post(apiPath('/event-bindings'), automationMutation(params, 'timer'), { retryOn401: false }),
   'event-binding.update': () => put(apiPath(`/event-bindings/${encodeURIComponent(params.id)}`), automationMutation(params, 'timer', 'update'), { retryOn401: false }),
 
@@ -529,15 +536,17 @@ ATTEMPT  (all ✅ on contract-v2)
                           blockedOnApprovalRequestIds?}
 
 EVENT BINDING  (定时任务 / create-by-agent)
-  automation.authorization_propose {org, request_id, source_kind, operation, configuration, target_binding_id?, expected_version?} # server sends one readable plan
+  automation.authorization_propose {org, request_id, source_kind, operation, configuration, target_binding_id?, expected_version?, replaces_proposal_message_id?} # server sends one confirmation card
+  automation.authorization_status {org, proposal_message_id} # authoritative card decision and interaction ID
   automation.authorization_preview {org, source_kind, operation, configuration, target_binding_id?, expected_version?} # retired; new server returns 410; never use as fallback
-  event-binding.create   {org, source_kind:"timer", configuration, authorization_proposal_message_id?, authorization_confirmation_message_id?}
-  event-binding.update   {org, id, expected_version, source_kind:"timer", configuration, authorization_proposal_message_id, authorization_confirmation_message_id}
+  event-binding.create   {org, source_kind:"timer", configuration, authorization_proposal_message_id, authorization_card_interaction_id}
+  event-binding.update   {org, id, expected_version, source_kind:"timer", configuration, authorization_proposal_message_id, authorization_card_interaction_id}
                          Legacy: {cronExpr, leadMemberId, ownerMemberId, projectId,
                           title, description?}                                   # agent: leadMemberId=自己, ownerMemberId=对话人类
   event-binding.list     {}                                                     # 本 org 的定时任务
-  webhook.create         {org, source_kind:"webhook", configuration, authorization_proposal_message_id?, authorization_confirmation_message_id?}
-  webhook.update         {org, id, expected_version, source_kind:"webhook", configuration, authorization_proposal_message_id, authorization_confirmation_message_id}
+  webhook.create         {org, source_kind:"webhook", configuration, authorization_proposal_message_id, authorization_card_interaction_id}
+  webhook.update         {org, id, expected_version, source_kind:"webhook", configuration, authorization_proposal_message_id, authorization_card_interaction_id}
+  # Registered legacy proposals use authorization_confirmation_message_id instead of card proof; never send both.
   webhook.get            {org, id}
   event-binding.get      {id}
   event-binding.delete   {id}                                                   # 停止后续触发, 不影响已生成的 Issue

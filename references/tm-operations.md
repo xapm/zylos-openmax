@@ -166,23 +166,30 @@ Conversations on an Issue / Task, plan explanations, state-change explanations, 
 For explicit `automation-create-request` form handoffs, follow
 [Automation Creation](automation-creation.md) before generic Issue intake.
 `event-binding.create` and `webhook.create` accept `{org, source_kind, configuration,
-authorization_proposal_message_id, authorization_confirmation_message_id}`.
-Agent calls require the real proposal and quoted human-confirmation IDs.
+authorization_proposal_message_id, authorization_card_interaction_id}`.
+Agent calls require the registered proposal and authenticated card interaction.
+Exactly one card or legacy quoted proof is allowed, never both. A SYSTEM receipt
+is not a HUMAN confirmation-message ID; generic card choices cannot authorize writes.
 Use `automation.authorization_propose {org,request_id,source_kind,operation,configuration,
-target_binding_id?,expected_version?}` with a UUID for this exact plan revision.
+target_binding_id?,expected_version?,replaces_proposal_message_id?}` with a UUID for this exact plan revision.
 Final timer proposals require an explicit nonblank IANA timezone; resolve missing
 or ambiguous timezones without silently defaulting to UTC or the machine timezone.
-The server sends one readable final plan to the verified DM. The CLI unwraps its
+The server sends one readable final card with Confirm, Modify, and Cancel to the verified DM. The CLI unwraps its
 `data` envelope and returns top-level `proposal_message_id`, `conversation_id`,
 and `proposal_text`.
 Do not resend the text, expose raw JSON or internal IDs, or ask for a second
-confirmation. Verify the returned message and obtain the human's single quoted
-confirmation before writing. The legacy `automation.authorization_preview`
+confirmation. Verify the returned card and call
+`automation.authorization_status {org,proposal_message_id}` after its trusted receipt.
+Require the matching proposal, `authorization_kind: "card"`, `status: "confirmed"`,
+and use its `card_interaction_id` UUID. Pending, modifying, cancelled, expired,
+or superseded states do not authorize mutation. Modify asks for changes; Cancel
+ends the request. Confirmation is not creation success. The legacy `automation.authorization_preview`
 command is retired (the new server returns 410); never send its output to the human or use it as a
 fallback. If the new endpoint is unavailable, stop without creating anything.
-Only the identical proposal request ID and configuration may be explicitly
+Only the identical proposal request ID, configuration, and replacement intent may be explicitly
 retried to recover the same server-sent message after an uncertain proposal send.
-A changed plan requires a new request ID and fresh confirmation. This proposal
+A changed plan requires a new request ID and fresh confirmation; replace only
+this request's prior card with `replaces_proposal_message_id`. This proposal
 idempotency does not authorize retrying an uncertain automation mutation.
 
 For an old unregistered proposal rejected with 403 after the Core upgrade,
@@ -191,21 +198,22 @@ do not blame the human or label their confirmation invalid. First reconcile any
 prior uncertain create/update; a later 403 does not resolve that earlier write.
 Only after a known unregistered-proposal rejection and no unresolved writes,
 request a fresh server-sent readable plan with a new request ID, read it back,
-and obtain a new single quoted human confirmation. Never reuse old proposal or
+and obtain a new verified human card confirmation. Never reuse old proposal or
 confirmation IDs or fall back to raw preview output. A proposal-store outage is
 503, not that 403: explain temporary unavailability, retain the existing context,
 and wait for recovery after reconciling uncertain writes; never blindly retry a
 mutation or replace proof while a write is unresolved. See Automation Creation
 for the full recovery procedure, including a previously successful operation.
 
-Required rollout order: successfully apply and verify migration 110, then deploy
-compatible Core and verify proposal-store and readable-proposal health, then
-release the compatible plugin. Stop if a prerequisite fails; health verification
+Required rollout order: deploy compatible Work with the card proof contract,
+successfully apply and verify Core migrations 110 and 111, then deploy compatible
+Core and verify proposal-store and confirmation-card health, then release the
+compatible plugin. Stop if a prerequisite fails; health verification
 includes durable proposal registration and readback, not just process liveness.
-Existing pending legacy confirmations are invalidated at Core cutover and need
-the recovery above. Use a maintenance window if needed for the incompatible
-interval; do not promise zero downtime or let an old plugin continue sending
-legacy preview plans against the new Core. This guidance is not live deployment
+Existing registered legacy proposals keep their original verification rules;
+unregistered legacy previews need the recovery above. Use a maintenance window
+if needed for an incompatible interval; do not promise zero downtime or let an
+old plugin treat a SYSTEM receipt as human confirmation. This guidance is not live deployment
 or test-automation authorization.
 
 `source_kind` must match the command (`timer` / `webhook`). The configuration
@@ -232,7 +240,7 @@ Scheduled task = `EventBinding(sourceKind=timer)`: when the time comes the platf
 
 | Status | Command | Description | Parameters | Endpoint |
 | --- | --- | --- | --- | --- |
-| ✅ | `event-binding.create` | Create a scheduled task with verified human confirmation | `{org,source_kind:"timer",configuration,authorization_proposal_message_id,authorization_confirmation_message_id}` | `POST /event-bindings` |
+| ✅ | `event-binding.create` | Create a scheduled task with verified human confirmation | `{org,source_kind:"timer",configuration,authorization_proposal_message_id,authorization_card_interaction_id}` | `POST /event-bindings` |
 | ✅ | `event-binding.update` | Replace a timer configuration with fresh confirmation | Create fields plus `{id,expected_version}` | `PUT /event-bindings/{id}` |
 | ✅ | `webhook.update` | Replace a webhook configuration with fresh confirmation | Create fields with `source_kind:"webhook"` plus `{id,expected_version}` | `PUT /webhooks/{id}` |
 | ✅ | `event-binding.list` | List the scheduled tasks of this org | `{}` | `GET /event-bindings` |
@@ -244,7 +252,7 @@ create-by-agent guardrails (enforced by cws-work, violations error out directly)
 - `leadMemberId` must = **your own member id** (an agent can only set itself as lead)
 - `ownerMemberId` must = **the member id of that human in the conversation**, and cannot be yourself (owner is the governance responsible party = human)
 - `cronExpr` has 5 fields (minute hour day month weekday)
-- Core must verify the exact final proposal and its quoted human confirmation;
+- Core must verify the exact final proposal and its authenticated human choice;
   direct Agent writes to Work cannot bypass this verification.
 
 ## Typical Usage Scenarios
@@ -379,12 +387,13 @@ When a human says in a DM "help me set up a scheduled task", you (the selected l
 #    - how often to run → convert to a 5-field cron (state the timezone assumption clearly)
 #    - which project it belongs to
 #    - what to do when the time comes → title / description, ask for as much context as possible
-# 1) Have automation.authorization_propose send one readable plan and obtain its quoted human confirmation.
-# 2) Create with those actual message IDs; never use placeholders as proof.
+# 1) Have automation.authorization_propose send one confirmation card.
+# 2) After its trusted receipt, use automation.authorization_status to verify confirmation.
+#    Create with the recorded proposal and returned interaction UUID; never use placeholders as proof.
 node src/cli/tm.js event-binding.create '{
   "org":"<verified organization>",
   "authorization_proposal_message_id":"<actual proposal message ID>",
-  "authorization_confirmation_message_id":"<actual human reply ID>",
+  "authorization_card_interaction_id":"<UUID returned by authorization_status>",
   "cronExpr":"0 9 * * 1",
   "leadMemberId":"<your own member id>",
   "ownerMemberId":"<the conversation human's member id>",

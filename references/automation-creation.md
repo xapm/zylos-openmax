@@ -203,11 +203,10 @@ Reference acceptance scenarios (instruction checks, not live Agent evidence):
    never automatically recreate or delete the binding.
    Record the returned binding ID privately. Report the task name, actual state
    and timer's next trigger time if returned in readable local time with timezone;
-   do not expose binding IDs or protocol fields. Build the existing Automation page link with
-   `core.frontend_url {"org":"<verified org_id>","path":"/automation"}`
-   (the existing automation list; there is no detail route). This local helper
-   does not select an organization in the browser; name the verified organization
-   in the result so the human can open its Automation list.
+   do not expose binding IDs or protocol fields. Do not include an Automation
+   list link in the creation result. Do not call `core.frontend_url` for this
+   receipt or construct a browser link from the backend/BFF address: it may be
+   an internal IP or service endpoint, not a public frontend URL.
    A webhook response includes a one-time secret
    `webhook_url`: send it only in this verified requester's DM when required for
    setup, never in group messages, public reports, screenshots or memory files.

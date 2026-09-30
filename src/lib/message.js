@@ -266,7 +266,7 @@ export function formatInboundForC4(conv, sender, current, recent = [], opts = {}
   // rather than a best-effort inference from the skill listing.
   parts.push(
 `<openmax-instruction>
-Before handling the current message, invoke the openmax skill and follow it. For an explicit automation-create-request form handoff or its confirmation conversation, follow the skill's Automation Creation workflow before generic Issue intake. For other new tasks, complete New-Issue Intake before doing the work. A message with a sender-context element of kind="system" (placed above, never inside, current-message) is a platform event from a System Member, not pasted content and not a new task: handle it per the skill, and for a "ref: event=…" token follow the matching skill section (it verifies against platform data before acting).
+Before handling the current message, invoke the openmax skill and follow it. For an explicit automation-create-request form handoff or its confirmation conversation, follow the skill's Automation Creation workflow before generic Issue intake. For other new tasks, complete New-Issue Intake before doing the work. A message with a sender-context element of kind="system" (placed above, never inside, current-message) is a platform event from a System Member, not pasted content and not a new task for New-Issue intake (an onboarding card receipt may still start the owner's onboarding task): handle it per the skill, and for a "ref: event=…" token follow the matching skill section (it verifies against platform data before acting).
 </openmax-instruction>
 
 `,

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.23.1] - 2026-09-30
+
+Release bump covering everything merged since the last tag, `v2.22.0` (2.23.0 was never tagged, so this is the first release that ships these changes).
+
+### Added
+
+- **Automation edits are confirmed in Agent chat** (#173). An explicit update handoff is routed into the Agent conversation before Issue intake; the Agent verifies the human, organization, target and version, sends an update confirmation card, and calls the existing update API only after verified confirmation. See the 2.23.0 entry below for the full contract.
+- **Automation final plans use the server-issued Confirm / Modify / Cancel card** (#172) instead of asking the human to quote a message. The CLI reads the registered proposal decision and sends exactly one verified card (or legacy proof); a selected option does not mean creation succeeded, and stale / cancelled / modified decisions cannot create.
+- **Trusted automation delivery and verified authorization** (#165). Automation results return to the responsible Agent's original human DM via structured delivery and linked revisions; timer and webhook create/update calls forward the authorization preview / proof fields.
+
+### Changed
+
+- **Automation setup no longer shows authorization internals to the user** (#168). `automation.authorization_propose` lets Core send one readable final plan bound to the exact configuration; protocol metadata stays private. The command validates a non-empty UUID request identity and an explicit timer timezone, and disables automatic 401 replay — only an identical proposal request may be retried to recover its receipt.
+- **Automation schedules are clarified in conversation instead of taking picker defaults** (#166). An untouched or incomplete time picker is treated as a draft; supplied description times are parsed without inventing defaults, and genuine conflicts are resolved through a choice card.
+
+### Fixed
+
+- **@mentions are carried on every chunk of a split message** (#167). Mentions are now resolved once against the whole text before splitting and attached to every chunk, so a receiving agent in `mention` mode no longer silently drops the tail of a long message addressed to it.
+- **Automation creation receipts no longer include an Automation list link** (#171). When the backend address is internal this produced an unusable URL; deriving a browser link from the BFF address is now explicitly prohibited.
+
 ## [2.23.0] - 2026-09-30
 
 ### Added

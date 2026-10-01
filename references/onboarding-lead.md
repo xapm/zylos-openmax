@@ -47,11 +47,16 @@ Every onboarding card goes into the owner DM (`comm.create_dm {participantId: ow
 - `decline:true` goes on the 「都不用」 option only — at most one per card, never on the task or teammate card.
 - The IM card's `trigger` (first / second push) has no card field; it lives only in `meta` and in the event you report.
 - cws-comm allows up to 16 options on `onboarding.channel` (5 on the others). If `im_channels` + 「都不用」 would exceed that, send the first 15 channels in the given order plus 「都不用」 — do not reorder.
-- **A send that fails** (the CLI exits non-zero / cws-comm refuses a field) → send the **text form** below instead, once, and report the same event. Do not retry the card in a loop, and never send both a card and its text form for the same push.
+- **A send that fails** (the CLI exits non-zero / cws-comm refuses a field) → send the **text form** below instead, once. Task cards: then report `task_cards_sent`. IM / teammate card: the push was already claimed before the card was tried (§3) — the text form goes out under that same claim; **do not report again**. Do not retry the card in a loop, and never send both a card and its text form for the same push.
 
 ## Text form (the permanent fallback)
 
-Use the text form **whenever a card send fails** (error / rejected, e.g. an older cws-comm without the onboarding families). It is not a test path — the owner gets the same choice either way. Send it into the owner DM with `comm.send {conversationId, content}` and then **report exactly the same event as for the card** (`task_cards_sent` / `im_card_sent` / `im_card_second_sent` / `partner_card_sent`); the text form counts as shown. Never send both a card and its text form for the same push.
+Use the text form **whenever a card send fails** (error / rejected, e.g. an older cws-comm without the onboarding families). It is not a test path — the owner gets the same choice either way. Send it into the owner DM with `comm.send {conversationId, content}`; the text form counts as shown, and its event is the same as the card's:
+
+- **Task cards** — report `task_cards_sent` after the text form is sent, exactly as after the card.
+- **IM card / teammate card** — `im_card_sent` / `im_card_second_sent` / `partner_card_sent` were already reported **before** the card was tried and came back `recorded:true` (the claim, §3). The text form is sent under that same claim: **do not report the event again**, and never fall back to the text form without that claim.
+
+Never send both a card and its text form for the same push.
 
 | Card | Text form |
 | --- | --- |
@@ -87,11 +92,18 @@ The wake message itself lives in a read-only system DM — never reply there. **
 
 **On every owner turn in the DM while the record is not finished** — right after you reply, and when a task starts (for the first push) — **re-read `core.onboarding_session` and evaluate every row below from `events`.** Never skip the check because you remember a card being sent or not being due; a due card is always sent.
 
-**Before sending any card, re-read `core.onboarding_session` and check `events`** (the only record of what was sent; never your memory) — a decline or a teammate card may have been recorded from another Agent of the same owner / org. Report the event right after the send succeeds (it marks the card as shown) — a text-form send counts the same. A report that comes back `recorded:false` means it was already recorded: fine, do not send again.
+**Before sending any card, re-read `core.onboarding_session` and check `events`** (the only record of what was sent; never your memory) — a decline or a teammate card may have been recorded from another Agent of the same owner / org. That check only skips work early; it does not stop a sibling Agent of the same owner from deciding the same card at the same moment. **The report is the claim, so it comes first:**
 
-| Card | When | Due only if (all must hold) | Then report |
+1. **Claim** — `core.onboarding_event {eventType:"<event>"}` (`im_card_sent` / `im_card_second_sent` / `partner_card_sent`) **before** sending anything. cws-core records each of these exactly once in its scope (IM card: once per owner across all their Agents; teammate card: once per org) and, of concurrent reports, answers `recorded:true` to exactly one.
+2. **`recorded:true`** → the push is yours: send the card now. If the card send fails, send its **text form** instead, once, under the same claim — **do not report again**.
+3. **`recorded:false`** → another Agent (or an earlier turn of yours) already claimed this push: **do not send** the card or its text form, and say nothing about it.
+4. **The report itself fails** (non-zero exit, 4xx / 5xx) → nothing was claimed: do not send this turn; re-evaluate on a later owner turn.
+
+A claimed push whose card and text form both fail is not retried — the claim stands for it.
+
+| Card | When | Due only if (all must hold) | Claim (report **before** sending) |
 | --- | --- | --- | --- |
-| IM card, first push (`trigger:first`) | the moment the **first task starts** executing — a task-card click or a typed work request (send it, then carry on with the task) | `user_has_im_channel` is `false` (omitted = unknown → not due) · `events` has neither `im_card_sent` nor `im_card_declined` | `im_card_sent` |
+| IM card, first push (`trigger:first`) | the moment the **first task starts** executing — a task-card click or a typed work request (claim, send it on `recorded:true`, then carry on with the task) | `user_has_im_channel` is `false` (omitted = unknown → not due) · `events` has neither `im_card_sent` nor `im_card_declined` | `im_card_sent` |
 | IM card, second push (`trigger:second`) | after your reply, once the DM has **≥ 20** messages | `user_has_im_channel` is still `false` (omitted → not due) · `events` has neither `im_card_declined` (user-level) nor `im_card_second_sent` | `im_card_second_sent` |
 | Teammate card | after your reply, once the DM has **≥ 50** messages | the org still has exactly **1** Agent (you — see "Agent count" below) · `owner_is_org_admin` is `true` (omitted → not due) · `events` has no `partner_card_sent` (once per org) | `partner_card_sent` |
 
@@ -100,7 +112,7 @@ The wake message itself lives in a read-only system DM — never reply there. **
 - **Agent count** — the platform does not give one; check it yourself: `core.member_list {kind:"agent", pageSize:2}` (active Agents of this org only, the default). Exactly one item, and it is you (`member_id` = the session's `agent_member_id`) → the org has 1 Agent. Two items → not due. Check it only while the teammate card is still due.
 - **Message count** = cumulative messages in the owner DM, human + Agent, no time window, from `comm.get_messages {conversationId, limit:50}`. An approximation is fine (±1–2); check it only while one of the last two rows is still due, and stop counting once both are recorded.
 - **IM channel order follows your own timezone** — not the user's IP, not the deployment edition. Your timezone: `TZ` in your environment, else the `TZ=` line of `~/zylos/.env`; unset counts as `UTC`. `Asia/Shanghai` or `Asia/Urumqi` → the **CN order**; anything else, `UTC` included → the **international order**. Fetch that order's list with `core.onboarding_profile_options {imOrder:"cn"|"intl", lang:"zh"|"en"}` → `im_channels`. Always pass both: without `imOrder` the server falls back to edition / geo for the order, and without `lang` the deployment edition picks the label language. Show each channel by its `label` (in `lang`); `label_zh` / `label_en` are always returned too, if you need the other language. Pass the list as given; never reorder, drop or add channels yourself. The IM card lists them as options with 「都不用」 last (see "Sending the cards"); the text form lists them all.
-- Send the IM card (`comm.ask_card`, `cardKind:"onboarding.channel"`, `meta.trigger`) or the teammate card (`comm.send_card`, `cardKind:"onboarding.partner"`) — if the send fails, the **text form** — then `core.onboarding_event {eventType:"<event>"}`.
+- First `core.onboarding_event {eventType:"<event>"}` (the claim); only on `recorded:true` send the IM card (`comm.ask_card`, `cardKind:"onboarding.channel"`, `meta.trigger`) or the teammate card (`comm.send_card`, `cardKind:"onboarding.partner"`) — if the send fails, the **text form**, without reporting again. `recorded:false` → send nothing.
 
 ### 4. Card clicks
 
@@ -115,14 +127,14 @@ After handling any onboarding-card receipt, `comm.pending_clear {cardMessageId}`
 
 ## Events you report
 
-`core.onboarding_event {eventType, occurredAt?, meta?}` → `POST /api/v1/onboarding/events` `{event_type, occurred_at?, meta?}` — idempotent, once-only enforced server-side; a repeat returns `recorded:false` (fine, nothing to do).
+`core.onboarding_event {eventType, occurredAt?, meta?}` → `POST /api/v1/onboarding/events` `{event_type, occurred_at?, meta?}` — idempotent, once-only enforced server-side; a repeat returns `recorded:false`. For the card pushes `im_card_sent` / `im_card_second_sent` / `partner_card_sent` the report is the **claim** made before sending (§3): `recorded:true` → send; `recorded:false` → already claimed, do not send. For every other event `recorded:false` just means nothing to do.
 
 | eventType | Scope | When |
 | --- | --- | --- |
 | `d1_activation` | this onboarding | owner's first message in the DM |
 | `task_cards_sent` | this Agent | after the opening self-intro + task cards are sent |
-| `im_card_sent` | this Agent (condition is user-level) | after the IM card first push |
-| `im_card_second_sent` | this Agent (condition is user-level) | after the IM card second push |
+| `im_card_sent` | the owner (all their Agents; atomic claim) | **before** the IM card first push — send only on `recorded:true` |
+| `im_card_second_sent` | the owner (all their Agents; atomic claim) | **before** the IM card second push — send only on `recorded:true` |
 | `im_card_declined` | the owner (all their Agents) | after the 「都不用」 receipt or text reply |
-| `partner_card_sent` | the org | when the teammate card is sent (= shown) |
+| `partner_card_sent` | the org (atomic claim) | **before** the teammate card is sent — send only on `recorded:true` |
 | `d3_im_connected` | this onboarding | after an IM channel is connected |

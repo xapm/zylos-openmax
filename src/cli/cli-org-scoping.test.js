@@ -269,3 +269,40 @@ for (const c of [
     }
   });
 }
+
+// core.onboarding_event is the claim for the card pushes (cws-core !770):
+// the Agent reports im_card_sent / im_card_second_sent / partner_card_sent
+// BEFORE sending and sends only on recorded=true. The CLI must POST the event
+// and print cws-core's `recorded` unchanged — a lost or defaulted `recorded`
+// would make two sibling Agents both send (or neither).
+for (const recorded of [true, false]) {
+  test(`core.onboarding_event im_card_sent → POST /onboarding/events, prints recorded=${recorded}`, async () => {
+    const home = setupMultiOrgHome({ agent: { api_key: 'cwsk_test' } });
+    const req = { method: null, body: null };
+    const matcher = (u) => u.includes('/onboarding/events');
+    matcher.body = { data: { event_type: 'im_card_sent', recorded }, request_id: 'r1' };
+    const { server, seen } = tokenHarness(matcher);
+    server.prependListener('request', (r) => {
+      if (!r.url.includes('/onboarding/events')) return;
+      req.method = r.method;
+      let b = '';
+      r.on('data', (d) => { b += d; });
+      r.on('end', () => { req.body = b; });
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    try {
+      const r = await runRealToken(home, 'core.js', 'core.onboarding_event', { org: 'org-1', eventType: 'im_card_sent' }, `http://127.0.0.1:${server.address().port}`);
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(req.method, 'POST');
+      assert.equal(JSON.parse(req.body).event_type, 'im_card_sent');
+      assert.equal(seen.auth, 'Bearer tok-org-1');
+      // stdout may carry a token-exchange log line before the JSON result.
+      const out = JSON.parse(r.stdout.slice(r.stdout.indexOf('{')));
+      assert.equal(out.recorded, recorded);
+      assert.equal(out.event_type, 'im_card_sent');
+    } finally {
+      await new Promise((r) => server.close(r));
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+}

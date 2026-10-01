@@ -225,6 +225,10 @@ const COMMANDS = {
   // and the push records task_cards_sent / im_card_sent / im_card_second_sent /
   // im_card_declined / partner_card_sent. Duplicates are absorbed server-side
   // (idempotent 200, recorded=false) — safe to fire without checking first.
+  // im_card_sent / im_card_second_sent / partner_card_sent are claims: report
+  // BEFORE sending the card and send only when the response says
+  // recorded=true (exactly one of concurrent claimants gets it); the response
+  // `{event_type, recorded}` is printed unchanged for that decision.
   // d7_first_delivery is server-observed and cannot be self-reported.
   'core.onboarding_event': () => opost(apiPath('/onboarding/events'), {
     event_type:  params.eventType || params.event_type,
@@ -347,7 +351,7 @@ Onboarding (see SKILL.md "Onboarding Lead" → references/onboarding-lead.md)
   core.onboarding_session  {}                                  # 本 Agent 的引导记录：岗位、行业、用户是否已接 IM、已记录的推送节点；404=无引导
   core.onboarding_preset   {role, industry?, lang?}            # 按岗位（运营按行业）取 3 张开场任务卡 + 人设
   core.onboarding_profile_options {imOrder?, lang?}            # 选项表；imOrder=cn|intl 指定 im_channels 顺序（按本 Agent 时区选，见 onboarding-lead）
-  core.onboarding_event    {eventType, occurredAt?, meta?}     # 上报：d1_activation|d3_im_connected|task_cards_sent|im_card_sent|im_card_second_sent|im_card_declined|partner_card_sent；重复上报幂等
+  core.onboarding_event    {eventType, occurredAt?, meta?}     # 上报：d1_activation|d3_im_connected|task_cards_sent|im_card_sent|im_card_second_sent|im_card_declined|partner_card_sent；重复上报幂等（recorded=false）；im_card_sent/im_card_second_sent/partner_card_sent 为发送前认领：先报，recorded=true 才发卡
 
 Organizations
   core.org_list            {orderBy?}

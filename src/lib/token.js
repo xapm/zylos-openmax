@@ -28,6 +28,18 @@
  * up at once and again when a CLI fan-outs several calls before the cache
  * is warm.
  *
+ * Cross-process refresh single-flight: the in-memory dedup above only covers
+ * one process, but several processes share one token file — the comm-bridge
+ * daemon, CLI calls, and the detached channel-connect watchers (one per
+ * pending QR). cws-core rotates the refresh_token on every /auth/refresh and
+ * treats a second use of an already-rotated refresh_token as reuse: it revokes
+ * the whole token family and blacklists its access tokens. So two processes
+ * refreshing from their own stale in-memory copy kill each other's session
+ * (seen as a spurious channel-connect failure when two QR waits overlap).
+ * refresh() therefore takes a per-org lock file, re-reads the token file
+ * under the lock, adopts a pair another process already rotated, and only
+ * otherwise refreshes — always with the latest refresh_token on disk.
+ *
  * Side-effect on first exchange: when org-scoped JWT comes back, we decode
  * the `member_id` claim and write it back into `config.orgs[slug].self.member_id`
  * if that field is empty. This lets interactive install skip asking the
@@ -45,6 +57,11 @@ import { redactSecrets } from './redact.js';
 const HOME = process.env.HOME || '/tmp';
 const TOKEN_DIR = path.join(HOME, 'zylos/components/openmax/runtime/tokens');
 const REFRESH_MARGIN_MS = 60_000;   // refresh when <60 s remain on access_token
+// Cross-process refresh lock. A holder older than LOCK_STALE_MS is assumed
+// dead (crashed mid-refresh) and its lock is broken; waiters poll every
+// LOCK_POLL_MS. Stale must exceed one refresh round trip by a wide margin.
+const LOCK_STALE_MS = 30_000;
+const LOCK_POLL_MS = 50;
 
 const LOG = '[token]';
 
@@ -235,6 +252,61 @@ function writeDisk(orgIdOrEmpty, state) {
   }
 }
 
+// ── cross-process refresh lock (per-org lock file) ──────────────────────────
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function lockFile(orgIdOrEmpty) {
+  return `${tokenFile(orgIdOrEmpty)}.lock`;
+}
+
+/**
+ * Run `fn` while holding the per-org lock file (O_EXCL create). Fail-open on
+ * filesystem errors other than EEXIST: losing the lock only reopens the race
+ * this guards against, it must never block token acquisition outright.
+ */
+async function withFileLock(orgIdOrEmpty, fn) {
+  const file = lockFile(orgIdOrEmpty);
+  const owner = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  let held = false;
+  try {
+    fs.mkdirSync(TOKEN_DIR, { recursive: true, mode: 0o700 });
+  } catch {}
+  for (;;) {
+    try {
+      fs.writeFileSync(file, owner, { flag: 'wx', mode: 0o600 });
+      held = true;
+      break;
+    } catch (e) {
+      if (e?.code !== 'EEXIST') {
+        console.warn(`${LOG} refresh lock(${orgIdOrEmpty || '_identity'}) unavailable, proceeding unlocked:`, e.message);
+        break;
+      }
+      let ageMs = 0;
+      try { ageMs = Date.now() - fs.statSync(file).mtimeMs; } catch { continue; } // vanished: retry now
+      if (ageMs > LOCK_STALE_MS) {
+        console.warn(`${LOG} breaking stale refresh lock(${orgIdOrEmpty || '_identity'}) age=${ageMs}ms`);
+        try { fs.unlinkSync(file); } catch {}
+        continue;
+      }
+      await sleep(LOCK_POLL_MS);
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    if (held) {
+      try {
+        if (fs.readFileSync(file, 'utf-8') === owner) fs.unlinkSync(file);
+      } catch {}
+    }
+  }
+}
+
+function isFresh(state) {
+  return Boolean(state?.access_token) && state.access_token_expires_at - Date.now() > REFRESH_MARGIN_MS;
+}
+
 // ── public API ────────────────────────────────────────────────────────────────
 
 /**
@@ -267,8 +339,18 @@ export async function exchange(orgIdArg) {
 
 export async function refresh(orgIdArg) {
   const oid = orgIdArg || '';
-  return withInflight(`refresh:${oid}`, async () => {
-    let s = _stateByOrg.get(oid) || readDisk(oid);
+  return withInflight(`refresh:${oid}`, () => withFileLock(oid, async () => {
+    // Re-read under the lock: the token file is the cross-process source of
+    // truth. Our in-memory copy may hold a refresh_token another process has
+    // already rotated; sending it again is reuse and revokes the family.
+    const mem = _stateByOrg.get(oid);
+    const disk = readDisk(oid);
+    if (isFresh(disk) && disk.access_token !== mem?.access_token) {
+      _stateByOrg.set(oid, disk);
+      console.log(`${LOG} refresh org=${oid || '(identity-only)'} adopted pair rotated by another process`);
+      return disk.access_token;
+    }
+    const s = disk?.refresh_token ? disk : mem;
     if (!s?.refresh_token) return exchange(oid);
     try {
       const body = oid ? { refresh_token: s.refresh_token, org_id: oid }
@@ -291,7 +373,7 @@ export async function refresh(orgIdArg) {
       console.warn(`${LOG} refresh(${oid || '_identity'}) failed, re-exchanging with api_key:`, err.message);
       return exchange(oid);
     }
-  });
+  }));
 }
 
 /**
